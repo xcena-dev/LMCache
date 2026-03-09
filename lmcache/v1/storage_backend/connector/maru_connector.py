@@ -5,7 +5,6 @@ from dataclasses import dataclass
 from typing import List, Optional, no_type_check
 from urllib.parse import urlparse
 import asyncio
-import hashlib
 import re
 
 # Third Party
@@ -95,17 +94,6 @@ class MaruConnectorConfig:
             max_inflight=int(extra.get("maru_max_inflight", 64)),
             eager_map=extra.get("maru_eager_map"),
         )
-
-
-def cache_key_to_int(key: CacheEngineKey) -> int:
-    """
-    Convert CacheEngineKey to stable int hash for MaruHandler.
-    Uses SHA-256 for determinism across process restarts.
-    """
-    key_str = key.to_string()
-    hash_bytes = hashlib.sha256(key_str.encode()).digest()
-    # Use first 8 bytes as int64
-    return int.from_bytes(hash_bytes[:8], byteorder="big", signed=False)
 
 
 # Ping error codes
@@ -222,21 +210,21 @@ class MaruConnector(RemoteConnector):
             return False
         assert self._handle is not None
 
-        key_hash = cache_key_to_int(key)
+        key_str = key.to_string()
         try:
             result = await asyncio.wait_for(
-                asyncio.to_thread(self._handle.exists, key_hash),
+                asyncio.to_thread(self._handle.exists, key_str),
                 timeout=self.maru_config.operation_timeout,
             )
             logger.debug(
-                "maru exists key_hash=%d, exists=%s",
-                key_hash,
+                "maru exists key_str=%s, exists=%s",
+                key_str,
                 result,
             )
             return result
         except asyncio.TimeoutError:
             self._rpc_errors += 1
-            logger.warning("maru exists timed out for key_hash=%d", key_hash)
+            logger.warning("maru exists timed out for key_str=%s", key_str)
             return False
         except Exception as e:
             self._rpc_errors += 1
@@ -248,10 +236,10 @@ class MaruConnector(RemoteConnector):
             return False
         assert self._handle is not None
 
-        key_hash = cache_key_to_int(key)
+        key_str = key.to_string()
         try:
-            result = self._handle.exists(key_hash)
-            logger.debug("maru exists_sync key_hash=%d, exists=%s", key_hash, result)
+            result = self._handle.exists(key_str)
+            logger.debug("maru exists_sync key_str=%s, exists=%s", key_str, result)
             return result
         except Exception as e:
             self._rpc_errors += 1
@@ -297,25 +285,25 @@ class MaruConnector(RemoteConnector):
             return None
         assert self._handle is not None
 
-        key_hash = cache_key_to_int(key)
+        key_str = key.to_string()
         try:
             info = await asyncio.wait_for(
-                asyncio.to_thread(self._handle.retrieve, key_hash),
+                asyncio.to_thread(self._handle.retrieve, key_str),
                 timeout=self.maru_config.operation_timeout,
             )
             if info is None:
-                logger.debug("maru get MISS key_hash=%d", key_hash)
+                logger.debug("maru get MISS key_str=%s", key_str)
                 return None
 
             data_size = len(info.view)
-            logger.debug("maru get HIT key_hash=%d, %d bytes", key_hash, data_size)
+            logger.debug("maru get HIT key_str=%s, %d bytes", key_str, data_size)
             memory_obj = self._decode_memory_obj(info)
             if memory_obj is not None:
                 memory_obj = self.reshape_partial_chunk(memory_obj, data_size)
             return memory_obj
         except asyncio.TimeoutError:
             self._rpc_errors += 1
-            logger.warning("maru get timed out for key_hash=%d", key_hash)
+            logger.warning("maru get timed out for key_str=%s", key_str)
             return None
         except Exception as e:
             self._rpc_errors += 1
@@ -327,24 +315,24 @@ class MaruConnector(RemoteConnector):
             raise RuntimeError("MaruConnector not connected to Maru server")
         assert self._handle is not None
 
-        key_hash = cache_key_to_int(key)
+        key_str = key.to_string()
         info = self._encode_memory_obj(memory_obj)
         data_size = len(info.view)
 
         try:
             success = await asyncio.wait_for(
-                asyncio.to_thread(self._handle.store, key_hash, info),
+                asyncio.to_thread(self._handle.store, key_str, info),
                 timeout=self.maru_config.operation_timeout,
             )
             if success:
-                logger.debug("maru put key_hash=%d, %d bytes", key_hash, data_size)
+                logger.debug("maru put key_str=%s, %d bytes", key_str, data_size)
             else:
-                logger.warning("maru put failed key_hash=%d", key_hash)
+                logger.warning("maru put failed key_str=%s", key_str)
         except asyncio.TimeoutError:
             self._rpc_errors += 1
             logger.warning(
-                "maru put timed out for key_hash=%d. Decode instance may redo prefill.",
-                key_hash,
+                "maru put timed out for key_str=%s. Decode instance may redo prefill.",
+                key_str,
             )
         except Exception as e:
             self._rpc_errors += 1
@@ -361,9 +349,9 @@ class MaruConnector(RemoteConnector):
             return False
         assert self._handle is not None
 
-        key_hash = cache_key_to_int(key)
+        key_str = key.to_string()
         try:
-            return self._handle.delete(key_hash)
+            return self._handle.delete(key_str)
         except Exception as e:
             self._rpc_errors += 1
             logger.error("maru remove_sync failed: %s", e)
@@ -397,9 +385,9 @@ class MaruConnector(RemoteConnector):
             return 0
         assert self._handle is not None
 
-        key_hashes = [cache_key_to_int(k) for k in keys]
+        key_strs = [k.to_string() for k in keys]
         try:
-            results = self._handle.batch_exists(key_hashes)
+            results = self._handle.batch_exists(key_strs)
             count = 0
             for exists in results:
                 if not exists:
@@ -419,10 +407,10 @@ class MaruConnector(RemoteConnector):
             return [None] * len(keys)
         assert self._handle is not None
 
-        key_hashes = [cache_key_to_int(k) for k in keys]
+        key_strs = [k.to_string() for k in keys]
         try:
             raw_results = await asyncio.wait_for(
-                asyncio.to_thread(self._handle.batch_retrieve, key_hashes),
+                asyncio.to_thread(self._handle.batch_retrieve, key_strs),
                 timeout=self.maru_config.operation_timeout,
             )
             hits = sum(1 for r in raw_results if r is not None)
@@ -455,7 +443,7 @@ class MaruConnector(RemoteConnector):
             return
         assert self._handle is not None
 
-        key_hashes = [cache_key_to_int(k) for k in keys]
+        key_strs = [k.to_string() for k in keys]
         infos = [self._encode_memory_obj(obj) for obj in memory_objs]
         total_bytes = sum(len(info.view) for info in infos)
 
@@ -463,7 +451,7 @@ class MaruConnector(RemoteConnector):
             results = await asyncio.wait_for(
                 asyncio.to_thread(
                     self._handle.batch_store,
-                    key_hashes,
+                    key_strs,
                     infos,
                 ),
                 timeout=self.maru_config.operation_timeout,
@@ -502,10 +490,10 @@ class MaruConnector(RemoteConnector):
             return []
         assert self._handle is not None
 
-        key_hashes = [cache_key_to_int(k) for k in keys]
+        key_strs = [k.to_string() for k in keys]
         try:
             raw_results = await asyncio.wait_for(
-                asyncio.to_thread(self._handle.batch_retrieve, key_hashes),
+                asyncio.to_thread(self._handle.batch_retrieve, key_strs),
                 timeout=self.maru_config.operation_timeout,
             )
 
@@ -581,10 +569,10 @@ class MaruConnector(RemoteConnector):
             return 0
         assert self._handle is not None
 
-        key_hashes = [cache_key_to_int(k) for k in keys]
+        key_strs = [k.to_string() for k in keys]
         try:
             results = await asyncio.wait_for(
-                asyncio.to_thread(self._handle.batch_exists, key_hashes),
+                asyncio.to_thread(self._handle.batch_exists, key_strs),
                 timeout=self.maru_config.operation_timeout,
             )
             # Count consecutive hits from start
