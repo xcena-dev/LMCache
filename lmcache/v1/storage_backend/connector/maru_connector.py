@@ -129,8 +129,10 @@ class MaruConnector(RemoteConnector):
     ):
         logger.info("init MaruConnector")
         super().__init__(config, metadata)
-        assert not config.use_layerwise, \
-            "Maru connector does not yet support layerwise KV cache."
+        if config.use_layerwise:
+            raise NotImplementedError(
+                "Maru connector does not yet support layerwise KV cache."
+            )
 
         self.url = url
         self.loop = loop
