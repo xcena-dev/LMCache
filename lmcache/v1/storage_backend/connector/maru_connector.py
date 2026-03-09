@@ -16,7 +16,7 @@ from lmcache.logging import init_logger
 from lmcache.observability import LMCStatsMonitor
 from lmcache.utils import CacheEngineKey
 from lmcache.v1.config import LMCacheEngineConfig
-from lmcache.v1.memory_management import MemoryObj
+from lmcache.v1.memory_management import MemoryObj, MemoryObjMetadata, TensorMemoryObj
 from lmcache.v1.metadata import LMCacheMetadata
 from lmcache.v1.storage_backend.connector.base_connector import RemoteConnector
 from lmcache.v1.storage_backend.local_cpu_backend import LocalCPUBackend
@@ -28,9 +28,15 @@ def parse_size(size_str: str) -> int:
     """Parse human-readable size string (e.g., '1G', '100M', '1024K') to bytes."""
     if isinstance(size_str, int):
         return size_str
-    match = re.match(r"^(\d+(?:\.\d+)?)\s*([KMGT]?)B?$", str(size_str).upper())
+    s = str(size_str).strip().upper()
+    match = re.match(r"^(\d+(?:\.\d+)?)\s*([KMGT]?)B?$", s)
     if not match:
-        return int(size_str)
+        try:
+            return int(s)
+        except ValueError:
+            raise ValueError(
+                f"Could not parse '{size_str}' as a size string or an integer."
+            ) from None
     value, unit = float(match.group(1)), match.group(2)
     multipliers = {"": 1, "K": 1024, "M": 1024**2, "G": 1024**3, "T": 1024**4}
     return int(value * multipliers.get(unit, 1))
@@ -122,8 +128,9 @@ class MaruConnector(RemoteConnector):
         metadata: LMCacheMetadata,
     ):
         logger.info("init MaruConnector")
-        logger.info("maru remote_url: %s", url)
         super().__init__(config, metadata)
+        assert not config.use_layerwise, \
+            "Maru connector does not yet support layerwise KV cache."
 
         self.url = url
         self.loop = loop
@@ -250,9 +257,6 @@ class MaruConnector(RemoteConnector):
             return False
 
     def _decode_memory_obj(self, info) -> Optional[MemoryObj]:
-        # First Party
-        from lmcache.v1.memory_management import MemoryObjMetadata, TensorMemoryObj
-
         mv = info.view
 
         logger.debug("maru decode data=%d bytes", len(mv))

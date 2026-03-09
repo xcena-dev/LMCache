@@ -22,15 +22,13 @@ class MaruConnectorAdapter(ConnectorAdapter):
         super().__init__("maru://")
 
     def create_connector(self, context: ConnectorContext) -> RemoteConnector:
-        logger.info(f"Creating Maru connector for URL: {context.url}")
-
         # Validate URL format (requires host:port)
         _ = parse_remote_url(context.url)
 
         # Parse configuration from URL
         maru_config = MaruConnectorConfig.from_url(context.url)
         logger.info(
-            "Maru config: server_url=%s, pool_size=%s",
+            "Maru config from URL: server_url=%s, pool_size=%d",
             maru_config.server_url,
             maru_config.pool_size,
         )
