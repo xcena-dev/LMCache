@@ -285,6 +285,14 @@ class MaruBackend(AllocatorBackendInterface):
         """
         assert memory_obj.tensor is not None
 
+        # ref_count_up x2:
+        # 1) pool reference — match LocalCPUBackend pattern so ref_count
+        #    stays at 1 after SM's ref_count_down
+        # 2) _async_store guard — SM's ref_count_down may run before
+        #    _async_store completes; this prevents ref_count reaching 0
+        memory_obj.ref_count_up()
+        memory_obj.ref_count_up()
+
         with self.put_lock:
             self.put_tasks.add(key)
 
@@ -356,6 +364,7 @@ class MaruBackend(AllocatorBackendInterface):
         except Exception as e:
             logger.error("[Maru] store failed key=%s: %s", key, e)
         finally:
+            memory_obj.ref_count_down()  # release _async_store guard
             with self.put_lock:
                 self.put_tasks.discard(key)
 
@@ -411,7 +420,7 @@ class MaruBackend(AllocatorBackendInterface):
             return None
 
         memory_obj.ref_count_up()
-        memory_obj.pin()
+        # pin() removed — server pin via contains(pin=True) instead
 
         logger.debug(
             "[Maru] get_blocking rid=%d pid=%d size=%d",
@@ -446,11 +455,35 @@ class MaruBackend(AllocatorBackendInterface):
         """
 
         def _contains_prefix() -> int:
+            key_strs = [
+                k.with_new_worker_id(0).to_string()
+                if self._mla_worker_id_as0_mode
+                else k.to_string()
+                for k in keys
+            ]
+            if pin:
+                results = self._handler.batch_exists_and_pin(key_strs)
+            else:
+                results = self._handler.batch_exists(key_strs)
+
+            # Prefix-based: count contiguous hits from index 0
             num_hit = 0
-            for key in keys:
-                if not self.contains(key):
+            for hit in results:
+                if not hit:
                     break
                 num_hit += 1
+
+            # If pin=True, unpin keys after the first miss
+            # (they were pinned by batch_exists_and_pin but won't be used)
+            if pin and num_hit < len(results):
+                pinned_after_miss = [
+                    key_strs[i]
+                    for i in range(num_hit, len(results))
+                    if results[i]
+                ]
+                if pinned_after_miss:
+                    self._handler.batch_unpin_kv(pinned_after_miss)
+
             return num_hit
 
         return await asyncio.to_thread(_contains_prefix)
@@ -496,7 +529,8 @@ class MaruBackend(AllocatorBackendInterface):
 
         Args:
             key: The cache key.
-            pin: If True, pin the entry. (TODO: delegate to handler)
+            pin: If True, atomically check existence and pin the entry
+                 to protect it from eviction.
 
         Returns:
             True if key exists.
@@ -504,13 +538,15 @@ class MaruBackend(AllocatorBackendInterface):
         if self._mla_worker_id_as0_mode:
             key = key.with_new_worker_id(0)
 
-        return self._handler.exists(key.to_string())
+        key_str = key.to_string()
+        if pin:
+            return self._handler.exists_and_pin(key_str)
+        return self._handler.exists(key_str)
 
     def pin(self, key: CacheEngineKey) -> bool:
-        """Pin a key to prevent eviction.
+        """Pin a key to prevent eviction on MaruServer.
 
-        TODO: Delegate to MaruHandler.pin() once server-side
-        ref_count management is implemented.
+        Increments the server-side pin_count.
 
         Args:
             key: The cache key.
@@ -518,13 +554,15 @@ class MaruBackend(AllocatorBackendInterface):
         Returns:
             True if pinned successfully.
         """
-        return False
+        if self._mla_worker_id_as0_mode:
+            key = key.with_new_worker_id(0)
+        return self._handler.pin_kv(key.to_string())
 
     def unpin(self, key: CacheEngineKey) -> bool:
-        """Unpin a key to allow eviction.
+        """Unpin a key to allow eviction on MaruServer.
 
-        TODO: Delegate to MaruHandler.unpin() once server-side
-        ref_count management is implemented.
+        Decrements the server-side pin_count. When pin_count reaches 0,
+        the entry becomes eligible for eviction.
 
         Args:
             key: The cache key.
@@ -532,7 +570,22 @@ class MaruBackend(AllocatorBackendInterface):
         Returns:
             True if unpinned successfully.
         """
-        return False
+        if self._mla_worker_id_as0_mode:
+            key = key.with_new_worker_id(0)
+        return self._handler.unpin_kv(key.to_string())
+
+    def batched_unpin(self, keys: List[CacheEngineKey]) -> None:
+        """Unpin multiple keys in a single RPC call.
+
+        Overrides the default loop-based implementation for batch optimization.
+        """
+        key_strs = [
+            k.with_new_worker_id(0).to_string()
+            if self._mla_worker_id_as0_mode
+            else k.to_string()
+            for k in keys
+        ]
+        self._handler.batch_unpin_kv(key_strs)
 
     def remove(self, key: CacheEngineKey, force: bool = True) -> bool:
         """Remove a key from MaruServer.

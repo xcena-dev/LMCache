@@ -1054,8 +1054,11 @@ class StorageManager:
         """
         for backend_name, backend in self.storage_backends.items():
             if locations is None or backend_name in locations:
-                for key in keys:
-                    backend.unpin(key)
+                if backend_name == "MaruBackend":
+                    backend.batched_unpin(keys)
+                else:
+                    for key in keys:
+                        backend.unpin(key)
 
     def clear(
         self,
