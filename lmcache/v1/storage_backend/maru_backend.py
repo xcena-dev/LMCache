@@ -8,8 +8,22 @@ import re
 import threading
 
 # Third Party
-from maru import MaruConfig, MaruHandler
-from maru_lmcache import CxlMemoryAdapter
+try:
+    from maru import MaruConfig, MaruHandler
+except ImportError as e:
+    raise ImportError(
+        "The 'maru' package is required to use MaruBackend. "
+        "Please install it according to the Maru setup documentation."
+    ) from e
+
+try:
+    from maru_lmcache import CxlMemoryAdapter
+except ImportError as e:
+    raise ImportError(
+        "The 'maru_lmcache' package is required to use MaruBackend. "
+        "Please install it according to the Maru setup documentation."
+    ) from e
+
 import torch
 
 # First Party
