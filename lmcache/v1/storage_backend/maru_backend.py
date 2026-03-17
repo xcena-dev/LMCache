@@ -136,7 +136,7 @@ class MaruBackend(AllocatorBackendInterface):
         # Convert maru:// scheme to tcp:// for ZMQ
         server_url = config.maru_path
         if server_url.startswith("maru://"):
-            server_url = "tcp://" + server_url[len("maru://"):]
+            server_url = "tcp://" + server_url[len("maru://") :]
 
         extra = config.extra_config or {}
         maru_config = MaruConfig(
@@ -477,9 +477,7 @@ class MaruBackend(AllocatorBackendInterface):
             # (they were pinned by batch_exists_and_pin but won't be used)
             if pin and num_hit < len(results):
                 pinned_after_miss = [
-                    key_strs[i]
-                    for i in range(num_hit, len(results))
-                    if results[i]
+                    key_strs[i] for i in range(num_hit, len(results)) if results[i]
                 ]
                 if pinned_after_miss:
                     self._handler.batch_unpin_kv(pinned_after_miss)

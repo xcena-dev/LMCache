@@ -1300,7 +1300,9 @@ class LMCacheEngine:
             else:
                 for key, memory_obj in memory_objs_flat:
                     try:
-                        logger.debug("Releasing memory object for lookup_id=%s", lookup_id)
+                        logger.debug(
+                            "Releasing memory object for lookup_id=%s", lookup_id
+                        )
                         memory_obj.unpin()
                         memory_obj.ref_count_down()
                     except Exception as e:
