@@ -1286,13 +1286,25 @@ class LMCacheEngine:
             memory_objs_flat = [mm for m in memory_objs for mm in m]
 
             # Release each memory object
-            for key, memory_obj in memory_objs_flat:
-                try:
-                    logger.debug("Releasing memory object for lookup_id=%s", lookup_id)
-                    memory_obj.unpin()
+            if (
+                self.storage_manager is not None
+                and "MaruBackend" in self.storage_manager.storage_backends
+            ):
+                # MaruBackend: server unpin via batch RPC
+                keys_to_unpin = [key for key, _ in memory_objs_flat]
+                self.storage_manager.storage_backends["MaruBackend"].batched_unpin(
+                    keys_to_unpin
+                )
+                for key, memory_obj in memory_objs_flat:
                     memory_obj.ref_count_down()
-                except Exception as e:
-                    logger.error(f"Error releasing memory object: {e}")
+            else:
+                for key, memory_obj in memory_objs_flat:
+                    try:
+                        logger.debug("Releasing memory object for lookup_id=%s", lookup_id)
+                        memory_obj.unpin()
+                        memory_obj.ref_count_down()
+                    except Exception as e:
+                        logger.error(f"Error releasing memory object: {e}")
         except Exception as e:
             logger.error(
                 f"Error during cleanup_memory_objs for lookup_id={lookup_id}: {e}"
