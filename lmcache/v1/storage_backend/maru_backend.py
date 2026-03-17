@@ -315,7 +315,7 @@ class MaruBackend(AllocatorBackendInterface):
         transfer_spec: Any = None,
         on_complete_callback: Optional[Callable[[CacheEngineKey], None]] = None,
     ) -> Union[List[Future], None]:
-        """Submit batched put tasks.
+        """Submit batched put tasks using batch RPC.
 
         Args:
             keys: The cache keys.
@@ -326,13 +326,67 @@ class MaruBackend(AllocatorBackendInterface):
         Returns:
             List of Futures, one per key.
         """
-        futures = []
+        logger.debug(
+            "[Maru][DEBUG] batched_submit_put_task called, n_keys=%d",
+            len(keys),
+        )
+
+        allocator = self.memory_allocator
+        assert isinstance(allocator, CxlMemoryAdapter)
+
+        key_strs = []
+        handles = []
         for key, memory_obj in zip(keys, memory_objs, strict=True):
-            future = self.submit_put_task(
-                key, memory_obj, on_complete_callback=on_complete_callback
+            assert memory_obj.tensor is not None
+            with self.put_lock:
+                self.put_tasks.add(key)
+            key_strs.append(key.to_string())
+            handles.append(allocator.create_store_handle(memory_obj))
+
+        future = asyncio.run_coroutine_threadsafe(
+            self._async_batch_store(
+                keys, key_strs, handles, on_complete_callback
+            ),
+            self.loop,
+        )
+        return [future]
+
+    async def _async_batch_store(
+        self,
+        keys: Sequence[CacheEngineKey],
+        key_strs: List[str],
+        handles: list,
+        on_complete_callback: Optional[Callable[[CacheEngineKey], None]] = None,
+    ) -> None:
+        """Register batch KV metadata with MaruServer via batch RPC."""
+        try:
+            results = await asyncio.to_thread(
+                self._handler.batch_store, key_strs, handles
             )
-            futures.append(future)
-        return futures
+            stored = sum(results) if results else 0
+            logger.debug(
+                "[Maru][DEBUG] batch_store completed, stored=%d/%d",
+                stored,
+                len(keys),
+            )
+            if stored < len(keys):
+                logger.warning(
+                    "[Maru] batch_store partial %d/%d keys", stored, len(keys)
+                )
+        except Exception as e:
+            logger.error("[Maru] batch_store failed: %s", e)
+        finally:
+            with self.put_lock:
+                for key in keys:
+                    self.put_tasks.discard(key)
+            if on_complete_callback is not None:
+                for key in keys:
+                    try:
+                        on_complete_callback(key)
+                    except Exception as e:
+                        logger.warning(
+                            "on_complete_callback failed for key %s: %s", key, e
+                        )
 
     async def _async_store(
         self,
@@ -459,15 +513,39 @@ class MaruBackend(AllocatorBackendInterface):
             Number of prefix-contiguous keys that exist.
         """
 
-        def _contains_prefix() -> int:
-            num_hit = 0
-            for key in keys:
-                if not self.contains(key):
-                    break
-                num_hit += 1
-            return num_hit
+        logger.debug(
+            "[Maru][DEBUG] batched_async_contains called, "
+            "lookup_id=%s, n_keys=%d",
+            lookup_id,
+            len(keys),
+        )
 
-        return await asyncio.to_thread(_contains_prefix)
+        if not keys:
+            return 0
+
+        def _batch_contains() -> int:
+            key_strs = []
+            for key in keys:
+                k = key.with_new_worker_id(0) if self._mla_worker_id_as0_mode else key
+                key_strs.append(k.to_string())
+            try:
+                results = self._handler.batch_exists(key_strs)
+                count = 0
+                for exists in results:
+                    if not exists:
+                        break
+                    count += 1
+                logger.debug(
+                    "[Maru][DEBUG] batch_exists completed, hits=%d/%d",
+                    count,
+                    len(keys),
+                )
+                return count
+            except Exception as e:
+                logger.error("[Maru] batch_exists failed: %s", e)
+                return 0
+
+        return await asyncio.to_thread(_batch_contains)
 
     async def batched_get_non_blocking(
         self,
@@ -490,16 +568,54 @@ class MaruBackend(AllocatorBackendInterface):
             List of MemoryObjs backed by CXL memory.
         """
 
-        def _get_batch() -> list[MemoryObj]:
-            results: list[MemoryObj] = []
-            for key in keys:
-                mem_obj = self.get_blocking(key)
-                if mem_obj is None:
-                    break
-                results.append(mem_obj)
-            return results
+        logger.debug(
+            "[Maru][DEBUG] batched_get_non_blocking called, "
+            "lookup_id=%s, n_keys=%d",
+            lookup_id,
+            len(keys),
+        )
 
-        return await asyncio.to_thread(_get_batch)
+        if not keys:
+            return []
+
+        def _batch_get() -> list[MemoryObj]:
+            key_strs = []
+            for key in keys:
+                k = key.with_new_worker_id(0) if self._mla_worker_id_as0_mode else key
+                key_strs.append(k.to_string())
+            try:
+                raw_results = self._handler.batch_retrieve(key_strs)
+            except Exception as e:
+                logger.error("[Maru] batch_retrieve failed: %s", e)
+                return []
+
+            allocator = self.memory_allocator
+            assert isinstance(allocator, CxlMemoryAdapter)
+
+            memory_objs: list[MemoryObj] = []
+            for mem_info in raw_results:
+                if mem_info is None:
+                    break
+                memory_obj = allocator.get_by_location(
+                    region_id=mem_info.region_id,
+                    page_index=mem_info.page_index,
+                    actual_size=len(mem_info.view),
+                    single_token_size=self._single_token_size,
+                )
+                if memory_obj is None:
+                    break
+                memory_obj.ref_count_up()
+                memory_obj.pin()
+                memory_objs.append(memory_obj)
+
+            logger.debug(
+                "[Maru][DEBUG] batch_retrieve completed, hits=%d/%d",
+                len(memory_objs),
+                len(keys),
+            )
+            return memory_objs
+
+        return await asyncio.to_thread(_batch_get)
 
     # =========================================================================
     # Contains / Pin / Unpin / Remove
