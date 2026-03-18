@@ -455,33 +455,11 @@ class MaruBackend(AllocatorBackendInterface):
         """
 
         def _contains_prefix() -> int:
-            key_strs = [
-                k.with_new_worker_id(0).to_string()
-                if self._mla_worker_id_as0_mode
-                else k.to_string()
-                for k in keys
-            ]
-            if pin:
-                results = self._handler.batch_exists_and_pin(key_strs)
-            else:
-                results = self._handler.batch_exists(key_strs)
-
-            # Prefix-based: count contiguous hits from index 0
             num_hit = 0
-            for hit in results:
-                if not hit:
+            for key in keys:
+                if not self.contains(key, pin=pin):
                     break
                 num_hit += 1
-
-            # If pin=True, unpin keys after the first miss
-            # (they were pinned by batch_exists_and_pin but won't be used)
-            if pin and num_hit < len(results):
-                pinned_after_miss = [
-                    key_strs[i] for i in range(num_hit, len(results)) if results[i]
-                ]
-                if pinned_after_miss:
-                    self._handler.batch_unpin_kv(pinned_after_miss)
-
             return num_hit
 
         return await asyncio.to_thread(_contains_prefix)
