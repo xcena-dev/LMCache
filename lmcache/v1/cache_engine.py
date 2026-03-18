@@ -1293,9 +1293,9 @@ class LMCacheEngine:
                 # MaruBackend: server unpin via batch RPC
                 keys_to_unpin = [key for key, _ in memory_objs_flat]
                 try:
-                    self.storage_manager.storage_backends[
-                        "MaruBackend"
-                    ].batched_unpin(keys_to_unpin)
+                    self.storage_manager.storage_backends["MaruBackend"].batched_unpin(
+                        keys_to_unpin
+                    )
                 except Exception as e:
                     logger.error(f"Error during batched_unpin: {e}")
                 finally:
