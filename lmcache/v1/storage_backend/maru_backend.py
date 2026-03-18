@@ -136,7 +136,7 @@ class MaruBackend(AllocatorBackendInterface):
         # Convert maru:// scheme to tcp:// for ZMQ
         server_url = config.maru_path
         if server_url.startswith("maru://"):
-            server_url = "tcp://" + server_url[len("maru://"):]
+            server_url = "tcp://" + server_url[len("maru://") :]
 
         extra = config.extra_config or {}
         maru_config = MaruConfig(
@@ -301,7 +301,7 @@ class MaruBackend(AllocatorBackendInterface):
         transfer_spec: Any = None,
         on_complete_callback: Optional[Callable[[CacheEngineKey], None]] = None,
     ) -> Union[List[Future], None]:
-        """Submit batched put tasks.
+        """Submit batched put tasks via single batch_store RPC.
 
         Args:
             keys: The cache keys.
@@ -310,15 +310,19 @@ class MaruBackend(AllocatorBackendInterface):
             on_complete_callback: Optional per-key callback.
 
         Returns:
-            List of Futures, one per key.
+            List containing a single Future for the entire batch.
         """
-        futures = []
-        for key, memory_obj in zip(keys, memory_objs, strict=True):
-            future = self.submit_put_task(
-                key, memory_obj, on_complete_callback=on_complete_callback
-            )
-            futures.append(future)
-        return futures
+        for memory_obj in memory_objs:
+            assert memory_obj.tensor is not None
+
+        with self.put_lock:
+            self.put_tasks.update(keys)
+
+        future = asyncio.run_coroutine_threadsafe(
+            self._async_batch_store(list(keys), memory_objs, on_complete_callback),
+            self.loop,
+        )
+        return [future]
 
     async def _async_store(
         self,
@@ -364,6 +368,44 @@ class MaruBackend(AllocatorBackendInterface):
                     on_complete_callback(key)
                 except Exception as e:
                     logger.warning("on_complete_callback failed for key %s: %s", key, e)
+
+    async def _async_batch_store(
+        self,
+        keys: List[CacheEngineKey],
+        memory_objs: List[MemoryObj],
+        on_complete_callback: Optional[Callable[[CacheEngineKey], None]] = None,
+    ) -> None:
+        """Register multiple KV metadata entries via single batch_store RPC."""
+        results: Optional[list[bool]] = None
+        try:
+            allocator = self.memory_allocator
+            assert isinstance(allocator, CxlMemoryAdapter)
+
+            key_strs = [k.to_string() for k in keys]
+            handles = [allocator.create_store_handle(m) for m in memory_objs]
+
+            results = await asyncio.to_thread(
+                self._handler.batch_store, key_strs, handles
+            )
+            if results is not None:
+                logger.debug("[Maru] batch_store %d/%d ok", sum(results), len(results))
+        except Exception as e:
+            logger.error("[Maru] batch_store failed: %s", e)
+        finally:
+            with self.put_lock:
+                self.put_tasks.difference_update(keys)
+
+            if on_complete_callback is not None:
+                for i, key in enumerate(keys):
+                    if results is not None and i < len(results) and results[i]:
+                        try:
+                            on_complete_callback(key)
+                        except Exception as e:
+                            logger.warning(
+                                "on_complete_callback failed for key %s: %s",
+                                key,
+                                e,
+                            )
 
     # =========================================================================
     # Get (sync)
@@ -421,6 +463,49 @@ class MaruBackend(AllocatorBackendInterface):
         )
         return memory_obj
 
+    def batched_get_blocking(
+        self,
+        keys: List[CacheEngineKey],
+    ) -> List[Optional[MemoryObj]]:
+        """Blocking batched get via single batch_retrieve RPC.
+
+        Args:
+            keys: The cache keys.
+
+        Returns:
+            List of MemoryObj (None for misses).
+        """
+        if self._mla_worker_id_as0_mode:
+            keys = [k.with_new_worker_id(0) for k in keys]
+
+        key_strs = [k.to_string() for k in keys]
+        mem_infos = self._handler.batch_retrieve(key_strs)
+
+        allocator = self.memory_allocator
+        assert isinstance(allocator, CxlMemoryAdapter)
+
+        results: List[Optional[MemoryObj]] = []
+        for mem_info in mem_infos:
+            if mem_info is None:
+                results.append(None)
+                continue
+            memory_obj = allocator.get_by_location(
+                region_id=mem_info.region_id,
+                page_index=mem_info.page_index,
+                actual_size=len(mem_info.view),
+                single_token_size=self._single_token_size,
+            )
+            if memory_obj is None:
+                results.append(None)
+                continue
+            memory_obj.ref_count_up()
+            memory_obj.pin()
+            results.append(memory_obj)
+
+        hits = sum(1 for r in results if r is not None)
+        logger.debug("[Maru] batch_retrieve %d/%d hits", hits, len(results))
+        return results
+
     # =========================================================================
     # Async lookup API (used by StorageManager.async_lookup_and_prefetch)
     # =========================================================================
@@ -431,10 +516,10 @@ class MaruBackend(AllocatorBackendInterface):
         keys: List[CacheEngineKey],
         pin: bool = False,
     ) -> int:
-        """Check how many prefix keys exist on MaruServer.
+        """Check how many prefix keys exist via single batch_exists RPC.
 
-        Prefix-based: returns the count of contiguous keys starting
-        from index 0 that exist. Stops at first miss.
+        Returns the count of contiguous keys starting from index 0
+        that exist. Stops at first miss.
 
         Args:
             lookup_id: Unique request identifier.
@@ -444,16 +529,7 @@ class MaruBackend(AllocatorBackendInterface):
         Returns:
             Number of prefix-contiguous keys that exist.
         """
-
-        def _contains_prefix() -> int:
-            num_hit = 0
-            for key in keys:
-                if not self.contains(key):
-                    break
-                num_hit += 1
-            return num_hit
-
-        return await asyncio.to_thread(_contains_prefix)
+        return await asyncio.to_thread(self.batched_contains, keys, pin)
 
     async def batched_get_non_blocking(
         self,
@@ -461,11 +537,11 @@ class MaruBackend(AllocatorBackendInterface):
         keys: list[CacheEngineKey],
         transfer_spec: Any = None,
     ) -> list[MemoryObj]:
-        """Non-blocking batched get via CXL direct read.
+        """Non-blocking batched get via single batch_retrieve RPC.
 
-        Each key triggers a metadata lookup on MaruServer followed by
-        a zero-copy CXL memory read. Stops at first miss and returns
-        the prefix that was successfully retrieved.
+        Uses handler.batch_retrieve() for a single RPC call, then
+        resolves each MemoryInfo to a MemoryObj via CxlMemoryAdapter.
+        Stops at first miss and returns the prefix.
 
         Args:
             lookup_id: Unique request identifier.
@@ -476,16 +552,40 @@ class MaruBackend(AllocatorBackendInterface):
             List of MemoryObjs backed by CXL memory.
         """
 
-        def _get_batch() -> list[MemoryObj]:
+        def _batch_get() -> list[MemoryObj]:
+            if self._mla_worker_id_as0_mode:
+                actual_keys = [k.with_new_worker_id(0) for k in keys]
+            else:
+                actual_keys = list(keys)
+
+            key_strs = [k.to_string() for k in actual_keys]
+            mem_infos = self._handler.batch_retrieve(key_strs)
+
+            allocator = self.memory_allocator
+            assert isinstance(allocator, CxlMemoryAdapter)
+
             results: list[MemoryObj] = []
-            for key in keys:
-                mem_obj = self.get_blocking(key)
-                if mem_obj is None:
+            for mem_info in mem_infos:
+                if mem_info is None:
                     break
-                results.append(mem_obj)
+                memory_obj = allocator.get_by_location(
+                    region_id=mem_info.region_id,
+                    page_index=mem_info.page_index,
+                    actual_size=len(mem_info.view),
+                    single_token_size=self._single_token_size,
+                )
+                if memory_obj is None:
+                    break
+                memory_obj.ref_count_up()
+                memory_obj.pin()
+                results.append(memory_obj)
+
+            logger.debug(
+                "[Maru] batch_get_non_blocking %d/%d hits", len(results), len(keys)
+            )
             return results
 
-        return await asyncio.to_thread(_get_batch)
+        return await asyncio.to_thread(_batch_get)
 
     # =========================================================================
     # Contains / Pin / Unpin / Remove
@@ -505,6 +605,32 @@ class MaruBackend(AllocatorBackendInterface):
             key = key.with_new_worker_id(0)
 
         return self._handler.exists(key.to_string())
+
+    def batched_contains(
+        self,
+        keys: List[CacheEngineKey],
+        pin: bool = False,
+    ) -> int:
+        """Check how many prefix keys exist via single batch_exists RPC.
+
+        Args:
+            keys: Keys to check in prefix order.
+            pin: Whether to pin. Not supported.
+
+        Returns:
+            Number of prefix-contiguous keys that exist.
+        """
+        if self._mla_worker_id_as0_mode:
+            keys = [k.with_new_worker_id(0) for k in keys]
+
+        key_strs = [k.to_string() for k in keys]
+        results = self._handler.batch_exists(key_strs)
+        num_hit = 0
+        for exists in results:
+            if not exists:
+                break
+            num_hit += 1
+        return num_hit
 
     def pin(self, key: CacheEngineKey) -> bool:
         """Pin a key to prevent eviction.
