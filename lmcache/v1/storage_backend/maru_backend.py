@@ -285,12 +285,6 @@ class MaruBackend(AllocatorBackendInterface):
         """
         assert memory_obj.tensor is not None
 
-        # ref_count_up x2:
-        # 1) pool reference — match LocalCPUBackend pattern so ref_count
-        #    stays at 1 after SM's ref_count_down
-        # 2) _async_store guard — SM's ref_count_down may run before
-        #    _async_store completes; this prevents ref_count reaching 0
-        memory_obj.ref_count_up()
         memory_obj.ref_count_up()
 
         with self.put_lock:
@@ -322,11 +316,6 @@ class MaruBackend(AllocatorBackendInterface):
         """
         for memory_obj in memory_objs:
             assert memory_obj.tensor is not None
-            # ref_count_up x2 (same as submit_put_task):
-            # 1) pool reference — stays at 1 after SM's ref_count_down
-            # 2) _async_batch_store guard — prevents ref_count reaching 0
-            #    before the async RPC completes
-            memory_obj.ref_count_up()
             memory_obj.ref_count_up()
 
         with self.put_lock:
@@ -374,7 +363,6 @@ class MaruBackend(AllocatorBackendInterface):
         except Exception as e:
             logger.error("[Maru] store failed key=%s: %s", key, e)
         finally:
-            memory_obj.ref_count_down()
             with self.put_lock:
                 self.put_tasks.discard(key)
 
@@ -407,8 +395,6 @@ class MaruBackend(AllocatorBackendInterface):
         except Exception as e:
             logger.error("[Maru] batch_store failed: %s", e)
         finally:
-            for memory_obj in memory_objs:
-                memory_obj.ref_count_down()
             with self.put_lock:
                 self.put_tasks.difference_update(keys)
 
@@ -515,7 +501,6 @@ class MaruBackend(AllocatorBackendInterface):
                 results.append(None)
                 continue
             memory_obj.ref_count_up()
-            memory_obj.pin()
             results.append(memory_obj)
 
         hits = sum(1 for r in results if r is not None)
@@ -593,7 +578,6 @@ class MaruBackend(AllocatorBackendInterface):
                 if memory_obj is None:
                     break
                 memory_obj.ref_count_up()
-                memory_obj.pin()
                 results.append(memory_obj)
 
             logger.debug(
