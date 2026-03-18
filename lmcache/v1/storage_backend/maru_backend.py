@@ -322,6 +322,12 @@ class MaruBackend(AllocatorBackendInterface):
         """
         for memory_obj in memory_objs:
             assert memory_obj.tensor is not None
+            # ref_count_up x2 (same as submit_put_task):
+            # 1) pool reference — stays at 1 after SM's ref_count_down
+            # 2) _async_batch_store guard — prevents ref_count reaching 0
+            #    before the async RPC completes
+            memory_obj.ref_count_up()
+            memory_obj.ref_count_up()
 
         with self.put_lock:
             self.put_tasks.update(keys)
@@ -401,6 +407,8 @@ class MaruBackend(AllocatorBackendInterface):
         except Exception as e:
             logger.error("[Maru] batch_store failed: %s", e)
         finally:
+            for memory_obj in memory_objs:
+                memory_obj.ref_count_down()
             with self.put_lock:
                 self.put_tasks.difference_update(keys)
 
