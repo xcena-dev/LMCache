@@ -218,19 +218,6 @@ class StorageBackendInterface(metaclass=abc.ABCMeta):
         """
         raise NotImplementedError
 
-    def batched_unpin(
-        self,
-        keys: List[CacheEngineKey],
-    ) -> None:
-        """
-        Unpin multiple memory objects. Default calls unpin() per key.
-        Subclasses may override for batch optimization (e.g. single RPC).
-
-        :param List[CacheEngineKey] keys: The keys to unpin.
-        """
-        for key in keys:
-            self.unpin(key)
-
     @abc.abstractmethod
     def remove(self, key: CacheEngineKey, force: bool = True) -> bool:
         """

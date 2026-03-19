@@ -1054,7 +1054,8 @@ class StorageManager:
         """
         for backend_name, backend in self.storage_backends.items():
             if locations is None or backend_name in locations:
-                backend.batched_unpin(keys)
+                for key in keys:
+                    backend.unpin(key)
 
     def clear(
         self,

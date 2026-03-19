@@ -671,19 +671,6 @@ class MaruBackend(AllocatorBackendInterface):
             key = key.with_new_worker_id(0)
         return self._handler.unpin_kv(key.to_string())
 
-    def batched_unpin(self, keys: List[CacheEngineKey]) -> None:
-        """Unpin multiple keys in a single RPC call.
-
-        Overrides the default loop-based implementation for batch optimization.
-        """
-        key_strs = [
-            k.with_new_worker_id(0).to_string()
-            if self._mla_worker_id_as0_mode
-            else k.to_string()
-            for k in keys
-        ]
-        self._handler.batch_unpin_kv(key_strs)
-
     def remove(self, key: CacheEngineKey, force: bool = True) -> bool:
         """Remove a key from MaruServer.
 
