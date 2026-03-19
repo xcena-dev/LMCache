@@ -219,10 +219,6 @@ def CreateStorageBackends(
         storage_backends[str(gds_backend)] = gds_backend
 
     if config.maru_path is not None and "MaruBackend" not in _skip:
-        assert not config.enable_pd, (
-            "MaruBackend and PDBackend cannot be enabled simultaneously. "
-            "Set enable_pd=False when using maru_path."
-        )
         # First Party
         from lmcache.v1.storage_backend.maru_backend import MaruBackend
 
