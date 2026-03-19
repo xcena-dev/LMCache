@@ -366,6 +366,9 @@ class MaruBackend(AllocatorBackendInterface):
             with self.put_lock:
                 self.put_tasks.discard(key)
 
+            if not success:
+                memory_obj.ref_count_down()
+
             if success and on_complete_callback is not None:
                 try:
                     on_complete_callback(key)
@@ -397,6 +400,12 @@ class MaruBackend(AllocatorBackendInterface):
         finally:
             with self.put_lock:
                 self.put_tasks.difference_update(keys)
+
+            # Release ref_count for failed stores
+            for i, memory_obj in enumerate(memory_objs):
+                succeeded = results is not None and i < len(results) and results[i]
+                if not succeeded:
+                    memory_obj.ref_count_down()
 
             if on_complete_callback is not None:
                 for i, key in enumerate(keys):
@@ -681,6 +690,8 @@ class MaruBackend(AllocatorBackendInterface):
         Returns:
             True if removed successfully.
         """
+        if self._mla_worker_id_as0_mode:
+            key = key.with_new_worker_id(0)
         key_str = key.to_string()
         result = self._handler.delete(key_str)
         logger.debug("[Maru] remove key=%s success=%s", key, result)
