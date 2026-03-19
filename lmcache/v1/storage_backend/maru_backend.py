@@ -7,8 +7,8 @@ import asyncio
 import re
 import threading
 
-# Third Party
 try:
+    # Third Party
     from maru import MaruConfig, MaruHandler
 except ImportError as e:
     raise ImportError(
@@ -17,6 +17,7 @@ except ImportError as e:
     ) from e
 
 try:
+    # Third Party
     from maru_lmcache import CxlMemoryAdapter
 except ImportError as e:
     raise ImportError(
@@ -24,6 +25,7 @@ except ImportError as e:
         "Please install it according to the Maru setup documentation."
     ) from e
 
+# Third Party
 import torch
 
 # First Party
@@ -598,7 +600,6 @@ class MaruBackend(AllocatorBackendInterface):
                 "[Maru] batch_get_non_blocking %d/%d hits", len(results), len(keys)
             )
             return results
-
 
         return await asyncio.to_thread(_batch_get)
 
