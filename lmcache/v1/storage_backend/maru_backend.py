@@ -680,6 +680,22 @@ class MaruBackend(AllocatorBackendInterface):
             key = key.with_new_worker_id(0)
         return self._handler.unpin_kv(key.to_string())
 
+    def batched_unpin(self, keys: List[CacheEngineKey]) -> None:
+        """Batch-unpin keys via single RPC.
+
+        Decrements server-side pin_count for each key. When pin_count
+        reaches 0, the entry becomes eligible for eviction.
+
+        Args:
+            keys: The cache keys to unpin.
+        """
+        if not keys:
+            return
+        if self._mla_worker_id_as0_mode:
+            keys = [k.with_new_worker_id(0) for k in keys]
+        key_strs = [k.to_string() for k in keys]
+        self._handler.batch_unpin_kv(key_strs)
+
     def remove(self, key: CacheEngineKey, force: bool = True) -> bool:
         """Remove a key from MaruServer.
 
