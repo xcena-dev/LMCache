@@ -301,6 +301,8 @@ class MaruBackend(AllocatorBackendInterface):
         """
         assert memory_obj.tensor is not None
 
+        memory_obj.ref_count_up()
+
         with self.put_lock:
             self.put_tasks.add(key)
 
@@ -330,6 +332,7 @@ class MaruBackend(AllocatorBackendInterface):
         """
         for memory_obj in memory_objs:
             assert memory_obj.tensor is not None
+            memory_obj.ref_count_up()
 
         with self.put_lock:
             self.put_tasks.update(keys)
@@ -379,6 +382,9 @@ class MaruBackend(AllocatorBackendInterface):
             with self.put_lock:
                 self.put_tasks.discard(key)
 
+            if not success:
+                memory_obj.ref_count_down()
+
             if success and on_complete_callback is not None:
                 try:
                     on_complete_callback(key)
@@ -410,6 +416,12 @@ class MaruBackend(AllocatorBackendInterface):
         finally:
             with self.put_lock:
                 self.put_tasks.difference_update(keys)
+
+            # Release ref_count for failed stores
+            for i, memory_obj in enumerate(memory_objs):
+                succeeded = results is not None and i < len(results) and results[i]
+                if not succeeded:
+                    memory_obj.ref_count_down()
 
             if on_complete_callback is not None:
                 for i, key in enumerate(keys):
@@ -469,7 +481,6 @@ class MaruBackend(AllocatorBackendInterface):
             return None
 
         memory_obj.ref_count_up()
-        memory_obj.pin()
 
         logger.debug(
             "[Maru] get_blocking rid=%d pid=%d size=%d",
@@ -515,7 +526,6 @@ class MaruBackend(AllocatorBackendInterface):
                 results.append(None)
                 continue
             memory_obj.ref_count_up()
-            memory_obj.pin()
             results.append(memory_obj)
 
         hits = sum(1 for r in results if r is not None)
@@ -593,7 +603,6 @@ class MaruBackend(AllocatorBackendInterface):
                 if memory_obj is None:
                     break
                 memory_obj.ref_count_up()
-                memory_obj.pin()
                 results.append(memory_obj)
 
             logger.debug(
@@ -612,7 +621,8 @@ class MaruBackend(AllocatorBackendInterface):
 
         Args:
             key: The cache key.
-            pin: If True, pin the entry. (TODO: delegate to handler)
+            pin: If True, atomically check existence and pin the entry
+                 to protect it from eviction.
 
         Returns:
             True if key exists.
@@ -620,7 +630,10 @@ class MaruBackend(AllocatorBackendInterface):
         if self._mla_worker_id_as0_mode:
             key = key.with_new_worker_id(0)
 
-        return self._handler.exists(key.to_string())
+        key_str = key.to_string()
+        if pin:
+            return self._handler.exists_and_pin(key_str)
+        return self._handler.exists(key_str)
 
     def batched_contains(
         self,
@@ -631,7 +644,8 @@ class MaruBackend(AllocatorBackendInterface):
 
         Args:
             keys: Keys to check in prefix order.
-            pin: Whether to pin. Not supported.
+            pin: If True, atomically check and pin via
+                 batch_exists_and_pin RPC.
 
         Returns:
             Number of prefix-contiguous keys that exist.
@@ -640,7 +654,10 @@ class MaruBackend(AllocatorBackendInterface):
             keys = [k.with_new_worker_id(0) for k in keys]
 
         key_strs = [k.to_string() for k in keys]
-        results = self._handler.batch_exists(key_strs)
+        if pin:
+            results = self._handler.batch_exists_and_pin(key_strs)
+        else:
+            results = self._handler.batch_exists(key_strs)
         num_hit = 0
         for exists in results:
             if not exists:
@@ -649,10 +666,9 @@ class MaruBackend(AllocatorBackendInterface):
         return num_hit
 
     def pin(self, key: CacheEngineKey) -> bool:
-        """Pin a key to prevent eviction.
+        """Pin a key to prevent eviction on MaruServer.
 
-        TODO: Delegate to MaruHandler.pin() once server-side
-        ref_count management is implemented.
+        Increments the server-side pin_count.
 
         Args:
             key: The cache key.
@@ -660,13 +676,15 @@ class MaruBackend(AllocatorBackendInterface):
         Returns:
             True if pinned successfully.
         """
-        return False
+        if self._mla_worker_id_as0_mode:
+            key = key.with_new_worker_id(0)
+        return self._handler.pin_kv(key.to_string())
 
     def unpin(self, key: CacheEngineKey) -> bool:
-        """Unpin a key to allow eviction.
+        """Unpin a key to allow eviction on MaruServer.
 
-        TODO: Delegate to MaruHandler.unpin() once server-side
-        ref_count management is implemented.
+        Decrements the server-side pin_count. When pin_count reaches 0,
+        the entry becomes eligible for eviction.
 
         Args:
             key: The cache key.
@@ -674,7 +692,25 @@ class MaruBackend(AllocatorBackendInterface):
         Returns:
             True if unpinned successfully.
         """
-        return False
+        if self._mla_worker_id_as0_mode:
+            key = key.with_new_worker_id(0)
+        return self._handler.unpin_kv(key.to_string())
+
+    def batched_unpin(self, keys: List[CacheEngineKey]) -> None:
+        """Batch-unpin keys via single RPC.
+
+        Decrements server-side pin_count for each key. When pin_count
+        reaches 0, the entry becomes eligible for eviction.
+
+        Args:
+            keys: The cache keys to unpin.
+        """
+        if not keys:
+            return
+        if self._mla_worker_id_as0_mode:
+            keys = [k.with_new_worker_id(0) for k in keys]
+        key_strs = [k.to_string() for k in keys]
+        self._handler.batch_unpin_kv(key_strs)
 
     def remove(self, key: CacheEngineKey, force: bool = True) -> bool:
         """Remove a key from MaruServer.
@@ -686,6 +722,8 @@ class MaruBackend(AllocatorBackendInterface):
         Returns:
             True if removed successfully.
         """
+        if self._mla_worker_id_as0_mode:
+            key = key.with_new_worker_id(0)
         key_str = key.to_string()
         result = self._handler.delete(key_str)
         logger.debug("[Maru] remove key=%s success=%s", key, result)
