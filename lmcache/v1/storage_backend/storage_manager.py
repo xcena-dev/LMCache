@@ -314,9 +314,7 @@ class StorageManager:
         if self.enable_pd:
             allocator_backend = self.storage_backends["PDBackend"]
         elif "MaruBackend" in self.storage_backends:
-            if config.maru_as_primary_allocator:
-                allocator_backend = self.storage_backends["MaruBackend"]
-            elif "LocalCPUBackend" in self.storage_backends:
+            if "LocalCPUBackend" in self.storage_backends:
                 allocator_backend = self.storage_backends["LocalCPUBackend"]
             else:
                 allocator_backend = self.storage_backends["MaruBackend"]
