@@ -5,6 +5,7 @@ from concurrent.futures import Future
 from typing import Any, Callable, List, Optional, Sequence, Union
 import asyncio
 import threading
+import time
 
 # Third Party
 from maru import MaruConfig, MaruHandler
@@ -723,13 +724,12 @@ class MaruBackend(AllocatorBackendInterface):
 
     def close(self) -> None:
         """Close the backend and underlying MaruHandler."""
-        with self.put_lock:
-            pending = len(self.put_tasks)
-        if pending > 0:
-            logger.warning(
-                "[Maru] closing with %d in-flight put tasks still pending",
-                pending,
-            )
+        while True:
+            with self.put_lock:
+                if not self.put_tasks:
+                    break
+            time.sleep(0.1)
+
         self.memory_allocator.close()
         self._handler.close()
         logger.info("MaruBackend closed.")

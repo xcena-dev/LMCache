@@ -720,17 +720,17 @@ class TestMaruBackendLifecycle:
         backend.memory_allocator.close.assert_called_once()
         backend._handler.close.assert_called_once()
 
-    def test_close_with_pending_put_tasks(self, backend, adapter):
-        """close() should warn but not raise when put tasks are pending."""
+    def test_close_drains_pending_put_tasks(self, backend, adapter):
+        """close() should wait for in-flight put tasks to complete."""
         obj = _make_memory_obj(adapter)
         obj.parent_allocator = None
         key = _make_cache_key()
 
-        # Manually add to put_tasks to simulate in-flight
-        with backend.put_lock:
-            backend.put_tasks.add(key)
+        # Submit a real put task that will complete via the event loop
+        future = backend.submit_put_task(key, obj)
+        future.result(timeout=5)
 
-        # Should not raise
+        # After drain, close should succeed
         backend.close()
         backend._handler.close.assert_called_once()
 
