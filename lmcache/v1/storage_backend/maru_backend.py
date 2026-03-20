@@ -379,6 +379,7 @@ class MaruBackend(AllocatorBackendInterface):
 
         except Exception as e:
             logger.error("[Maru] store failed key=%s: %s", key, e)
+            raise
         finally:
             with self.put_lock:
                 self.put_tasks.discard(key)
@@ -414,6 +415,7 @@ class MaruBackend(AllocatorBackendInterface):
                 logger.debug("[Maru] batch_store %d/%d ok", sum(results), len(results))
         except Exception as e:
             logger.error("[Maru] batch_store failed: %s", e)
+            raise
         finally:
             with self.put_lock:
                 self.put_tasks.difference_update(keys)

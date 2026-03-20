@@ -329,12 +329,10 @@ class TestMaruBackendPut:
         store_entered = threading.Event()
         store_proceed = threading.Event()
 
-        original_store = backend._handler.store
-
         def blocking_store(*args, **kwargs):
             store_entered.set()
             store_proceed.wait(timeout=5)
-            return original_store(*args, **kwargs)
+            return True
 
         backend._handler.store.side_effect = blocking_store
 
