@@ -43,14 +43,11 @@ Deploy Model With Maru
 .. code-block:: yaml
 
     chunk_size: 256
-    local_cpu: True
-    max_local_cpu_size: 5
-    remote_url: "maru://localhost:5555"
-    remote_serde: "naive"
+    save_unfull_chunk: True
 
-    extra_config:
-      maru_pool_size: "4G"
-      save_chunk_meta: False
+    # Maru backend
+    maru_path: "tcp://localhost:5555"
+    maru_pool_size: 4G
 
 **3. Start vLLM with Maru**
 
@@ -75,11 +72,14 @@ Configuration
    * - Parameter
      - Default
      - Description
-   * - ``remote_url``
+   * - ``maru_path``
      - Required
-     - Maru server URL (format: ``maru://host:port``)
+     - Maru server URL (format: ``tcp://host:port``)
+   * - ``maru_pool_size``
+     - ``"4G"``
+     - CXL memory pool size per instance (e.g., ``"4G"``, ``"500M"``)
 
-**Maru Parameters (via extra_config):**
+**Advanced Parameters (via extra_config):**
 
 .. list-table::
    :header-rows: 1
@@ -88,17 +88,11 @@ Configuration
    * - Parameter
      - Default
      - Description
-   * - ``maru_pool_size``
-     - ``"1G"``
-     - CXL memory pool size per instance (e.g., ``"4G"``, ``"500M"``)
    * - ``maru_instance_id``
      - auto UUID
      - Unique client instance identifier
-   * - ``maru_operation_timeout``
-     - 10.0
-     - Per-operation timeout in seconds
    * - ``maru_timeout_ms``
-     - 2000
+     - 5000
      - ZMQ RPC socket timeout in milliseconds
    * - ``maru_use_async_rpc``
      - true
