@@ -4,7 +4,6 @@
 from concurrent.futures import Future
 from typing import Any, Callable, List, Optional, Sequence, Union
 import asyncio
-import re
 import threading
 
 # Third Party
@@ -93,24 +92,9 @@ class MaruBackend(AllocatorBackendInterface):
         return self.__class__.__name__
 
     @staticmethod
-    def _parse_pool_size(raw: Optional[str]) -> int:
-        """Parse human-readable pool size (e.g. '4G', '512M') to bytes."""
-        _DEFAULT = 4 * 1024**3
-        if raw is None:
-            return _DEFAULT
-        if isinstance(raw, (int, float)):
-            return int(raw)
-        s = str(raw).strip().upper()
-        match = re.match(r"^(\d+(?:\.\d+)?)\s*([KMGT]?)B?$", s)
-        if not match:
-            try:
-                return int(s)
-            except ValueError:
-                logger.warning("Cannot parse maru_pool_size=%r, using default", raw)
-                return _DEFAULT
-        value, unit = float(match.group(1)), match.group(2)
-        multipliers = {"": 1, "K": 1024, "M": 1024**2, "G": 1024**3, "T": 1024**4}
-        return int(value * multipliers.get(unit, 1))
+    def _pool_size_gb_to_bytes(size_gb: float) -> int:
+        """Convert pool size in GB to bytes."""
+        return int(size_gb * 1024**3)
 
     # =========================================================================
     # Initialization helpers
@@ -142,7 +126,7 @@ class MaruBackend(AllocatorBackendInterface):
         maru_config = MaruConfig(
             server_url=server_url,
             instance_id=extra.get("maru_instance_id"),
-            pool_size=self._parse_pool_size(config.maru_pool_size),
+            pool_size=self._pool_size_gb_to_bytes(config.maru_pool_size),
             chunk_size_bytes=self._full_chunk_size_bytes,
             auto_connect=False,
             timeout_ms=extra.get("maru_timeout_ms", 5000),
