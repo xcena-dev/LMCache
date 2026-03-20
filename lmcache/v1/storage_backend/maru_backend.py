@@ -208,7 +208,7 @@ class MaruBackend(AllocatorBackendInterface):
             shapes: Tensor shape(s).
             dtypes: Tensor dtype(s).
             fmt: Memory format.
-            eviction: Unused (no eviction policy yet).
+            eviction: Unused.
             busy_loop: Unused.
 
         Returns:
@@ -264,6 +264,13 @@ class MaruBackend(AllocatorBackendInterface):
         with self.put_lock:
             return key in self.put_tasks
 
+    @staticmethod
+    def _create_immediate_empty_future() -> Future:
+        """Create a Future that is already resolved with None."""
+        f: Future = Future()
+        f.set_result(None)
+        return f
+
     def submit_put_task(
         self,
         key: CacheEngineKey,
@@ -283,6 +290,10 @@ class MaruBackend(AllocatorBackendInterface):
         Returns:
             Future that completes when metadata is registered.
         """
+        # If MLA worker id as 0 mode is enabled, skip put tasks
+        if self._mla_worker_id_as0_mode:
+            return self._create_immediate_empty_future()
+
         assert memory_obj.tensor is not None
 
         # Keep CXL page alive: ref_count_down is only called on failure.
@@ -316,6 +327,10 @@ class MaruBackend(AllocatorBackendInterface):
         Returns:
             List containing a single Future for the entire batch.
         """
+        # If MLA worker id as 0 mode is enabled, skip put tasks
+        if self._mla_worker_id_as0_mode:
+            return None
+
         for memory_obj in memory_objs:
             assert memory_obj.tensor is not None
             memory_obj.ref_count_up()
