@@ -632,7 +632,7 @@ class MaruBackend(AllocatorBackendInterface):
 
         key_str = key.to_string()
         if pin:
-            return self._handler.exists_and_pin(key_str)
+            return self._handler.pin(key_str)
         return self._handler.exists(key_str)
 
     def batched_contains(
@@ -645,7 +645,7 @@ class MaruBackend(AllocatorBackendInterface):
         Args:
             keys: Keys to check in prefix order.
             pin: If True, atomically check and pin via
-                 batch_exists_and_pin RPC.
+                 batch_pin RPC.
 
         Returns:
             Number of prefix-contiguous keys that exist.
@@ -655,7 +655,7 @@ class MaruBackend(AllocatorBackendInterface):
 
         key_strs = [k.to_string() for k in keys]
         if pin:
-            results = self._handler.batch_exists_and_pin(key_strs)
+            results = self._handler.batch_pin(key_strs)
         else:
             results = self._handler.batch_exists(key_strs)
         num_hit = 0
@@ -694,7 +694,7 @@ class MaruBackend(AllocatorBackendInterface):
         """
         if self._mla_worker_id_as0_mode:
             key = key.with_new_worker_id(0)
-        return self._handler.unpin_kv(key.to_string())
+        return self._handler.unpin(key.to_string())
 
     def batched_unpin(self, keys: List[CacheEngineKey]) -> None:
         """Batch-unpin keys via single RPC.
@@ -710,7 +710,7 @@ class MaruBackend(AllocatorBackendInterface):
         if self._mla_worker_id_as0_mode:
             keys = [k.with_new_worker_id(0) for k in keys]
         key_strs = [k.to_string() for k in keys]
-        self._handler.batch_unpin_kv(key_strs)
+        self._handler.batch_unpin(key_strs)
 
     def remove(self, key: CacheEngineKey, force: bool = True) -> bool:
         """Remove a key from MaruServer.
