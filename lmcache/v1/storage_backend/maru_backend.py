@@ -155,7 +155,7 @@ class MaruBackend(AllocatorBackendInterface):
             server_url = "tcp://" + server_url[len("maru://") :]
 
         extra = config.extra_config or {}
-        maru_config = MaruConfig(
+        maru_kwargs = dict(
             server_url=server_url,
             instance_id=extra.get("maru_instance_id"),
             pool_size=self._parse_pool_size(config.maru_pool_size),
@@ -166,6 +166,26 @@ class MaruBackend(AllocatorBackendInterface):
             max_inflight=extra.get("maru_max_inflight", 64),
             eager_map=extra.get("maru_eager_map", True),
         )
+        pool_id = extra.get("maru_pool_id")
+        if pool_id is not None:
+            try:
+                if isinstance(pool_id, list):
+                    if pool_id:
+                        maru_kwargs["pool_id"] = [int(p) for p in pool_id]
+                elif isinstance(pool_id, str):
+                    stripped = pool_id.strip()
+                    if stripped:
+                        if "," in stripped:
+                            maru_kwargs["pool_id"] = [
+                                int(p.strip()) for p in stripped.split(",") if p.strip()
+                            ]
+                        else:
+                            maru_kwargs["pool_id"] = int(stripped)
+                else:
+                    maru_kwargs["pool_id"] = int(pool_id)
+            except (ValueError, TypeError) as e:
+                raise ValueError(f"Invalid maru_pool_id={pool_id!r}: {e}") from e
+        maru_config = MaruConfig(**maru_kwargs)
 
         handler = MaruHandler(maru_config)
         if not handler.connect():
