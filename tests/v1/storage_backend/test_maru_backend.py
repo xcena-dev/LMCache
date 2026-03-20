@@ -388,6 +388,44 @@ class TestMaruBackendPut:
         assert future.result(timeout=5) is None
         backend._handler.store.assert_not_called()
 
+    def test_submit_put_task_refcount_down_on_failure(self, backend, adapter):
+        """On store failure, ref_count should return to pre-submit level."""
+        obj = _make_memory_obj(adapter)
+        obj.parent_allocator = None
+        key = _make_cache_key()
+        initial_ref = obj.get_ref_count()
+
+        backend._handler.store.side_effect = RuntimeError("store failed")
+
+        future = backend.submit_put_task(key, obj)
+        with pytest.raises(RuntimeError):
+            future.result(timeout=5)
+
+        assert obj.get_ref_count() == initial_ref
+        assert not backend.exists_in_put_tasks(key)
+
+    def test_batched_submit_put_task_refcount_down_on_failure(
+        self, backend, adapter
+    ):
+        """On batch_store failure, ref_count should return to pre-submit level."""
+        keys = [_make_cache_key(i) for i in range(3)]
+        objs = [_make_memory_obj(adapter) for _ in range(3)]
+        for obj in objs:
+            obj.parent_allocator = None
+        initial_refs = [obj.get_ref_count() for obj in objs]
+
+        backend._handler.batch_store.side_effect = RuntimeError("batch failed")
+
+        futures = backend.batched_submit_put_task(keys, objs)
+        for future in futures:
+            with pytest.raises(RuntimeError):
+                future.result(timeout=5)
+
+        for obj, initial_ref in zip(objs, initial_refs):
+            assert obj.get_ref_count() == initial_ref
+        for key in keys:
+            assert not backend.exists_in_put_tasks(key)
+
     def test_batched_submit_put_task_skips_in_mla_mode(self, backend, adapter):
         """In MLA worker_id_as0 mode, batched_submit_put_task should skip."""
         backend._mla_worker_id_as0_mode = True
