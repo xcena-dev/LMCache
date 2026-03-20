@@ -43,6 +43,8 @@ Deploy Model With Maru
 .. code-block:: yaml
 
     chunk_size: 256
+    local_cpu: False
+    max_local_cpu_size: 0
     save_unfull_chunk: True
 
     # Maru backend
