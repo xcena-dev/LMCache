@@ -1,10 +1,10 @@
 # SPDX-License-Identifier: Apache-2.0
 
 # Standard
+from unittest.mock import MagicMock, patch
 import asyncio
 import mmap
 import threading
-from unittest.mock import MagicMock, patch
 
 # Third Party
 import pytest
@@ -19,7 +19,6 @@ from lmcache.v1.storage_backend.abstract_backend import AllocatorBackendInterfac
 from tests.v1.utils import (
     check_method_signatures,
     get_abstract_methods,
-    get_all_methods_from_base,
     get_methods_implemented_in_class,
 )
 
@@ -28,11 +27,13 @@ maru_lmcache = pytest.importorskip(
     "maru_lmcache", reason="maru_lmcache package not installed"
 )
 
-# Local
-from lmcache.v1.storage_backend.maru_backend import MaruBackend
-from maru_handler.memory import AllocHandle
-from maru_handler.memory.types import MappedRegion, MemoryInfo
-from maru_lmcache.adapter import CxlMemoryAdapter
+# Third Party
+from maru_handler.memory import AllocHandle  # noqa: E402
+from maru_handler.memory.types import MappedRegion, MemoryInfo  # noqa: E402
+from maru_lmcache.adapter import CxlMemoryAdapter  # noqa: E402
+
+# First Party
+from lmcache.v1.storage_backend.maru_backend import MaruBackend  # noqa: E402
 
 # =========================================================================
 # Constants
@@ -85,9 +86,7 @@ def _make_mock_handler(pool_size=4096, chunk_size=TEST_CHUNK_SIZE):
         idx = page_counter[0]
         page_counter[0] += 1
         buf = mapped_region.get_buffer_view(idx * chunk_size, size)
-        return AllocHandle(
-            buf=buf, _region_id=region_id, _page_index=idx, _size=size
-        )
+        return AllocHandle(buf=buf, _region_id=region_id, _page_index=idx, _size=size)
 
     handler.alloc.side_effect = mock_alloc
     handler.free = MagicMock()
@@ -174,7 +173,6 @@ def backend(mock_handler, adapter, async_loop):
     """Create a MaruBackend with mocked internals."""
     # Local
 
-
     with patch.object(MaruBackend, "initialize_allocator", return_value=adapter):
         backend = MaruBackend.__new__(MaruBackend)
         backend.dst_device = "cpu"
@@ -219,53 +217,35 @@ class TestMaruBackendParsePoolSize:
     """Test _parse_pool_size static method."""
 
     def test_none_returns_default(self):
-    
-
         result = MaruBackend._parse_pool_size(None)
         assert result == 4 * 1024**3
 
     def test_parse_gigabytes(self):
-    
-
         assert MaruBackend._parse_pool_size("4G") == 4 * 1024**3
         assert MaruBackend._parse_pool_size("4GB") == 4 * 1024**3
 
     def test_parse_megabytes(self):
-    
-
         assert MaruBackend._parse_pool_size("512M") == 512 * 1024**2
         assert MaruBackend._parse_pool_size("512MB") == 512 * 1024**2
 
     def test_parse_kilobytes(self):
-    
-
         assert MaruBackend._parse_pool_size("1K") == 1024
         assert MaruBackend._parse_pool_size("1KB") == 1024
 
     def test_parse_terabytes(self):
-    
-
         assert MaruBackend._parse_pool_size("1T") == 1024**4
 
     def test_parse_plain_integer_string(self):
-    
-
         assert MaruBackend._parse_pool_size("1048576") == 1048576
 
     def test_parse_integer_value(self):
-    
-
         assert MaruBackend._parse_pool_size(2048) == 2048
 
     def test_parse_invalid_returns_default(self):
-    
-
         result = MaruBackend._parse_pool_size("invalid")
         assert result == 4 * 1024**3
 
     def test_parse_case_insensitive(self):
-    
-
         assert MaruBackend._parse_pool_size("4g") == 4 * 1024**3
         assert MaruBackend._parse_pool_size("512m") == 512 * 1024**2
 
@@ -274,8 +254,6 @@ class TestMaruBackendInterfaceCompliance:
     """Verify MaruBackend implements all required interface methods."""
 
     def test_implements_all_abstract_methods(self):
-    
-
         abstract = get_abstract_methods(AllocatorBackendInterface)
         implemented = get_methods_implemented_in_class(
             MaruBackend, AllocatorBackendInterface
@@ -284,8 +262,6 @@ class TestMaruBackendInterfaceCompliance:
         assert not missing, f"Missing abstract methods: {missing}"
 
     def test_method_signatures_match(self):
-    
-
         # Known: batched_submit_put_task uses 'memory_objs' instead of 'objs'
         # TODO: Rename to 'objs' for full compliance
         known_param_renames = {"batched_submit_put_task"}
@@ -618,9 +594,7 @@ class TestMaruBackendAsyncLookup:
 
     def test_batched_async_contains_empty(self, backend, async_loop):
         backend._handler.batch_exists.return_value = []
-        result = _run_async(
-            async_loop, backend.batched_async_contains("lookup-3", [])
-        )
+        result = _run_async(async_loop, backend.batched_async_contains("lookup-3", []))
         assert result == 0
 
     def test_batched_get_non_blocking_all_hit(self, backend, adapter, async_loop):
