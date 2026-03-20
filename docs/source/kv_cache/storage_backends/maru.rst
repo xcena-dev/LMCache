@@ -49,7 +49,7 @@ Deploy Model With Maru
 
     # Maru backend
     maru_path: "tcp://localhost:5555"
-    maru_pool_size: 4G
+    maru_pool_size: 4
 
 **3. Start vLLM with Maru**
 
@@ -78,8 +78,8 @@ Configuration
      - Required
      - Maru server URL (format: ``tcp://host:port``)
    * - ``maru_pool_size``
-     - ``"4G"``
-     - CXL memory pool size per instance (e.g., ``"4G"``, ``"500M"``)
+     - ``4.0``
+     - CXL memory pool size per instance in GB (e.g., ``4``, ``0.5``)
 
 **Advanced Parameters (via extra_config):**
 

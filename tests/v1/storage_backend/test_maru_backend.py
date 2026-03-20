@@ -176,7 +176,7 @@ def backend(mock_handler, adapter, async_loop):
         backend = MaruBackend.__new__(MaruBackend)
         backend.dst_device = "cpu"
         backend.config = MagicMock()
-        backend.config.maru_pool_size = "4K"
+        backend.config.maru_pool_size = 4.0
         backend.loop = async_loop
         backend.memory_allocator = adapter
         backend._handler = mock_handler
@@ -212,41 +212,20 @@ class TestMaruBackendInit:
         assert backend.get_memory_allocator() is adapter
 
 
-class TestMaruBackendParsePoolSize:
-    """Test _parse_pool_size static method."""
+class TestMaruBackendPoolSizeGbToBytes:
+    """Test _pool_size_gb_to_bytes static method."""
 
-    def test_none_returns_default(self):
-        result = MaruBackend._parse_pool_size(None)
-        assert result == 4 * 1024**3
+    def test_4gb(self):
+        assert MaruBackend._pool_size_gb_to_bytes(4.0) == 4 * 1024**3
 
-    def test_parse_gigabytes(self):
-        assert MaruBackend._parse_pool_size("4G") == 4 * 1024**3
-        assert MaruBackend._parse_pool_size("4GB") == 4 * 1024**3
+    def test_half_gb(self):
+        assert MaruBackend._pool_size_gb_to_bytes(0.5) == 512 * 1024**2
 
-    def test_parse_megabytes(self):
-        assert MaruBackend._parse_pool_size("512M") == 512 * 1024**2
-        assert MaruBackend._parse_pool_size("512MB") == 512 * 1024**2
+    def test_1gb(self):
+        assert MaruBackend._pool_size_gb_to_bytes(1.0) == 1024**3
 
-    def test_parse_kilobytes(self):
-        assert MaruBackend._parse_pool_size("1K") == 1024
-        assert MaruBackend._parse_pool_size("1KB") == 1024
-
-    def test_parse_terabytes(self):
-        assert MaruBackend._parse_pool_size("1T") == 1024**4
-
-    def test_parse_plain_integer_string(self):
-        assert MaruBackend._parse_pool_size("1048576") == 1048576
-
-    def test_parse_integer_value(self):
-        assert MaruBackend._parse_pool_size(2048) == 2048
-
-    def test_parse_invalid_returns_default(self):
-        result = MaruBackend._parse_pool_size("invalid")
-        assert result == 4 * 1024**3
-
-    def test_parse_case_insensitive(self):
-        assert MaruBackend._parse_pool_size("4g") == 4 * 1024**3
-        assert MaruBackend._parse_pool_size("512m") == 512 * 1024**2
+    def test_zero(self):
+        assert MaruBackend._pool_size_gb_to_bytes(0.0) == 0
 
 
 class TestMaruBackendInterfaceCompliance:
@@ -741,17 +720,17 @@ class TestMaruBackendLifecycle:
         backend.memory_allocator.close.assert_called_once()
         backend._handler.close.assert_called_once()
 
-    def test_close_with_pending_put_tasks(self, backend, adapter):
-        """close() should warn but not raise when put tasks are pending."""
+    def test_close_drains_pending_put_tasks(self, backend, adapter):
+        """close() should wait for in-flight put tasks to complete."""
         obj = _make_memory_obj(adapter)
         obj.parent_allocator = None
         key = _make_cache_key()
 
-        # Manually add to put_tasks to simulate in-flight
-        with backend.put_lock:
-            backend.put_tasks.add(key)
+        # Submit a real put task that will complete via the event loop
+        future = backend.submit_put_task(key, obj)
+        future.result(timeout=5)
 
-        # Should not raise
+        # After drain, close should succeed
         backend.close()
         backend._handler.close.assert_called_once()
 
