@@ -100,7 +100,6 @@ def _make_mock_handler(pool_size=4096, chunk_size=TEST_CHUNK_SIZE):
     handler.batch_exists.return_value = []
     handler.delete.return_value = True
     handler.pin.return_value = True
-    handler.pin_kv.return_value = True
     handler.unpin.return_value = True
     handler.batch_pin.return_value = []
     handler.batch_unpin.return_value = None
@@ -657,14 +656,14 @@ class TestMaruBackendAsyncLookup:
 class TestMaruBackendPinRemove:
     def test_pin_delegates_to_handler(self, backend):
         key = _make_cache_key()
-        backend._handler.pin_kv.return_value = True
+        backend._handler.pin.return_value = True
 
         assert backend.pin(key) is True
-        backend._handler.pin_kv.assert_called_once_with(key.to_string())
+        backend._handler.pin.assert_called_once_with(key.to_string())
 
     def test_pin_returns_false_on_failure(self, backend):
         key = _make_cache_key()
-        backend._handler.pin_kv.return_value = False
+        backend._handler.pin.return_value = False
 
         assert backend.pin(key) is False
 
