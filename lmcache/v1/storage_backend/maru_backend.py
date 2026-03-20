@@ -604,6 +604,7 @@ class MaruBackend(AllocatorBackendInterface):
                 if memory_obj is None:
                     break
                 memory_obj.ref_count_up()
+                memory_obj.pin()
                 results.append(memory_obj)
 
             logger.debug(
