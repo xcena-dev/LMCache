@@ -285,6 +285,8 @@ class MaruBackend(AllocatorBackendInterface):
         """
         assert memory_obj.tensor is not None
 
+        # Keep CXL page alive: ref_count_down is only called on failure.
+        # On success the ref is retained so the CXL memory is not reclaimed.
         memory_obj.ref_count_up()
 
         with self.put_lock:
@@ -662,7 +664,7 @@ class MaruBackend(AllocatorBackendInterface):
         """
         if self._mla_worker_id_as0_mode:
             key = key.with_new_worker_id(0)
-        return self._handler.pin_kv(key.to_string())
+        return self._handler.pin(key.to_string())
 
     def unpin(self, key: CacheEngineKey) -> bool:
         """Unpin a key to allow eviction on MaruServer.
