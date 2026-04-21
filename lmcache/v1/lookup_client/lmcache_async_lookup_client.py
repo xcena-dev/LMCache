@@ -169,6 +169,13 @@ class LMCacheAsyncLookupClient(LookupClientInterface):
             if (req_status := self.reqs_status.get(lookup_id, -1)) == -1:
                 self.reqs_status[lookup_id] = None
                 self.first_lookup_time[lookup_id] = time.time()
+                logger.info(
+                    "[PERF][0.00ms][lookup_client.first_poll]: start=%.2f "
+                    "thread=%s lookup_id=%s status=new",
+                    time.perf_counter_ns() / 1e6,
+                    threading.current_thread().name,
+                    lookup_id,
+                )
             elif req_status is None:
                 time.sleep(self.lookup_backoff_time)
                 if (
@@ -186,7 +193,6 @@ class LMCacheAsyncLookupClient(LookupClientInterface):
                     self.cancel_lookup(lookup_id)
                     self.first_lookup_time.pop(lookup_id, None)
                     return 0
-
             return req_status
 
     # TODO(Jiayi): Consider batching here
@@ -244,6 +250,21 @@ class LMCacheAsyncLookupClient(LookupClientInterface):
                         # can use the minimum value as the number of
                         # hit tokens.
                         self.reqs_status[lookup_id] = min(all_res)
+                        _first_t = self.first_lookup_time.get(lookup_id)
+                        _wait_ms = (
+                            (time.time() - _first_t) * 1000
+                            if _first_t is not None
+                            else -1.0
+                        )
+                        logger.info(
+                            "[PERF][%.2fms][lookup_client.result_arrived]: "
+                            "start=%.2f thread=%s lookup_id=%s hits=%s",
+                            _wait_ms,
+                            time.perf_counter_ns() / 1e6 - max(_wait_ms, 0.0),
+                            threading.current_thread().name,
+                            lookup_id,
+                            min(all_res),
+                        )
 
             except Exception as e:
                 logger.error("Error processing response from worker: %s", e)
@@ -366,6 +387,13 @@ class LMCacheAsyncLookupServer:
 
                 if isinstance(msg, LookupRequestMsg):
                     # Handle lookup request
+                    logger.info(
+                        "[PERF][0.00ms][lookup_server.recv_request]: "
+                        "start=%.2f thread=%s lookup_id=%s",
+                        time.perf_counter_ns() / 1e6,
+                        threading.current_thread().name,
+                        msg.lookup_id,
+                    )
                     self.lmcache_engine.async_lookup_and_prefetch(
                         lookup_id=msg.lookup_id,
                         hashes=msg.hashes,

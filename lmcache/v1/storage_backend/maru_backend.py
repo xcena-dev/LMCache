@@ -572,7 +572,18 @@ class MaruBackend(AllocatorBackendInterface):
                 actual_keys = list(keys)
 
             key_strs = [k.to_string() for k in actual_keys]
+            _t0 = time.perf_counter_ns()
             mem_infos = self._handler.batch_retrieve(key_strs)
+            _dur_ms = (time.perf_counter_ns() - _t0) / 1e6
+            logger.info(
+                "[PERF][%.2fms][maru.batch_retrieve]: start=%.2f "
+                "thread=%s lookup_id=%s n_keys=%d",
+                _dur_ms,
+                _t0 / 1e6,
+                threading.current_thread().name,
+                lookup_id,
+                len(key_strs),
+            )
 
             allocator = self.memory_allocator
             assert isinstance(allocator, CxlMemoryAdapter)

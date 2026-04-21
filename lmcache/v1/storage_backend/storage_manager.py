@@ -18,6 +18,7 @@ from typing import (
 import asyncio
 import functools
 import threading
+import time
 
 # Third Party
 import torch
@@ -661,6 +662,15 @@ class StorageManager:
         "LocalDiskBackend"] for now. If None, search in all backends.
         :param bool pin: Whether to pin the keys.
         """
+        _perf_t0 = time.perf_counter_ns()
+        logger.info(
+            "[PERF][0.00ms][storage_mgr.async_lookup_enter]: start=%.2f "
+            "thread=%s lookup_id=%s n_keys=%d",
+            _perf_t0 / 1e6,
+            threading.current_thread().name,
+            lookup_id,
+            len(keys),
+        )
 
         # NOTE(Jiayi): Currently, the retrieval pattern is always
         # prefix-based. That is, we retrieve 0-t1 tokens from backend 1

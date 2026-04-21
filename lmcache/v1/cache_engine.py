@@ -22,6 +22,8 @@ if TYPE_CHECKING:
 import asyncio
 import gc
 import multiprocessing
+import os
+import threading
 import time
 
 # Third Party
@@ -63,6 +65,31 @@ from lmcache.v1.token_database import (
 )
 
 logger = init_logger(__name__)
+
+
+# ---------------------------------------------------------------------------
+# Perf log (naru perf_parser compatible). Format:
+#   [PERF][{elapsed_ms:.2f}ms][{module}]: start={start_ms} thread={tname} {msg}
+# Enable by setting LMCACHE_PERF_LOG=1 (naru sets this automatically).
+# `start` is time.monotonic()*1000 so timelines can be reconstructed across
+# maru / lmcache sources that share the same clock.
+# ---------------------------------------------------------------------------
+_PERF_LOG = os.environ.get("LMCACHE_PERF_LOG", "0") == "1"
+
+
+def _perf_emit(module: str, t0: float, message: str) -> None:
+    if not _PERF_LOG:
+        return
+    now = time.monotonic()
+    elapsed_ms = (now - t0) * 1000
+    start_ms = t0 * 1000
+    tname = threading.current_thread().name
+    print(
+        f"[PERF][{elapsed_ms:.2f}ms][{module}]: "
+        f"start={start_ms:.3f} thread={tname} {message}",
+        flush=True,
+    )
+
 
 # Type aliases for processed chunks
 # (cache_key, memory_obj, start_index, end_index)
@@ -530,7 +557,14 @@ class LMCacheEngine:
             return
 
         with store_stats.profile_from_gpu():
+            _t0 = time.monotonic()
             self.gpu_connector.batched_from_gpu(memory_objs, starts, ends, **kwargs)
+            _tokens = int(ends[-1] - starts[0]) if starts and ends else 0
+            _perf_emit(
+                "cache_engine",
+                _t0,
+                f"GPU→DRAM copy n={len(memory_objs)} tokens={_tokens}",
+            )
 
         with store_stats.profile_put():
             transfer_spec = kwargs.get("transfer_spec", None)
@@ -851,8 +885,22 @@ class LMCacheEngine:
         if len(reordered_chunks) > 0:
             with retrieve_stats.profile_to_gpu():
                 _, memory_objs, starts, ends = zip(*reordered_chunks, strict=False)
+                memory_objs_list = list(memory_objs)
+                starts_list = list(starts)
+                ends_list = list(ends)
+                _t0 = time.monotonic()
                 self.gpu_connector.batched_to_gpu(
-                    list(memory_objs), list(starts), list(ends), **kwargs
+                    memory_objs_list, starts_list, ends_list, **kwargs
+                )
+                _tokens = (
+                    int(ends_list[-1] - starts_list[0])
+                    if starts_list and ends_list
+                    else 0
+                )
+                _perf_emit(
+                    "cache_engine",
+                    _t0,
+                    f"DRAM→GPU copy n={len(memory_objs_list)} tokens={_tokens}",
                 )
 
         # TODO(Jiayi): Remove the following for loop with batched operations
@@ -1282,6 +1330,15 @@ class LMCacheEngine:
             keys.append(key)
             cum_chunk_lengths.append(end)
 
+        _perf_t0 = time.perf_counter_ns()
+        logger.info(
+            "[PERF][0.00ms][cache_engine.submit_lookup]: start=%.2f "
+            "thread=%s lookup_id=%s n_keys=%d",
+            _perf_t0 / 1e6,
+            threading.current_thread().name,
+            lookup_id,
+            len(keys),
+        )
         asyncio.run_coroutine_threadsafe(
             self.storage_manager.async_lookup_and_prefetch(
                 lookup_id, keys, cum_chunk_lengths, search_range, pin
