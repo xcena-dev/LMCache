@@ -53,22 +53,57 @@ class MaruBackend(AllocatorBackendInterface):
     ):
         super().__init__(dst_device=dst_device)
 
-        if config.use_layerwise:
-            raise NotImplementedError(
-                "MaruBackend does not yet support layerwise KV cache."
-            )
-
         # 1. Config
         self.config = config
         self.loop = loop
+        self._layerwise: bool = config.use_layerwise
 
-        self._full_chunk_size_bytes: int = get_size_bytes(
-            metadata.get_shapes(), metadata.get_dtypes()
-        )
+        # Layerwise: shrink pool chunk to a single layer so each MemoryObj
+        # allocated from the pool holds [kv_size, tokens, hidden_dim] instead
+        # of [kv_size, num_layers, tokens, hidden_dim]. Divide the full-layer
+        # byte size by total number of layers across all KV layer groups.
+        full_shapes = metadata.get_shapes()
+        full_chunk_size_bytes: int = get_size_bytes(full_shapes, metadata.get_dtypes())
+        total_num_layers: int = sum(int(shape[1]) for shape in full_shapes)
+        if self._layerwise:
+            if full_chunk_size_bytes % total_num_layers != 0:
+                raise RuntimeError(
+                    f"Layerwise MaruBackend: full chunk bytes "
+                    f"{full_chunk_size_bytes} not divisible by "
+                    f"total_num_layers {total_num_layers}"
+                )
+            self._full_chunk_size_bytes = full_chunk_size_bytes // total_num_layers
+        else:
+            self._full_chunk_size_bytes = full_chunk_size_bytes
         assert self._full_chunk_size_bytes % metadata.chunk_size == 0
         self._single_token_size: int = (
             self._full_chunk_size_bytes // metadata.chunk_size
         )
+
+        # Default memory format — mirrors CacheEngine's choice in
+        # `lmcache/v1/cache_engine.py` (`self.fmt` in __init__).
+        #   layerwise + MLA           -> KV_MLA_FMT  (not yet supported here)
+        #   layerwise + blending      -> KV_2TD
+        #   layerwise (default)       -> KV_T2D
+        #   non-layerwise + MLA       -> KV_MLA_FMT
+        #   non-layerwise             -> KV_2LTD
+        self._default_fmt: MemoryFormat
+        if self._layerwise:
+            if metadata.use_mla:
+                # MLA layerwise needs a per-layer [tokens, hidden_dim] shape
+                # with a different allocator layout; defer until we can
+                # test it end-to-end.
+                raise NotImplementedError(
+                    "MaruBackend layerwise + MLA is not yet supported."
+                )
+            if config.enable_blending:
+                self._default_fmt = MemoryFormat.KV_2TD
+            else:
+                self._default_fmt = MemoryFormat.KV_T2D
+        elif metadata.use_mla:
+            self._default_fmt = MemoryFormat.KV_MLA_FMT
+        else:
+            self._default_fmt = MemoryFormat.KV_2LTD
 
         self._mla_worker_id_as0_mode: bool = (
             config.get_extra_config_value(
@@ -158,9 +193,26 @@ class MaruBackend(AllocatorBackendInterface):
         Returns:
             CxlMemoryAdapter instance.
         """
-        shapes = metadata.get_shapes()
         dtypes = metadata.get_dtypes()
-        fmt = MemoryFormat.KV_MLA_FMT if metadata.use_mla else MemoryFormat.KV_2LTD
+        if self._layerwise:
+            # Per-layer shape, drop the num_layers axis from
+            # [kv_size, num_layers, tokens, hidden_dim]. Ordering depends on
+            # the memory format:
+            #   KV_T2D -> [tokens, kv_size, hidden_dim]
+            #   KV_2TD -> [kv_size, tokens, hidden_dim]
+            if self._default_fmt == MemoryFormat.KV_T2D:
+                shapes = [
+                    torch.Size([int(s[2]), int(s[0]), int(s[3])])
+                    for s in metadata.get_shapes()
+                ]
+            else:  # KV_2TD
+                shapes = [
+                    torch.Size([int(s[0]), int(s[2]), int(s[3])])
+                    for s in metadata.get_shapes()
+                ]
+        else:
+            shapes = metadata.get_shapes()
+        fmt = self._default_fmt
         chunk_size = self._handler.get_chunk_size()
 
         return CxlMemoryAdapter(
@@ -183,7 +235,7 @@ class MaruBackend(AllocatorBackendInterface):
         self,
         shapes: Union[torch.Size, list[torch.Size]],
         dtypes: Union[torch.dtype, list[torch.dtype]],
-        fmt: MemoryFormat = MemoryFormat.KV_2LTD,
+        fmt: Optional[MemoryFormat] = None,
         eviction: bool = True,
         busy_loop: bool = True,
     ) -> Optional[MemoryObj]:
@@ -199,6 +251,8 @@ class MaruBackend(AllocatorBackendInterface):
         Returns:
             MemoryObj backed by CXL memory, or None on failure.
         """
+        if fmt is None:
+            fmt = self._default_fmt
         obj = self.memory_allocator.allocate(shapes, dtypes, fmt)
         if obj is not None:
             logger.debug(
@@ -214,7 +268,7 @@ class MaruBackend(AllocatorBackendInterface):
         shapes: Union[torch.Size, list[torch.Size]],
         dtypes: Union[torch.dtype, list[torch.dtype]],
         batch_size: int,
-        fmt: MemoryFormat = MemoryFormat.KV_2LTD,
+        fmt: Optional[MemoryFormat] = None,
         eviction: bool = True,
         busy_loop: bool = True,
     ) -> Optional[list[MemoryObj]]:
@@ -231,6 +285,8 @@ class MaruBackend(AllocatorBackendInterface):
         Returns:
             List of MemoryObj, or None if any allocation fails.
         """
+        if fmt is None:
+            fmt = self._default_fmt
         return self.memory_allocator.batched_allocate(shapes, dtypes, batch_size, fmt)
 
     # =========================================================================

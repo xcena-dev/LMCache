@@ -531,7 +531,13 @@ class StorageManager:
         :return: A generator that yields a future for each layer.
         """
         if location is None:
-            location = "LocalCPUBackend"
+            if "LocalCPUBackend" in self.storage_backends:
+                location = "LocalCPUBackend"
+            elif "MaruBackend" in self.storage_backends:
+                location = "MaruBackend"
+            else:
+                # Fall back to first registered allocator-capable backend
+                location = next(iter(self.storage_backends))
         for keys_multi_chunk in keys:
             # Retrieve all chunks for one layer
             backend = self.storage_backends[location]
