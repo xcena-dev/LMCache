@@ -164,6 +164,38 @@ def add_storage_manager_args(
         help="The alignment size in bytes. Default is 4KB (4096 bytes).",
     )
 
+    # Maru L1 backend (optional). When --maru-server-url is set, the
+    # L1 allocator becomes CXL-backed and the DRAM L1 settings above
+    # (--l1-size-gb / --l1-use-lazy / --l1-init-size-gb) are ignored.
+    # Pass ``--l1-size-gb 0`` in that case to satisfy the required flag.
+    maru_group = parser.add_argument_group(
+        "Maru L1 Backend",
+        "Optional CXL-backed L1 via Maru. Overrides DRAM L1 settings.",
+    )
+    maru_group.add_argument(
+        "--maru-server-url",
+        type=str,
+        default=None,
+        help="MaruServer endpoint (e.g. maru://host:port or tcp://host:port). "
+        "When set, the L1 allocator is CXL-backed and the DRAM L1 settings "
+        "(--l1-size-gb, --l1-use-lazy, --l1-init-size-gb) are ignored.",
+    )
+    maru_group.add_argument(
+        "--maru-pool-size-gb",
+        type=float,
+        default=0.0,
+        help="CXL pool size to request from MaruServer (GB). "
+        "Required when --maru-server-url is set.",
+    )
+    maru_group.add_argument(
+        "--maru-instance-id",
+        type=str,
+        default=None,
+        help="Stable client identifier reported to MaruServer for ownership "
+        "tracking and restart recovery. Auto-generated if omitted "
+        "(acceptable for single-node setups; recommended for multi-node).",
+    )
+
     # L1 Manager Config (TTL settings)
     ttl_group = parser.add_argument_group(
         "L1 Manager TTL", "TTL configuration for L1 manager locks"
@@ -286,11 +318,27 @@ def parse_args_to_config(
     Returns:
         StorageManagerConfig: The configuration object.
     """
+    maru_config: Optional["MaruL1Config"] = None
+    if args.maru_server_url is not None:
+        if args.maru_pool_size_gb <= 0:
+            raise ValueError(
+                "--maru-pool-size-gb must be positive when --maru-server-url is set"
+            )
+        # First Party
+        from lmcache.v1.distributed.maru_memory_allocator import MaruL1Config
+
+        maru_config = MaruL1Config(
+            server_url=args.maru_server_url,
+            pool_size_bytes=int(args.maru_pool_size_gb * (1 << 30)),
+            instance_id=args.maru_instance_id,
+        )
+
     memory_config = L1MemoryManagerConfig(
         size_in_bytes=int(args.l1_size_gb * (1 << 30)),
         use_lazy=args.l1_use_lazy,
         init_size_in_bytes=int(args.l1_init_size_gb * (1 << 30)),
         align_bytes=args.l1_align_bytes,
+        maru_config=maru_config,
     )
 
     l1_manager_config = L1ManagerConfig(

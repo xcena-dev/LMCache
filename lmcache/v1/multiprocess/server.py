@@ -35,7 +35,7 @@ from lmcache.v1.gpu_connector.gpu_ops import (
     lmcache_memcpy_async_h2d,
 )
 from lmcache.v1.gpu_connector.utils import LayoutHints
-from lmcache.v1.memory_management import MemoryObj
+from lmcache.v1.memory_management import MemoryFormat, MemoryObj
 from lmcache.v1.mp_observability.config import (
     ObservabilityConfig,
     add_observability_args,
@@ -255,6 +255,19 @@ class MPCacheEngine:
         )
         self.gpu_contexts[instance_id] = gpu_context
         self.gpu_context_meta[instance_id] = (model_name, world_size)
+
+        # Forward the KV layout to the storage manager. The maru
+        # backend needs this to bring up its ``CxlMemoryAdapter`` pool
+        # on first registration; default DRAM backends ignore the
+        # call. Subsequent registrations with a different layout are
+        # rejected by maru (single-model constraint) and pass through
+        # for default backends.
+        layout_desc = get_layout_desc(gpu_context, self.chunk_size)
+        fmt = MemoryFormat.KV_MLA_FMT if gpu_context.is_mla_ else MemoryFormat.KV_2LTD
+        self.storage_manager.register_kv_layout(
+            layout_desc.shapes, layout_desc.dtypes, fmt, self.chunk_size
+        )
+
         logger.info(
             "Registered KV cache for GPU ID %d with %d layers",
             instance_id,
@@ -427,9 +440,19 @@ class MPCacheEngine:
             finally:
                 event.record()
                 if reserved_dict:
+                    # Snapshot keys/values now so the host callback
+                    # sees the same set even if ``reserved_dict`` is
+                    # mutated. ``memory_objs`` is required by the
+                    # maru backend (used to issue
+                    # ``MaruHandler.batch_store``); the default
+                    # backend ignores it.
+                    finish_keys = list(reserved_dict.keys())
+                    finish_objs = list(reserved_dict.values())
                     gpu_context.cupy_stream.launch_host_func(
-                        self.storage_manager.finish_write,
-                        list(reserved_dict.keys()),
+                        lambda _: self.storage_manager.finish_write(
+                            finish_keys, memory_objs=finish_objs
+                        ),
+                        None,
                     )
                 # All reserved MemoryObjs share one layout_desc, so per-object
                 # size is identical — avoid summing N identical values.
