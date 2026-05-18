@@ -6,7 +6,7 @@ Configuration for distributed storage manager
 
 # Standard
 from dataclasses import dataclass, field
-from typing import Literal
+from typing import TYPE_CHECKING, Literal, Optional
 import argparse
 
 # First Party
@@ -16,6 +16,10 @@ from lmcache.v1.distributed.l2_adapters.config import (
     parse_args_to_l2_adapters_config,
 )
 
+if TYPE_CHECKING:
+    # First Party
+    from lmcache.v1.distributed.maru_memory_allocator import MaruL1Config
+
 
 @dataclass
 class L1MemoryManagerConfig:
@@ -24,10 +28,11 @@ class L1MemoryManagerConfig:
     """
 
     size_in_bytes: int
-    """ The size of L1 memory in bytes. """
+    """ The size of L1 memory in bytes. (Ignored when ``maru_config`` is set.) """
 
     use_lazy: bool
-    """ Whether to use lazy initialization for L1 memory. """
+    """ Whether to use lazy initialization for L1 memory.
+    (Ignored when ``maru_config`` is set.) """
 
     init_size_in_bytes: int = field(default=20 << 30)
     """ The initial size when using lazy allocation. Default is 20GB. """
@@ -35,8 +40,15 @@ class L1MemoryManagerConfig:
     align_bytes: int = field(default=0x1000)
     """ The alignment size in bytes. Default is 4KB. """
 
+    maru_config: Optional["MaruL1Config"] = None
+    """ Optional Maru backend config. When set, the L1 allocator is
+    constructed as ``MaruMemoryAllocator`` (CXL-backed) and the DRAM
+    fields above are ignored. See ``docs/source/mp/maru/integration.md``. """
+
     def __post_init__(self):
-        self.init_size_in_bytes = min(self.init_size_in_bytes, self.size_in_bytes)
+        # The DRAM init-size clamp only makes sense for default backends.
+        if self.maru_config is None:
+            self.init_size_in_bytes = min(self.init_size_in_bytes, self.size_in_bytes)
 
 
 @dataclass

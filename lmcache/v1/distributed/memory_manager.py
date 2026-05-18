@@ -27,6 +27,18 @@ def create_memory_allocator(config: L1MemoryManagerConfig) -> MemoryAllocatorInt
     Returns:
         MemoryAllocatorInterface: An instance of a memory allocator.
     """
+    if config.maru_config is not None:
+        # Maru backend — CXL-backed allocator via MaruMemoryAllocator.
+        # Lazy import keeps the maru runtime optional for non-maru builds.
+        # First Party
+        from lmcache.v1.distributed.maru_memory_allocator import MaruMemoryAllocator
+
+        logger.debug(
+            "use maru memory allocator: server=%s pool_size=%d bytes",
+            config.maru_config.server_url,
+            config.maru_config.pool_size_bytes,
+        )
+        return MaruMemoryAllocator(config.maru_config)
     if config.use_lazy:
         logger.debug(
             "use lazy memory allocator, init size is %d bytes, "
@@ -49,6 +61,18 @@ def create_memory_allocator(config: L1MemoryManagerConfig) -> MemoryAllocatorInt
             config.size_in_bytes,
             align_bytes=config.align_bytes,
         )
+
+
+def _is_maru_allocator(allocator: MemoryAllocatorInterface) -> bool:
+    """``isinstance(allocator, MaruMemoryAllocator)`` with lazy import.
+
+    Avoids importing the maru-backed allocator (and indirectly the maru
+    runtime types it lazily uses) when not needed.
+    """
+    # First Party
+    from lmcache.v1.distributed.maru_memory_allocator import MaruMemoryAllocator
+
+    return isinstance(allocator, MaruMemoryAllocator)
 
 
 # MAIN CLASS
@@ -121,6 +145,22 @@ class L1MemoryManager:
             In the future, we may want to make a "callback" based mechanism to
             trigger eviction when the memory usage reaches a watermark.
         """
+        # Maru backend: query MaruHandler stats. Eviction is owned by MaruServer
+        # so this is best-effort observability; on failure return (0, 0) rather
+        # than crash the eviction controller (though eviction is typically
+        # disabled in maru mode — cf. integration.md Phase 1.D).
+        if _is_maru_allocator(self._allocator):
+            try:
+                handler = self._allocator.handler  # type: ignore[attr-defined]
+                stats = handler.get_stats() if hasattr(handler, "get_stats") else {}
+                used = int(stats.get("used_bytes", 0))
+                total = int(
+                    stats.get("pool_size_bytes", 0) or stats.get("pool_size", 0)
+                )
+                return used, total
+            except Exception:
+                logger.exception("Failed to query Maru handler stats")
+                return 0, 0
 
         # HACK: now trying to read this from the address manager in a ad-hoc
         # manner
@@ -152,6 +192,14 @@ class L1MemoryManager:
         Raises:
             NotImplementedError: If the allocator type does not support this operation.
         """
+        if _is_maru_allocator(self._allocator):
+            # No contiguous DRAM buffer to describe — Maru-backed L1 lives in
+            # CXL pages mmap'd via the handler. RDMA-style registration of a
+            # single base pointer does not apply.
+            raise NotImplementedError(
+                "get_l1_memory_desc is not supported for the maru backend "
+                "(L1 lives in CXL via mmap, not a single contiguous buffer)."
+            )
         if isinstance(self._allocator, MixedMemoryAllocator):
             buffer = self._allocator.buffer
         elif isinstance(self._allocator, LazyMemoryAllocator):
