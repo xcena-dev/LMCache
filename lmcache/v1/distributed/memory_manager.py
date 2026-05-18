@@ -90,6 +90,18 @@ class L1MemoryManager:
         self._size_in_bytes = config.size_in_bytes
         self._align_bytes = config.align_bytes
 
+    @property
+    def allocator(self) -> MemoryAllocatorInterface:
+        """Underlying memory allocator.
+
+        Exposed primarily for callers that need allocator-specific
+        operations not in :class:`MemoryAllocatorInterface` — e.g.
+        ``L1Manager``'s maru branch reaches into
+        :class:`MaruMemoryAllocator` for ``handler`` /
+        ``get_by_location`` / ``create_store_handle``.
+        """
+        return self._allocator
+
     def allocate(
         self, layout_desc: MemoryLayoutDesc, count: int
     ) -> tuple[L1Error, list[MemoryObj]]:

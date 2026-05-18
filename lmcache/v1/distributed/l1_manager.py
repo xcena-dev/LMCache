@@ -5,7 +5,7 @@ Managing objects and memory for L1 cache
 
 # Standard
 from dataclasses import dataclass
-from typing import Literal
+from typing import Any, Literal, Optional, cast
 import threading
 
 # First Party
@@ -15,13 +15,28 @@ from lmcache.v1.distributed.api import MemoryLayoutDesc, ObjectKey
 from lmcache.v1.distributed.config import L1ManagerConfig
 from lmcache.v1.distributed.error import L1Error
 from lmcache.v1.distributed.internal_api import L1ManagerListener
-from lmcache.v1.distributed.memory_manager import L1MemoryManager
+from lmcache.v1.distributed.memory_manager import L1MemoryManager, _is_maru_allocator
 from lmcache.v1.memory_management import MemoryObj
 from lmcache.v1.mp_observability.event import Event, EventType
 from lmcache.v1.mp_observability.event_bus import get_event_bus
 from lmcache.v1.mp_observability.otel_init import register_gauge
 
 logger = init_logger(__name__)
+
+
+def _object_key_to_string(key: ObjectKey) -> str:
+    """Stable string representation of ``ObjectKey`` for ``MaruHandler``
+    RPCs.
+
+    The convention mirrors the other L2 adapters (FS / S3 / NIXL /
+    native-connector): ``model@kv_rank@chunk_hex[@salt]``. ``ObjectKey``
+    invariants (no ``@`` in ``model_name`` / ``cache_salt``) ensure the
+    serialization is unambiguous and reversible.
+    """
+    base = f"{key.model_name}@{key.kv_rank:08x}@{key.chunk_hash.hex()}"
+    if key.cache_salt:
+        return f"{base}@{key.cache_salt}"
+    return base
 
 
 # Internal classes and helper functions
@@ -193,6 +208,36 @@ class L1Manager:
 
         self._event_bus = get_event_bus()
 
+        # === Maru backend wiring (Option B) ===
+        # When the L1 allocator is ``MaruMemoryAllocator``, L1Manager
+        # operates in *pass-through* mode: state machine / TTLLock /
+        # eviction policy are bypassed, and MaruServer RPCs
+        # (``batch_store`` / ``batch_pin`` / ``batch_retrieve`` /
+        # ``batch_unpin`` / ``delete``) are issued directly via the
+        # allocator's handler. See docs/source/mp/maru/integration.md
+        # Phase 1.C for the rationale.
+        self._maru_handler: Optional[Any] = None
+        self._maru_allocator: Optional[Any] = None
+        # Side channel: ``reserve_read`` (maru branch) stages the
+        # CXL-backed MemoryObjs here so the subsequent ``unsafe_read``
+        # can retrieve them; ``finish_read`` clears entries before
+        # ``batch_unpin``.
+        self._pending_read_memobjs: dict[ObjectKey, MemoryObj] = {}
+        if _is_maru_allocator(self._memory_manager.allocator):
+            # Lazy-import the concrete class only when we know the
+            # allocator is actually maru-backed; this keeps the maru
+            # runtime optional for non-maru deployments. ``cast`` tells
+            # mypy that the dispatch flag implies the concrete type.
+            # First Party
+            from lmcache.v1.distributed.maru_memory_allocator import (
+                MaruMemoryAllocator,
+            )
+
+            self._maru_allocator = cast(
+                MaruMemoryAllocator, self._memory_manager.allocator
+            )
+            self._maru_handler = self._maru_allocator.handler
+
         L1Manager._gauge_target = self
         if not L1Manager._gauge_registered:
             L1Manager._gauge_registered = True
@@ -213,12 +258,30 @@ class L1Manager:
                 lambda: _l1_usage_ratio_or_zero(L1Manager._gauge_target),
             )
 
+    def _is_maru_backend(self) -> bool:
+        """True when the L1 allocator is ``MaruMemoryAllocator``.
+
+        In maru mode, L1Manager operates as a pass-through shim:
+        - The object dict / TTLLock state machine / eviction policy are
+          all skipped (the engine flow goes straight to MaruServer via
+          the allocator's handler).
+        - Listeners are NOT invoked (controllers / observability paths
+          are bypassed in Phase 1.D).
+        """
+        return self._maru_handler is not None
+
     def register_listener(self, listener: L1ManagerListener) -> None:
         """Register a listener for L1Manager events.
 
         Args:
             listener: The listener to register.
         """
+        if self._is_maru_backend():
+            # Maru mode bypasses StoreController / PrefetchController /
+            # L1EvictionController (cf. Phase 1.D). Listener callbacks
+            # are therefore intentionally never invoked, and registration
+            # is silently dropped to keep the API surface stable.
+            return
         with self._lock:
             self._registered_listeners.append(listener)
 
@@ -248,6 +311,9 @@ class L1Manager:
             KEY_NOT_READABLE: The key exists but is not
                 readable.
         """
+        if self._is_maru_backend():
+            return self._maru_reserve_read(keys)
+
         extra_count = _validate_extra_count(extra_count)
         total = 1 + extra_count
         ret: dict[ObjectKey, L1OperationResult] = {}
@@ -302,6 +368,9 @@ class L1Manager:
             KEY_NOT_EXIST: The key does not exist.
             KEY_NOT_READABLE: The key is not readable (in this case, not read-locked).
         """
+        if self._is_maru_backend():
+            return self._maru_unsafe_read(keys)
+
         ret: dict[ObjectKey, L1OperationResult] = {}
 
         for key in keys:
@@ -347,6 +416,9 @@ class L1Manager:
                 non-read-locked, which means the reader may
                 read inconsistent data.
         """
+        if self._is_maru_backend():
+            return self._maru_finish_read(keys)
+
         extra_count = _validate_extra_count(extra_count)
         total = 1 + extra_count
         need_to_free: list[MemoryObj] = []
@@ -446,6 +518,9 @@ class L1Manager:
             KEY_NOT_WRITABLE: The key exists but is not writable.
             OUT_OF_MEMORY: Not enough memory to allocate for the object.
         """
+        if self._is_maru_backend():
+            return self._maru_reserve_write(keys, is_temporary, layout_desc, mode)
+
         need_to_allocate: list[tuple[ObjectKey, bool]] = []
         ret: dict[ObjectKey, L1OperationResult] = {}
         successful_keys: list[ObjectKey] = []
@@ -518,11 +593,18 @@ class L1Manager:
     def finish_write(
         self,
         keys: list[ObjectKey],
+        memory_objs: Optional[list[MemoryObj]] = None,
     ) -> dict[ObjectKey, L1Error]:
         """Finish write access for the given keys.
 
         Args:
             keys: The list of object keys to finish write access for.
+            memory_objs: The ``MemoryObj`` instances corresponding to
+                ``keys``. **Required in maru mode** (used to issue
+                ``MaruHandler.batch_store``); ignored in default mode
+                (the in-process dict already holds the MemoryObj).
+                Defaults to ``None`` for backward compatibility with
+                callers that only update L1 state.
 
         Returns:
             A dictionary mapping each object key to an L1Error.
@@ -532,6 +614,9 @@ class L1Manager:
             KEY_IN_WRONG_STATE: The key is not write-locked, or it's read-locked,
                 which means the writer may have caused inconsistent data.
         """
+        if self._is_maru_backend():
+            return self._maru_finish_write(keys, memory_objs)
+
         ret: dict[ObjectKey, L1Error] = {}
         successful_keys: list[ObjectKey] = []
 
@@ -602,6 +687,16 @@ class L1Manager:
             KEY_IN_WRONG_STATE: The key is not write-locked, or it already
                 has read locks.
         """
+        if self._is_maru_backend():
+            # Maru flow stages MemoryObjs in the side channel during
+            # ``reserve_read``; the engine then transitions straight to
+            # ``unsafe_read`` → ``finish_read``. This atomic
+            # write-to-read transition is therefore a no-op (and not
+            # exercised by the maru path in Phase 1.D), but we keep a
+            # safe SUCCESS response in case any code path still calls
+            # it.
+            return self._maru_finish_write_and_reserve_read(keys)
+
         extra_count = _validate_extra_count(extra_count)
         total = 1 + extra_count
         ret: dict[ObjectKey, L1OperationResult] = {}
@@ -661,6 +756,9 @@ class L1Manager:
             KEY_IS_LOCKED: The key is locked (either write-locked or read-locked
                 and cannot be deleted).
         """
+        if self._is_maru_backend():
+            return self._maru_delete(keys)
+
         need_to_free: list[MemoryObj] = []
         ret: dict[ObjectKey, L1Error] = {}
         successful_keys: list[ObjectKey] = []
@@ -698,6 +796,10 @@ class L1Manager:
         Args:
             keys: The list of object keys to touch.
         """
+        if self._is_maru_backend():
+            # No LRU bookkeeping in maru mode — MaruServer owns eviction
+            # decisions and ``touch_keys`` has no observable effect.
+            return
         for listener in self._registered_listeners:
             listener.on_l1_keys_accessed(keys)
 
@@ -711,6 +813,10 @@ class L1Manager:
                 If False (default), only clear unlocked objects, keeping
                 write-locked and read-locked objects intact.
         """
+        if self._is_maru_backend():
+            self._maru_clear(force)
+            return
+
         if force:
             logger.warning(
                 "L1Manager: force-clearing all %d objects "
@@ -782,6 +888,14 @@ class L1Manager:
             True if the key exists and is not locked (neither read-locked
             nor write-locked), False otherwise.
         """
+        if self._is_maru_backend():
+            # L1EvictionController is not registered in maru mode
+            # (cf. Phase 1.D), so this method is never consulted on the
+            # hot path. We still return True to keep the contract simple
+            # for any defensive caller: MaruServer's ``pin_kv`` /
+            # ``delete_kv`` make their own atomic decisions; the
+            # LMCache-side answer has no bearing on actual eviction.
+            return True
         entry = self._objects.get(key, None)
         if entry is None:
             return False
@@ -806,9 +920,15 @@ class L1Manager:
     def close(self) -> None:
         """Close the L1Manager and free all resources."""
         with self._lock:
-            all_memory_objs = [entry.memory_obj for entry in self._objects.values()]
-            self._memory_manager.free(all_memory_objs)
-            self._objects.clear()
+            if self._is_maru_backend():
+                # No in-process state machine — just drop any pending
+                # read-side handles so the engine can shut down cleanly.
+                # CXL page lifecycle remains owned by MaruServer.
+                self._pending_read_memobjs.clear()
+            else:
+                all_memory_objs = [entry.memory_obj for entry in self._objects.values()]
+                self._memory_manager.free(all_memory_objs)
+                self._objects.clear()
 
         self._memory_manager.close()
 
@@ -816,6 +936,9 @@ class L1Manager:
     @l1_mgr_synchronized
     def report_status(self) -> dict:
         """Return a status dict describing L1 cache state."""
+        if self._is_maru_backend():
+            return self._maru_report_status()
+
         write_locked = 0
         read_locked = 0
         temporary = 0
@@ -851,11 +974,20 @@ class L1Manager:
         Returns:
             The L1ObjectState if the object exists, None otherwise.
         """
+        if self._is_maru_backend():
+            # No in-process state machine in maru mode (no TTLLock /
+            # is_temporary / L1ObjectState).
+            return None
         return self._objects.get(key, None)
 
     @l1_mgr_synchronized
     def memcheck(self) -> bool:
         """Perform memory check for L1 cache."""
+        if self._is_maru_backend():
+            # No object dict to introspect; MaruServer + handler own
+            # consistency. Always healthy from LMCache's vantage point.
+            return True
+
         mem_check_result = self._memory_manager.memcheck()
 
         # Log the locked objects for debugging
@@ -875,3 +1007,304 @@ class L1Manager:
             num_read_locked,
         )
         return mem_check_result
+
+    # =====================================================================
+    # Maru backend helpers (Option B — see docs/source/mp/maru/integration.md
+    # Phase 1.C). These are dispatched from the corresponding public methods
+    # when ``_is_maru_backend()`` is true. They issue ``MaruHandler`` RPCs
+    # directly (sync) instead of going through ``StoreController`` /
+    # ``PrefetchController`` / ``L1EvictionController``.
+    # =====================================================================
+
+    def _maru_reserve_read(
+        self, keys: list[ObjectKey]
+    ) -> dict[ObjectKey, L1OperationResult]:
+        """``reserve_read`` in maru mode: pin + retrieve + populate side
+        channel.
+
+        ``MaruHandler.batch_pin`` has prefix-stop semantics — it only
+        pins the contiguous prefix of existing keys. We then resolve
+        each pinned key via ``batch_retrieve`` + ``get_by_location`` to
+        materialize a ``MemoryObj`` pointing at the existing CXL page
+        (no data copy). The resolved ``MemoryObj`` is staged in
+        ``self._pending_read_memobjs`` so the subsequent
+        ``unsafe_read`` can return it.
+
+        If a pinned key cannot be resolved (race between pin and
+        retrieve), we unpin the unused tail to keep MaruServer's
+        ``pin_count`` accurate.
+        """
+        assert self._maru_handler is not None
+        assert self._maru_allocator is not None
+
+        key_strs = [_object_key_to_string(k) for k in keys]
+        try:
+            pin_results = self._maru_handler.batch_pin(key_strs)
+        except Exception:
+            logger.exception("MaruHandler.batch_pin failed for %d keys", len(keys))
+            return {k: (L1Error.KEY_NOT_EXIST, None) for k in keys}
+
+        num_pinned = 0
+        for ok in pin_results:
+            if not ok:
+                break
+            num_pinned += 1
+
+        ret: dict[ObjectKey, L1OperationResult] = {
+            k: (L1Error.KEY_NOT_EXIST, None) for k in keys
+        }
+        if num_pinned == 0:
+            return ret
+
+        try:
+            mem_infos = self._maru_handler.batch_retrieve(key_strs[:num_pinned])
+        except Exception:
+            logger.exception(
+                "MaruHandler.batch_retrieve failed for %d keys", num_pinned
+            )
+            # Roll back the pins so MaruServer's refcount stays consistent.
+            try:
+                self._maru_handler.batch_unpin(key_strs[:num_pinned])
+            except Exception:
+                logger.exception(
+                    "MaruHandler.batch_unpin rollback failed for %d keys",
+                    num_pinned,
+                )
+            return ret
+
+        resolved = 0
+        for k, mi in zip(keys[:num_pinned], mem_infos, strict=False):
+            if mi is None:
+                # Race between pin and retrieve — treat this and all
+                # subsequent keys as miss to preserve prefix semantics.
+                break
+            mem_obj = self._maru_allocator.get_by_location(
+                region_id=mi.region_id,
+                page_index=mi.page_index,
+                actual_size=len(mi.view),
+            )
+            if mem_obj is None:
+                break
+            self._pending_read_memobjs[k] = mem_obj
+            ret[k] = (L1Error.SUCCESS, mem_obj)
+            resolved += 1
+
+        if resolved < num_pinned:
+            extras = key_strs[resolved:num_pinned]
+            try:
+                self._maru_handler.batch_unpin(extras)
+            except Exception:
+                logger.exception(
+                    "MaruHandler.batch_unpin (reconciliation) failed for %d keys",
+                    len(extras),
+                )
+        return ret
+
+    def _maru_unsafe_read(
+        self, keys: list[ObjectKey]
+    ) -> dict[ObjectKey, L1OperationResult]:
+        """``unsafe_read`` in maru mode: lookup the side channel."""
+        ret: dict[ObjectKey, L1OperationResult] = {}
+        for k in keys:
+            mem_obj = self._pending_read_memobjs.get(k)
+            if mem_obj is None:
+                ret[k] = (L1Error.KEY_NOT_EXIST, None)
+            else:
+                ret[k] = (L1Error.SUCCESS, mem_obj)
+        return ret
+
+    def _maru_finish_read(self, keys: list[ObjectKey]) -> dict[ObjectKey, L1Error]:
+        """``finish_read`` in maru mode: drop side-channel entries +
+        ``batch_unpin``.
+        """
+        assert self._maru_handler is not None
+
+        ret: dict[ObjectKey, L1Error] = {}
+        to_unpin: list[str] = []
+        for k in keys:
+            if self._pending_read_memobjs.pop(k, None) is not None:
+                to_unpin.append(_object_key_to_string(k))
+                ret[k] = L1Error.SUCCESS
+            else:
+                ret[k] = L1Error.KEY_NOT_EXIST
+
+        if to_unpin:
+            try:
+                self._maru_handler.batch_unpin(to_unpin)
+            except Exception:
+                logger.exception(
+                    "MaruHandler.batch_unpin failed in finish_read for %d keys",
+                    len(to_unpin),
+                )
+        return ret
+
+    def _maru_reserve_write(
+        self,
+        keys: list[ObjectKey],
+        is_temporary: list[bool],
+        layout_desc: MemoryLayoutDesc,
+        mode: str,
+    ) -> dict[ObjectKey, L1OperationResult]:
+        """``reserve_write`` in maru mode: allocate CXL ``MemoryObj``s.
+
+        No in-process dict / TTLLock / state machine is used. The
+        engine takes the returned ``MemoryObj``s, runs cudaMemcpy into
+        their CXL-backed ``data_ptr``, then hands them back via
+        :meth:`finish_write` (which is responsible for ``batch_store``).
+
+        ``is_temporary`` and ``mode`` are accepted for interface
+        compatibility but have no effect in maru mode — the maru flow
+        only uses ``mode="new"``.
+        """
+        del is_temporary, mode  # unused in maru mode
+
+        ret: dict[ObjectKey, L1OperationResult] = {}
+        if not keys:
+            return ret
+
+        err, allocated_objs = self._memory_manager.allocate(layout_desc, len(keys))
+        if err != L1Error.SUCCESS:
+            for k in keys:
+                ret[k] = (L1Error.OUT_OF_MEMORY, None)
+            return ret
+
+        for k, obj in zip(keys, allocated_objs, strict=False):
+            ret[k] = (L1Error.SUCCESS, obj)
+        return ret
+
+    def _maru_finish_write(
+        self,
+        keys: list[ObjectKey],
+        memory_objs: Optional[list[MemoryObj]],
+    ) -> dict[ObjectKey, L1Error]:
+        """``finish_write`` in maru mode: register KVs via
+        ``MaruHandler.batch_store``.
+
+        ``batch_store`` is responsible for the dup-skip + auto-free
+        protocol: keys that already exist on MaruServer have their
+        newly-allocated CXL page returned to the pool transparently.
+        """
+        assert self._maru_handler is not None
+        assert self._maru_allocator is not None
+
+        if memory_objs is None or len(memory_objs) != len(keys):
+            actual = 0 if memory_objs is None else len(memory_objs)
+            logger.error(
+                "Maru finish_write requires memory_objs matching keys "
+                "(keys=%d, memory_objs=%d)",
+                len(keys),
+                actual,
+            )
+            return {k: L1Error.KEY_IN_WRONG_STATE for k in keys}
+
+        key_strs = [_object_key_to_string(k) for k in keys]
+        try:
+            handles = [
+                self._maru_allocator.create_store_handle(mo) for mo in memory_objs
+            ]
+        except Exception:
+            logger.exception(
+                "create_store_handle failed for %d MemoryObjs", len(memory_objs)
+            )
+            return {k: L1Error.KEY_IN_WRONG_STATE for k in keys}
+
+        try:
+            results = self._maru_handler.batch_store(key_strs, handles)
+        except Exception:
+            logger.exception("MaruHandler.batch_store failed for %d keys", len(keys))
+            return {k: L1Error.KEY_IN_WRONG_STATE for k in keys}
+
+        # ``batch_store`` returns per-key success flags. Both "newly
+        # registered" and "skipped because already present" are
+        # functional successes from LMCache's perspective: in either
+        # case the KV is now available in Maru.
+        ret: dict[ObjectKey, L1Error] = {}
+        for k, ok in zip(keys, results, strict=False):
+            ret[k] = L1Error.SUCCESS if ok else L1Error.KEY_IN_WRONG_STATE
+        return ret
+
+    def _maru_finish_write_and_reserve_read(
+        self, keys: list[ObjectKey]
+    ) -> dict[ObjectKey, L1OperationResult]:
+        """``finish_write_and_reserve_read`` in maru mode.
+
+        Defensive no-op: in the maru flow the side channel is
+        populated by ``reserve_read`` rather than the
+        ``reserve_write(is_temporary=True)`` → ``submit_load_task`` →
+        ``finish_write_and_reserve_read`` sequence used by other
+        backends. We return ``SUCCESS`` for already-staged keys and
+        ``KEY_NOT_EXIST`` otherwise so any defensive caller still sees
+        a useful answer.
+        """
+        ret: dict[ObjectKey, L1OperationResult] = {}
+        for k in keys:
+            mem_obj = self._pending_read_memobjs.get(k)
+            if mem_obj is None:
+                ret[k] = (L1Error.KEY_NOT_EXIST, None)
+            else:
+                ret[k] = (L1Error.SUCCESS, mem_obj)
+        return ret
+
+    def _maru_delete(self, keys: list[ObjectKey]) -> dict[ObjectKey, L1Error]:
+        """``delete`` in maru mode: forward to ``MaruHandler.delete``.
+
+        ``MaruHandler.delete`` returns ``False`` when the key is pinned
+        (e.g. an in-flight read), in which case we report
+        ``KEY_IS_LOCKED`` so the caller can retry. Missing keys are
+        reported as ``KEY_NOT_EXIST``. There is no batched delete on
+        the handler so we issue one RPC per key.
+        """
+        assert self._maru_handler is not None
+
+        ret: dict[ObjectKey, L1Error] = {}
+        for k in keys:
+            key_str = _object_key_to_string(k)
+            try:
+                ok = self._maru_handler.delete(key_str)
+            except Exception:
+                logger.exception("MaruHandler.delete failed for key=%s", key_str)
+                ret[k] = L1Error.KEY_IN_WRONG_STATE
+                continue
+            # The handler API conflates "key not found" and "key pinned"
+            # under a False return. Without server-side richer
+            # diagnostics we can't tell them apart here; default to the
+            # softer ``KEY_NOT_EXIST`` since callers retrying after
+            # ``KEY_IS_LOCKED`` will quickly hit it again.
+            ret[k] = L1Error.SUCCESS if ok else L1Error.KEY_NOT_EXIST
+        return ret
+
+    def _maru_clear(self, force: bool) -> None:
+        """``clear`` in maru mode: drop staged side-channel entries
+        only.
+
+        The CXL pool itself is owned by ``MaruServer`` and is never
+        wiped by L1Manager — ``force=True`` only affects the in-process
+        read-side bookkeeping. Server-side wipes (e.g. shutdown) go
+        through explicit ``MaruHandler.delete`` calls or MaruServer's
+        own lifecycle.
+        """
+        if force:
+            logger.warning(
+                "L1Manager (maru): force-clear drops %d pending read "
+                "MemoryObjs but does NOT touch MaruServer.",
+                len(self._pending_read_memobjs),
+            )
+        self._pending_read_memobjs.clear()
+
+    def _maru_report_status(self) -> dict:
+        """``report_status`` in maru mode."""
+        used, total = self._memory_manager.get_memory_usage()
+        return {
+            "is_healthy": True,
+            "backend": "maru",
+            "total_object_count": 0,
+            "write_locked_count": 0,
+            "read_locked_count": 0,
+            "temporary_count": 0,
+            "pending_read_memobjs": len(self._pending_read_memobjs),
+            "memory_used_bytes": used,
+            "memory_total_bytes": total,
+            "memory_usage_ratio": used / total if total > 0 else 0.0,
+            "write_ttl_seconds": self._write_ttl_seconds,
+            "read_ttl_seconds": self._read_ttl_seconds,
+        }
