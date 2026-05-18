@@ -1,5 +1,8 @@
 # SPDX-License-Identifier: Apache-2.0
 
+# Third Party
+import torch
+
 # First Party
 from lmcache.logging import init_logger
 from lmcache.v1.distributed.api import MemoryLayoutDesc
@@ -9,6 +12,7 @@ from lmcache.v1.distributed.internal_api import L1MemoryDesc
 from lmcache.v1.lazy_memory_allocator import LazyMemoryAllocator
 from lmcache.v1.memory_management import (
     MemoryAllocatorInterface,
+    MemoryFormat,
     MemoryObj,
     MixedMemoryAllocator,
 )
@@ -161,8 +165,12 @@ class L1MemoryManager:
         # MaruServer so this is best-effort observability; on failure
         # return (0, 0) rather than crash the eviction controller.
         if _is_maru_allocator(self._allocator):
+            allocator = self._allocator
+            # Lazy backend — handler not built until register_kv_layout.
+            if not allocator.is_initialized:  # type: ignore[attr-defined]
+                return 0, 0
             try:
-                handler = self._allocator.handler  # type: ignore[attr-defined]
+                handler = allocator.handler  # type: ignore[attr-defined]
                 stats = handler.get_stats() if hasattr(handler, "get_stats") else {}
                 used = int(stats.get("used_bytes", 0))
                 total = int(
@@ -226,6 +234,35 @@ class L1MemoryManager:
             size=self._size_in_bytes,
             align_bytes=self._align_bytes,
         )
+
+    def register_kv_layout(
+        self,
+        shapes: list[torch.Size],
+        dtypes: list[torch.dtype],
+        fmt: MemoryFormat,
+        chunk_size_in_tokens: int,
+    ) -> None:
+        """Bind the KV layout to the underlying allocator.
+
+        Only the maru backend acts on this — its ``CxlMemoryAdapter``
+        pool is typed at first registration. The default DRAM
+        allocators (``LazyMemoryAllocator`` / ``MixedMemoryAllocator``)
+        are layout-agnostic so this call is a no-op for them.
+
+        Idempotent for matching layouts; layout mismatch on a
+        subsequent call raises ``ValueError`` (maru single-model
+        constraint).
+
+        Args:
+            shapes: KV chunk shapes (per-layer-group).
+            dtypes: KV chunk dtypes aligned with ``shapes``.
+            fmt: Memory format.
+            chunk_size_in_tokens: LMCache chunk size in tokens.
+        """
+        if _is_maru_allocator(self._allocator):
+            self._allocator.init_layout(  # type: ignore[attr-defined]
+                shapes, dtypes, fmt, chunk_size_in_tokens
+            )
 
     def close(self) -> None:
         """
