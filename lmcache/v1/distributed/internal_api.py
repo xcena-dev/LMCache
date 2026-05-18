@@ -10,6 +10,13 @@ import enum
 
 # First Party
 from lmcache.v1.distributed.api import ObjectKey
+from lmcache.v1.distributed.error import L1Error
+from lmcache.v1.memory_management import MemoryObj
+
+L1OperationResult = tuple[L1Error, MemoryObj | None]
+""" Result tuple returned by L1Manager (and its maru dispatcher)
+read/write reservation methods: ``(error, memory_obj)``. ``memory_obj``
+is ``None`` whenever ``error != L1Error.SUCCESS``. """
 
 
 @dataclass(frozen=True)

@@ -3,9 +3,9 @@
 
 Coverage:
 
-1. ``_object_key_to_string`` — stable string form for MaruHandler RPCs.
+1. ``object_key_to_string`` — stable string form for MaruHandler RPCs.
 2. ``L1Manager.__init__`` — auto-detects ``MaruMemoryAllocator`` and
-   sets ``_maru_handler`` / ``_maru_allocator`` / side channel.
+   constructs a :class:`MaruL1Dispatcher`.
 3. ``_is_maru_backend`` — dispatch flag.
 4. STORE path: ``reserve_write`` (allocate) → ``finish_write``
    (``MaruHandler.batch_store``).
@@ -30,17 +30,19 @@ from unittest import mock
 
 # Third Party
 import pytest
-import torch
 
 # First Party
 from lmcache.v1.distributed.api import ObjectKey
 from lmcache.v1.distributed.config import L1ManagerConfig, L1MemoryManagerConfig
 from lmcache.v1.distributed.error import L1Error
-from lmcache.v1.memory_management import MemoryFormat
 
 try:
     # First Party
-    from lmcache.v1.distributed.l1_manager import L1Manager, _object_key_to_string
+    from lmcache.v1.distributed.l1_manager import L1Manager
+    from lmcache.v1.distributed.maru_l1_dispatch import (
+        MaruL1Dispatcher,
+        object_key_to_string,
+    )
     from lmcache.v1.distributed.maru_memory_allocator import (
         MaruL1Config,
         MaruMemoryAllocator,
@@ -76,11 +78,6 @@ def maru_cfg() -> MaruL1Config:
     return MaruL1Config(
         server_url="maru://localhost:5555",
         pool_size_bytes=60 * 1024**3,
-        full_chunk_size_bytes=256 * 4096,
-        chunk_size_in_tokens=256,
-        shapes=[torch.Size([2, 32, 256, 128])],
-        dtypes=[torch.float16],
-        fmt=MemoryFormat.KV_2LTD,
         instance_id="test-mp",
     )
 
@@ -88,17 +85,19 @@ def maru_cfg() -> MaruL1Config:
 @pytest.fixture
 def fake_maru_allocator():
     """Replace ``MaruMemoryAllocator.__init__`` with a stub that
-    installs ``MagicMock`` handler + adapter. Reverts on teardown.
+    installs ``MagicMock`` handler + adapter directly — equivalent
+    to the post-``init_layout`` state. Reverts on teardown.
     """
     real_init = MaruMemoryAllocator.__init__
 
     def fake_init(self, config: MaruL1Config) -> None:
-        self._config = config
-        self._single_token_size = (
-            config.full_chunk_size_bytes // config.chunk_size_in_tokens
-        )
+        real_init(self, config)
+        # Post-``init_layout`` state: pool, handler, and layout
+        # metadata are present so the allocator is considered
+        # initialized.
         self._handler = mock.MagicMock(name="MaruHandler")
         self._cxl_adapter = mock.MagicMock(name="CxlMemoryAdapter")
+        self._single_token_size = 4096  # dummy non-zero
 
     MaruMemoryAllocator.__init__ = fake_init
     try:
@@ -120,6 +119,25 @@ def maru_mgr(maru_cfg, fake_maru_allocator) -> L1Manager:
     return L1Manager(cfg)
 
 
+@pytest.fixture
+def maru_handler(maru_mgr):
+    """The ``MagicMock`` handler installed by ``fake_maru_allocator``.
+
+    Shortcut so test methods can configure RPC return values directly
+    without threading through the full dispatcher → allocator chain.
+    """
+    return maru_mgr._maru_dispatcher._allocator._handler
+
+
+@pytest.fixture
+def maru_adapter(maru_mgr):
+    """The ``MagicMock`` ``CxlMemoryAdapter`` installed by
+    ``fake_maru_allocator``. Use it to configure
+    ``create_store_handle`` / ``get_by_location`` side effects.
+    """
+    return maru_mgr._maru_dispatcher._allocator._cxl_adapter
+
+
 def _mk_key(idx: int = 0, salt: str = "") -> ObjectKey:
     return ObjectKey(
         chunk_hash=idx.to_bytes(4, byteorder="big"),
@@ -130,18 +148,18 @@ def _mk_key(idx: int = 0, salt: str = "") -> ObjectKey:
 
 
 # =========================================================================
-# (1) _object_key_to_string
+# (1) object_key_to_string
 # =========================================================================
 
 
 class TestObjectKeyToString:
     def test_basic(self):
         k = _mk_key(idx=0x01020304)
-        assert _object_key_to_string(k) == "test-model@0000abcd@01020304"
+        assert object_key_to_string(k) == "test-model@0000abcd@01020304"
 
     def test_with_salt(self):
         k = _mk_key(idx=0xFF, salt="user-1")
-        assert _object_key_to_string(k) == "test-model@0000abcd@000000ff@user-1"
+        assert object_key_to_string(k) == "test-model@0000abcd@000000ff@user-1"
 
 
 # =========================================================================
@@ -150,16 +168,15 @@ class TestObjectKeyToString:
 
 
 class TestMaruBackendDetection:
-    def test_maru_handler_wired(self, maru_mgr):
+    def test_dispatcher_wired(self, maru_mgr, maru_handler):
         assert maru_mgr._is_maru_backend() is True
-        assert maru_mgr._maru_handler is not None
-        assert maru_mgr._maru_allocator is not None
-        # ``handler`` is exposed by the allocator's mock; verify we
-        # grabbed it during __init__.
-        assert maru_mgr._maru_handler is maru_mgr._maru_allocator._handler
+        assert isinstance(maru_mgr._maru_dispatcher, MaruL1Dispatcher)
+        # Dispatcher resolves ``handler`` through its allocator
+        # reference — verify it points at the same MagicMock.
+        assert maru_mgr._maru_dispatcher.handler is maru_handler
 
     def test_pending_read_memobjs_initialized(self, maru_mgr):
-        assert maru_mgr._pending_read_memobjs == {}
+        assert maru_mgr._maru_dispatcher._pending_read_memobjs == {}
 
 
 # =========================================================================
@@ -173,6 +190,7 @@ class TestMaruReserveWrite:
         keys = [_mk_key(i) for i in range(3)]
         fake_objs = [mock.MagicMock(spec=[]) for _ in keys]
         maru_mgr._memory_manager = mock.MagicMock()
+        maru_mgr._maru_dispatcher._memory_manager = maru_mgr._memory_manager
         maru_mgr._memory_manager.allocate.return_value = (L1Error.SUCCESS, fake_objs)
 
         ret = maru_mgr.reserve_write(
@@ -193,6 +211,7 @@ class TestMaruReserveWrite:
     def test_out_of_memory(self, maru_mgr):
         keys = [_mk_key(i) for i in range(2)]
         maru_mgr._memory_manager = mock.MagicMock()
+        maru_mgr._maru_dispatcher._memory_manager = maru_mgr._memory_manager
         maru_mgr._memory_manager.allocate.return_value = (L1Error.OUT_OF_MEMORY, [])
 
         ret = maru_mgr.reserve_write(
@@ -205,62 +224,66 @@ class TestMaruReserveWrite:
 
 
 class TestMaruFinishWrite:
-    def test_happy_path_calls_batch_store(self, maru_mgr):
+    def test_happy_path_calls_batch_store(self, maru_mgr, maru_handler, maru_adapter):
         keys = [_mk_key(i) for i in range(2)]
         memory_objs = [mock.MagicMock(name=f"mo-{i}") for i in range(2)]
         # ``MaruMemoryAllocator.create_store_handle`` forwards to the
         # underlying ``CxlMemoryAdapter`` — we configure that mock to
         # observe and override the return values.
         handles = [mock.MagicMock(name=f"handle-{i}") for i in range(2)]
-        maru_mgr._maru_allocator._cxl_adapter.create_store_handle.side_effect = handles
-        maru_mgr._maru_handler.batch_store.return_value = [True, True]
+        maru_adapter.create_store_handle.side_effect = handles
+        maru_handler.batch_store.return_value = [
+            True,
+            True,
+        ]
 
         ret = maru_mgr.finish_write(keys, memory_objs=memory_objs)
 
         # Verify batch_store was called with key strings + handles.
-        called_args = maru_mgr._maru_handler.batch_store.call_args
+        called_args = maru_handler.batch_store.call_args
         called_key_strs, called_handles = called_args.args
-        assert called_key_strs == [_object_key_to_string(k) for k in keys]
+        assert called_key_strs == [object_key_to_string(k) for k in keys]
         assert called_handles == handles
         for k in keys:
             assert ret[k] is L1Error.SUCCESS
 
-    def test_dup_skip_returns_success(self, maru_mgr):
+    def test_dup_skip_returns_success(self, maru_mgr, maru_handler, maru_adapter):
         # ``batch_store`` returns True for both newly registered AND
         # dup-skipped keys; both are functional successes.
         keys = [_mk_key(i) for i in range(2)]
         memory_objs = [mock.MagicMock() for _ in keys]
-        maru_mgr._maru_allocator._cxl_adapter.create_store_handle.side_effect = [
-            mock.MagicMock() for _ in keys
-        ]
+        maru_adapter.create_store_handle.side_effect = [mock.MagicMock() for _ in keys]
         # MaruHandler returns True even for dup-skipped keys.
-        maru_mgr._maru_handler.batch_store.return_value = [True, True]
+        maru_handler.batch_store.return_value = [
+            True,
+            True,
+        ]
 
         ret = maru_mgr.finish_write(keys, memory_objs=memory_objs)
         for k in keys:
             assert ret[k] is L1Error.SUCCESS
 
-    def test_missing_memory_objs_returns_error(self, maru_mgr):
+    def test_missing_memory_objs_returns_error(self, maru_mgr, maru_handler):
         keys = [_mk_key(i) for i in range(2)]
         ret = maru_mgr.finish_write(keys, memory_objs=None)
         for k in keys:
             assert ret[k] is L1Error.KEY_IN_WRONG_STATE
-        maru_mgr._maru_handler.batch_store.assert_not_called()
+        maru_handler.batch_store.assert_not_called()
 
-    def test_length_mismatch_returns_error(self, maru_mgr):
+    def test_length_mismatch_returns_error(self, maru_mgr, maru_handler):
         keys = [_mk_key(i) for i in range(3)]
         ret = maru_mgr.finish_write(keys, memory_objs=[mock.MagicMock()])
         for k in keys:
             assert ret[k] is L1Error.KEY_IN_WRONG_STATE
-        maru_mgr._maru_handler.batch_store.assert_not_called()
+        maru_handler.batch_store.assert_not_called()
 
-    def test_batch_store_exception_returns_error(self, maru_mgr):
+    def test_batch_store_exception_returns_error(
+        self, maru_mgr, maru_handler, maru_adapter
+    ):
         keys = [_mk_key(i) for i in range(2)]
         memory_objs = [mock.MagicMock() for _ in keys]
-        maru_mgr._maru_allocator._cxl_adapter.create_store_handle.side_effect = [
-            mock.MagicMock() for _ in keys
-        ]
-        maru_mgr._maru_handler.batch_store.side_effect = RuntimeError("rpc fail")
+        maru_adapter.create_store_handle.side_effect = [mock.MagicMock() for _ in keys]
+        maru_handler.batch_store.side_effect = RuntimeError("rpc fail")
         ret = maru_mgr.finish_write(keys, memory_objs=memory_objs)
         for k in keys:
             assert ret[k] is L1Error.KEY_IN_WRONG_STATE
@@ -272,15 +295,19 @@ class TestMaruFinishWrite:
 
 
 class TestMaruReserveRead:
-    def test_all_hit(self, maru_mgr):
+    def test_all_hit(self, maru_mgr, maru_handler, maru_adapter):
         keys = [_mk_key(i) for i in range(3)]
-        maru_mgr._maru_handler.batch_pin.return_value = [True, True, True]
+        maru_handler.batch_pin.return_value = [
+            True,
+            True,
+            True,
+        ]
         mem_infos = [
             _FakeMemInfo(region_id=i, page_index=i, view=b"x" * 32) for i in range(3)
         ]
-        maru_mgr._maru_handler.batch_retrieve.return_value = mem_infos
+        maru_handler.batch_retrieve.return_value = mem_infos
         fake_objs = [mock.MagicMock(name=f"obj-{i}") for i in range(3)]
-        maru_mgr._maru_allocator._cxl_adapter.get_by_location.side_effect = fake_objs
+        maru_adapter.get_by_location.side_effect = fake_objs
 
         ret = maru_mgr.reserve_read(keys)
 
@@ -288,90 +315,103 @@ class TestMaruReserveRead:
             err, returned = ret[k]
             assert err is L1Error.SUCCESS
             assert returned is obj
-            assert maru_mgr._pending_read_memobjs[k] is obj
+            assert maru_mgr._maru_dispatcher._pending_read_memobjs[k] is obj
 
-    def test_prefix_miss(self, maru_mgr):
+    def test_prefix_miss(self, maru_mgr, maru_handler, maru_adapter):
         """``batch_pin`` reports prefix-stop: only k0, k1 are pinned."""
         keys = [_mk_key(i) for i in range(3)]
-        maru_mgr._maru_handler.batch_pin.return_value = [True, True, False]
+        maru_handler.batch_pin.return_value = [
+            True,
+            True,
+            False,
+        ]
         mem_infos = [_FakeMemInfo(i, i, b"x" * 32) for i in range(2)]
-        maru_mgr._maru_handler.batch_retrieve.return_value = mem_infos
+        maru_handler.batch_retrieve.return_value = mem_infos
         fake_objs = [mock.MagicMock(), mock.MagicMock()]
-        maru_mgr._maru_allocator._cxl_adapter.get_by_location.side_effect = fake_objs
+        maru_adapter.get_by_location.side_effect = fake_objs
 
         ret = maru_mgr.reserve_read(keys)
 
         assert ret[keys[0]][0] is L1Error.SUCCESS
         assert ret[keys[1]][0] is L1Error.SUCCESS
         assert ret[keys[2]] == (L1Error.KEY_NOT_EXIST, None)
-        assert keys[2] not in maru_mgr._pending_read_memobjs
+        assert keys[2] not in maru_mgr._maru_dispatcher._pending_read_memobjs
 
-    def test_all_miss(self, maru_mgr):
+    def test_all_miss(self, maru_mgr, maru_handler):
         keys = [_mk_key(i) for i in range(2)]
-        maru_mgr._maru_handler.batch_pin.return_value = [False, False]
+        maru_handler.batch_pin.return_value = [
+            False,
+            False,
+        ]
 
         ret = maru_mgr.reserve_read(keys)
 
         for k in keys:
             assert ret[k] == (L1Error.KEY_NOT_EXIST, None)
-        maru_mgr._maru_handler.batch_retrieve.assert_not_called()
-        assert maru_mgr._pending_read_memobjs == {}
+        maru_handler.batch_retrieve.assert_not_called()
+        assert maru_mgr._maru_dispatcher._pending_read_memobjs == {}
 
-    def test_race_batch_retrieve_returns_none_mid_batch(self, maru_mgr):
+    def test_race_batch_retrieve_returns_none_mid_batch(
+        self, maru_mgr, maru_handler, maru_adapter
+    ):
         """k0 resolves; k1 races and returns None — k1 is unpinned."""
         keys = [_mk_key(i) for i in range(2)]
-        maru_mgr._maru_handler.batch_pin.return_value = [True, True]
-        maru_mgr._maru_handler.batch_retrieve.return_value = [
+        maru_handler.batch_pin.return_value = [
+            True,
+            True,
+        ]
+        maru_handler.batch_retrieve.return_value = [
             _FakeMemInfo(0, 0, b"x" * 32),
             None,
         ]
-        maru_mgr._maru_allocator._cxl_adapter.get_by_location.return_value = (
-            mock.MagicMock(name="obj-0")
-        )
+        maru_adapter.get_by_location.return_value = mock.MagicMock(name="obj-0")
 
         ret = maru_mgr.reserve_read(keys)
 
         assert ret[keys[0]][0] is L1Error.SUCCESS
         assert ret[keys[1]] == (L1Error.KEY_NOT_EXIST, None)
         # Only k1's key string should be rolled back via batch_unpin.
-        maru_mgr._maru_handler.batch_unpin.assert_called_once_with(
-            [_object_key_to_string(keys[1])]
+        maru_handler.batch_unpin.assert_called_once_with(
+            [object_key_to_string(keys[1])]
         )
 
-    def test_race_get_by_location_returns_none(self, maru_mgr):
+    def test_race_get_by_location_returns_none(
+        self, maru_mgr, maru_handler, maru_adapter
+    ):
         keys = [_mk_key(0)]
-        maru_mgr._maru_handler.batch_pin.return_value = [True]
-        maru_mgr._maru_handler.batch_retrieve.return_value = [
-            _FakeMemInfo(0, 0, b"x" * 32)
-        ]
-        maru_mgr._maru_allocator._cxl_adapter.get_by_location.return_value = None
+        maru_handler.batch_pin.return_value = [True]
+        maru_handler.batch_retrieve.return_value = [_FakeMemInfo(0, 0, b"x" * 32)]
+        maru_adapter.get_by_location.return_value = None
 
         ret = maru_mgr.reserve_read(keys)
 
         assert ret[keys[0]] == (L1Error.KEY_NOT_EXIST, None)
-        maru_mgr._maru_handler.batch_unpin.assert_called_once_with(
-            [_object_key_to_string(keys[0])]
+        maru_handler.batch_unpin.assert_called_once_with(
+            [object_key_to_string(keys[0])]
         )
 
-    def test_batch_pin_exception_returns_miss_for_all(self, maru_mgr):
+    def test_batch_pin_exception_returns_miss_for_all(self, maru_mgr, maru_handler):
         keys = [_mk_key(i) for i in range(2)]
-        maru_mgr._maru_handler.batch_pin.side_effect = RuntimeError("rpc fail")
+        maru_handler.batch_pin.side_effect = RuntimeError("rpc fail")
 
         ret = maru_mgr.reserve_read(keys)
         for k in keys:
             assert ret[k] == (L1Error.KEY_NOT_EXIST, None)
 
-    def test_batch_retrieve_exception_rolls_back_pins(self, maru_mgr):
+    def test_batch_retrieve_exception_rolls_back_pins(self, maru_mgr, maru_handler):
         keys = [_mk_key(i) for i in range(2)]
-        maru_mgr._maru_handler.batch_pin.return_value = [True, True]
-        maru_mgr._maru_handler.batch_retrieve.side_effect = RuntimeError("rpc fail")
+        maru_handler.batch_pin.return_value = [
+            True,
+            True,
+        ]
+        maru_handler.batch_retrieve.side_effect = RuntimeError("rpc fail")
 
         ret = maru_mgr.reserve_read(keys)
         for k in keys:
             assert ret[k] == (L1Error.KEY_NOT_EXIST, None)
         # Both pins should have been rolled back.
-        maru_mgr._maru_handler.batch_unpin.assert_called_once_with(
-            [_object_key_to_string(k) for k in keys]
+        maru_handler.batch_unpin.assert_called_once_with(
+            [object_key_to_string(k) for k in keys]
         )
 
 
@@ -380,7 +420,7 @@ class TestMaruUnsafeRead:
         keys = [_mk_key(i) for i in range(2)]
         fake_objs = [mock.MagicMock(name=f"obj-{i}") for i in range(2)]
         for k, obj in zip(keys, fake_objs, strict=False):
-            maru_mgr._pending_read_memobjs[k] = obj
+            maru_mgr._maru_dispatcher._pending_read_memobjs[k] = obj
 
         ret = maru_mgr.unsafe_read(keys)
 
@@ -391,7 +431,7 @@ class TestMaruUnsafeRead:
 
     def test_missing_key_returns_not_exist(self, maru_mgr):
         keys = [_mk_key(0), _mk_key(1)]
-        maru_mgr._pending_read_memobjs[keys[0]] = mock.MagicMock()
+        maru_mgr._maru_dispatcher._pending_read_memobjs[keys[0]] = mock.MagicMock()
 
         ret = maru_mgr.unsafe_read(keys)
 
@@ -400,35 +440,37 @@ class TestMaruUnsafeRead:
 
 
 class TestMaruFinishRead:
-    def test_pops_side_channel_and_unpins(self, maru_mgr):
+    def test_pops_side_channel_and_unpins(self, maru_mgr, maru_handler):
         keys = [_mk_key(i) for i in range(2)]
         for k in keys:
-            maru_mgr._pending_read_memobjs[k] = mock.MagicMock()
+            maru_mgr._maru_dispatcher._pending_read_memobjs[k] = mock.MagicMock()
 
         ret = maru_mgr.finish_read(keys)
 
         for k in keys:
             assert ret[k] is L1Error.SUCCESS
-            assert k not in maru_mgr._pending_read_memobjs
-        maru_mgr._maru_handler.batch_unpin.assert_called_once_with(
-            [_object_key_to_string(k) for k in keys]
+            assert k not in maru_mgr._maru_dispatcher._pending_read_memobjs
+        maru_handler.batch_unpin.assert_called_once_with(
+            [object_key_to_string(k) for k in keys]
         )
 
-    def test_non_pending_key_returns_not_exist_and_skips_unpin(self, maru_mgr):
+    def test_non_pending_key_returns_not_exist_and_skips_unpin(
+        self, maru_mgr, maru_handler
+    ):
         unknown = _mk_key(99)
         ret = maru_mgr.finish_read([unknown])
         assert ret[unknown] is L1Error.KEY_NOT_EXIST
-        maru_mgr._maru_handler.batch_unpin.assert_not_called()
+        maru_handler.batch_unpin.assert_not_called()
 
-    def test_unpin_exception_does_not_propagate(self, maru_mgr):
+    def test_unpin_exception_does_not_propagate(self, maru_mgr, maru_handler):
         keys = [_mk_key(0)]
-        maru_mgr._pending_read_memobjs[keys[0]] = mock.MagicMock()
-        maru_mgr._maru_handler.batch_unpin.side_effect = RuntimeError("rpc fail")
+        maru_mgr._maru_dispatcher._pending_read_memobjs[keys[0]] = mock.MagicMock()
+        maru_handler.batch_unpin.side_effect = RuntimeError("rpc fail")
 
         # Should not raise; side channel is still cleared.
         ret = maru_mgr.finish_read(keys)
         assert ret[keys[0]] is L1Error.SUCCESS
-        assert maru_mgr._pending_read_memobjs == {}
+        assert maru_mgr._maru_dispatcher._pending_read_memobjs == {}
 
 
 # =========================================================================
@@ -437,54 +479,54 @@ class TestMaruFinishRead:
 
 
 class TestMaruDelete:
-    def test_success(self, maru_mgr):
+    def test_success(self, maru_mgr, maru_handler):
         keys = [_mk_key(i) for i in range(2)]
-        maru_mgr._maru_handler.delete.return_value = True
+        maru_handler.delete.return_value = True
         ret = maru_mgr.delete(keys)
         assert all(v is L1Error.SUCCESS for v in ret.values())
-        assert maru_mgr._maru_handler.delete.call_count == 2
+        assert maru_handler.delete.call_count == 2
 
-    def test_handler_returns_false_reports_not_exist(self, maru_mgr):
+    def test_handler_returns_false_reports_not_exist(self, maru_mgr, maru_handler):
         """``MaruHandler.delete`` returns False for either missing or
         pinned keys; ``L1Manager`` maps both to ``KEY_NOT_EXIST``.
         """
         keys = [_mk_key(0)]
-        maru_mgr._maru_handler.delete.return_value = False
+        maru_handler.delete.return_value = False
         ret = maru_mgr.delete(keys)
         assert ret[keys[0]] is L1Error.KEY_NOT_EXIST
 
-    def test_exception_reports_wrong_state(self, maru_mgr):
+    def test_exception_reports_wrong_state(self, maru_mgr, maru_handler):
         keys = [_mk_key(0)]
-        maru_mgr._maru_handler.delete.side_effect = RuntimeError("rpc fail")
+        maru_handler.delete.side_effect = RuntimeError("rpc fail")
         ret = maru_mgr.delete(keys)
         assert ret[keys[0]] is L1Error.KEY_IN_WRONG_STATE
 
 
 class TestMaruClear:
-    def test_clear_drops_side_channel_only(self, maru_mgr):
-        maru_mgr._pending_read_memobjs[_mk_key(0)] = mock.MagicMock()
-        maru_mgr._pending_read_memobjs[_mk_key(1)] = mock.MagicMock()
+    def test_clear_drops_side_channel_only(self, maru_mgr, maru_handler):
+        maru_mgr._maru_dispatcher._pending_read_memobjs[_mk_key(0)] = mock.MagicMock()
+        maru_mgr._maru_dispatcher._pending_read_memobjs[_mk_key(1)] = mock.MagicMock()
 
         maru_mgr.clear()
 
-        assert maru_mgr._pending_read_memobjs == {}
+        assert maru_mgr._maru_dispatcher._pending_read_memobjs == {}
         # Server-side state is untouched.
-        maru_mgr._maru_handler.delete.assert_not_called()
+        maru_handler.delete.assert_not_called()
 
-    def test_force_clear_also_drops_only_side_channel(self, maru_mgr):
-        maru_mgr._pending_read_memobjs[_mk_key(0)] = mock.MagicMock()
+    def test_force_clear_also_drops_only_side_channel(self, maru_mgr, maru_handler):
+        maru_mgr._maru_dispatcher._pending_read_memobjs[_mk_key(0)] = mock.MagicMock()
 
         maru_mgr.clear(force=True)
 
-        assert maru_mgr._pending_read_memobjs == {}
-        maru_mgr._maru_handler.delete.assert_not_called()
+        assert maru_mgr._maru_dispatcher._pending_read_memobjs == {}
+        maru_handler.delete.assert_not_called()
 
 
 class TestMaruFinishWriteAndReserveRead:
     def test_resolves_from_side_channel(self, maru_mgr):
         k = _mk_key(0)
         fake_obj = mock.MagicMock()
-        maru_mgr._pending_read_memobjs[k] = fake_obj
+        maru_mgr._maru_dispatcher._pending_read_memobjs[k] = fake_obj
         ret = maru_mgr.finish_write_and_reserve_read([k])
         err, returned = ret[k]
         assert err is L1Error.SUCCESS
@@ -520,7 +562,7 @@ class TestMaruNoOps:
         # consistent answer.
         assert maru_mgr.is_key_evictable(_mk_key(0)) is True
         # Also for a key that happens to be in the side channel.
-        maru_mgr._pending_read_memobjs[_mk_key(1)] = mock.MagicMock()
+        maru_mgr._maru_dispatcher._pending_read_memobjs[_mk_key(1)] = mock.MagicMock()
         assert maru_mgr.is_key_evictable(_mk_key(1)) is True
 
     def test_memcheck_returns_true(self, maru_mgr):
@@ -537,11 +579,12 @@ class TestMaruNoOps:
 
 class TestMaruReportStatus:
     def test_shape(self, maru_mgr):
-        maru_mgr._pending_read_memobjs[_mk_key(0)] = mock.MagicMock()
+        maru_mgr._maru_dispatcher._pending_read_memobjs[_mk_key(0)] = mock.MagicMock()
         # Memory manager get_memory_usage is exercised by
         # ``test_l1_memory_manager_maru.py``; here we only verify the
         # maru-mode dict shape.
         maru_mgr._memory_manager = mock.MagicMock()
+        maru_mgr._maru_dispatcher._memory_manager = maru_mgr._memory_manager
         maru_mgr._memory_manager.get_memory_usage.return_value = (10, 100)
 
         status = maru_mgr.report_status()
@@ -557,12 +600,13 @@ class TestMaruReportStatus:
 
 class TestMaruClose:
     def test_close_clears_side_channel(self, maru_mgr):
-        maru_mgr._pending_read_memobjs[_mk_key(0)] = mock.MagicMock()
+        maru_mgr._maru_dispatcher._pending_read_memobjs[_mk_key(0)] = mock.MagicMock()
         maru_mgr._memory_manager = mock.MagicMock()
+        maru_mgr._maru_dispatcher._memory_manager = maru_mgr._memory_manager
 
         maru_mgr.close()
 
-        assert maru_mgr._pending_read_memobjs == {}
+        assert maru_mgr._maru_dispatcher._pending_read_memobjs == {}
         maru_mgr._memory_manager.close.assert_called_once()
 
 
