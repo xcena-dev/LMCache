@@ -208,26 +208,21 @@ class L1Manager:
 
         self._event_bus = get_event_bus()
 
-        # === Maru backend wiring (Option B) ===
         # When the L1 allocator is ``MaruMemoryAllocator``, L1Manager
-        # operates in *pass-through* mode: state machine / TTLLock /
-        # eviction policy are bypassed, and MaruServer RPCs
-        # (``batch_store`` / ``batch_pin`` / ``batch_retrieve`` /
-        # ``batch_unpin`` / ``delete``) are issued directly via the
-        # allocator's handler. See docs/source/mp/maru/integration.md
-        # Phase 1.C for the rationale.
+        # operates in pass-through mode: the state machine / TTLLock /
+        # eviction policy are bypassed and MaruServer RPCs are issued
+        # directly via the allocator's handler.
         self._maru_handler: Optional[Any] = None
         self._maru_allocator: Optional[Any] = None
-        # Side channel: ``reserve_read`` (maru branch) stages the
-        # CXL-backed MemoryObjs here so the subsequent ``unsafe_read``
-        # can retrieve them; ``finish_read`` clears entries before
-        # ``batch_unpin``.
+        # ``reserve_read`` (maru branch) stages CXL-backed MemoryObjs
+        # here so the subsequent ``unsafe_read`` can return them;
+        # ``finish_read`` clears entries before ``batch_unpin``.
         self._pending_read_memobjs: dict[ObjectKey, MemoryObj] = {}
         if _is_maru_allocator(self._memory_manager.allocator):
-            # Lazy-import the concrete class only when we know the
-            # allocator is actually maru-backed; this keeps the maru
-            # runtime optional for non-maru deployments. ``cast`` tells
-            # mypy that the dispatch flag implies the concrete type.
+            # Lazy-import the concrete class only when the allocator is
+            # actually maru-backed, keeping the maru runtime optional.
+            # ``cast`` tells mypy that the dispatch flag implies the
+            # concrete type.
             # First Party
             from lmcache.v1.distributed.maru_memory_allocator import (
                 MaruMemoryAllocator,
@@ -266,7 +261,7 @@ class L1Manager:
           all skipped (the engine flow goes straight to MaruServer via
           the allocator's handler).
         - Listeners are NOT invoked (controllers / observability paths
-          are bypassed in Phase 1.D).
+          are bypassed).
         """
         return self._maru_handler is not None
 
@@ -278,9 +273,9 @@ class L1Manager:
         """
         if self._is_maru_backend():
             # Maru mode bypasses StoreController / PrefetchController /
-            # L1EvictionController (cf. Phase 1.D). Listener callbacks
-            # are therefore intentionally never invoked, and registration
-            # is silently dropped to keep the API surface stable.
+            # L1EvictionController, so listener callbacks are never
+            # invoked. Registration is silently dropped to keep the API
+            # surface stable.
             return
         with self._lock:
             self._registered_listeners.append(listener)
@@ -689,12 +684,11 @@ class L1Manager:
         """
         if self._is_maru_backend():
             # Maru flow stages MemoryObjs in the side channel during
-            # ``reserve_read``; the engine then transitions straight to
-            # ``unsafe_read`` → ``finish_read``. This atomic
-            # write-to-read transition is therefore a no-op (and not
-            # exercised by the maru path in Phase 1.D), but we keep a
-            # safe SUCCESS response in case any code path still calls
-            # it.
+            # ``reserve_read`` and the engine transitions straight to
+            # ``unsafe_read`` → ``finish_read``, so this atomic
+            # write-to-read transition is never exercised by the maru
+            # path. Return a safe SUCCESS response in case any caller
+            # still invokes it.
             return self._maru_finish_write_and_reserve_read(keys)
 
         extra_count = _validate_extra_count(extra_count)
@@ -889,12 +883,12 @@ class L1Manager:
             nor write-locked), False otherwise.
         """
         if self._is_maru_backend():
-            # L1EvictionController is not registered in maru mode
-            # (cf. Phase 1.D), so this method is never consulted on the
-            # hot path. We still return True to keep the contract simple
-            # for any defensive caller: MaruServer's ``pin_kv`` /
-            # ``delete_kv`` make their own atomic decisions; the
-            # LMCache-side answer has no bearing on actual eviction.
+            # L1EvictionController is not registered in maru mode, so
+            # this method is never consulted on the hot path. Return
+            # True to keep the contract simple for any defensive caller:
+            # MaruServer's ``pin_kv`` / ``delete_kv`` make their own
+            # atomic decisions and the LMCache-side answer has no
+            # bearing on actual eviction.
             return True
         entry = self._objects.get(key, None)
         if entry is None:
@@ -1009,11 +1003,11 @@ class L1Manager:
         return mem_check_result
 
     # =====================================================================
-    # Maru backend helpers (Option B — see docs/source/mp/maru/integration.md
-    # Phase 1.C). These are dispatched from the corresponding public methods
-    # when ``_is_maru_backend()`` is true. They issue ``MaruHandler`` RPCs
-    # directly (sync) instead of going through ``StoreController`` /
-    # ``PrefetchController`` / ``L1EvictionController``.
+    # Maru backend helpers — dispatched from the corresponding public
+    # methods when ``_is_maru_backend()`` is true. They issue
+    # ``MaruHandler`` RPCs directly (sync) instead of going through
+    # ``StoreController`` / ``PrefetchController`` /
+    # ``L1EvictionController``.
     # =====================================================================
 
     def _maru_reserve_read(

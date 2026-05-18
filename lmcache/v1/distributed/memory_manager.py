@@ -157,10 +157,9 @@ class L1MemoryManager:
             In the future, we may want to make a "callback" based mechanism to
             trigger eviction when the memory usage reaches a watermark.
         """
-        # Maru backend: query MaruHandler stats. Eviction is owned by MaruServer
-        # so this is best-effort observability; on failure return (0, 0) rather
-        # than crash the eviction controller (though eviction is typically
-        # disabled in maru mode — cf. integration.md Phase 1.D).
+        # Maru backend: query MaruHandler stats. Eviction is owned by
+        # MaruServer so this is best-effort observability; on failure
+        # return (0, 0) rather than crash the eviction controller.
         if _is_maru_allocator(self._allocator):
             try:
                 handler = self._allocator.handler  # type: ignore[attr-defined]

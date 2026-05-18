@@ -1,8 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 """Unit tests for the maru-backend wiring of L1MemoryManager.
 
-These tests cover the Phase 1.B changes in
-``docs/source/mp/maru/integration.md``:
+Coverage:
 
 1. ``L1MemoryManagerConfig.maru_config`` — when set, the DRAM-only
    ``init_size_in_bytes`` clamp is skipped.
@@ -136,11 +135,11 @@ class TestCreateMemoryAllocatorDispatch:
         finally:
             alloc.close()
 
-    # NOTE: ``use_lazy=False`` (MixedMemoryAllocator) is intentionally NOT
-    # covered here: its constructor eagerly invokes ``cudaHostAlloc`` which
-    # is environment-dependent. That path is already exercised by
-    # ``test_l1_memory_manager.py``. Phase 1.B only touches the maru
-    # routing, which is covered below.
+    # NOTE: ``use_lazy=False`` (MixedMemoryAllocator) is intentionally
+    # NOT covered here — its constructor eagerly invokes
+    # ``cudaHostAlloc`` which is environment-dependent. That path is
+    # already exercised by ``test_l1_memory_manager.py``; we only need
+    # to verify the maru routing here.
 
     def test_maru_path_routes_to_maru_allocator(self, maru_cfg, fake_maru_init):
         cfg = L1MemoryManagerConfig(

@@ -5,9 +5,7 @@
 This module exposes :class:`MaruMemoryAllocator`, an implementation of
 :class:`MemoryAllocatorInterface` whose ``MemoryObj`` instances are backed
 by CXL shared memory via the embedded ``CxlMemoryAdapter``
-(``maru_lmcache``). It is the "Option B" allocator used by LMCache MP
-mode's maru integration; see ``docs/source/mp/maru/integration.md`` for
-the broader design.
+(``maru_lmcache``).
 
 Key invariants:
 - ``MemoryObj.parent_allocator`` is ``None`` for all objects returned by
@@ -17,7 +15,7 @@ Key invariants:
 - :meth:`get_by_location` and :meth:`create_store_handle` are not part
   of ``MemoryAllocatorInterface``; ``L1Manager``'s maru branch reaches
   them through an ``isinstance`` check.
-- ``maru`` and ``maru_lmcache`` are imported lazily so that loading this
+- ``maru`` and ``maru_lmcache`` are imported lazily so loading this
   module does not require those packages to be installed.
 """
 

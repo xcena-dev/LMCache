@@ -1,8 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 """Unit tests for the maru-backend branches of L1Manager.
 
-These tests cover the Phase 1.C changes in
-``docs/source/mp/maru/integration.md``:
+Coverage:
 
 1. ``_object_key_to_string`` — stable string form for MaruHandler RPCs.
 2. ``L1Manager.__init__`` — auto-detects ``MaruMemoryAllocator`` and
@@ -539,8 +538,9 @@ class TestMaruNoOps:
 class TestMaruReportStatus:
     def test_shape(self, maru_mgr):
         maru_mgr._pending_read_memobjs[_mk_key(0)] = mock.MagicMock()
-        # Memory manager get_memory_usage is already covered by the
-        # Phase 1.B tests; here we just verify the maru-mode dict shape.
+        # Memory manager get_memory_usage is exercised by
+        # ``test_l1_memory_manager_maru.py``; here we only verify the
+        # maru-mode dict shape.
         maru_mgr._memory_manager = mock.MagicMock()
         maru_mgr._memory_manager.get_memory_usage.return_value = (10, 100)
 

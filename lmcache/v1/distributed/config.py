@@ -43,7 +43,7 @@ class L1MemoryManagerConfig:
     maru_config: Optional["MaruL1Config"] = None
     """ Optional Maru backend config. When set, the L1 allocator is
     constructed as ``MaruMemoryAllocator`` (CXL-backed) and the DRAM
-    fields above are ignored. See ``docs/source/mp/maru/integration.md``. """
+    fields above are ignored. """
 
     def __post_init__(self):
         # The DRAM init-size clamp only makes sense for default backends.
