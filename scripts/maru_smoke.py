@@ -22,8 +22,9 @@ Tiers (each builds on the previous):
     T4. ``MaruMemoryAllocator.init_layout()`` brings the CXL pool up.
     T5. ``MaruMemoryAllocator.batched_allocate()`` returns MemoryObjs.
     T6. ``L1MemoryManager.register_kv_layout()`` forwards down.
-    T7. ``MaruL2Adapter`` constructs + connects.
-    T8. ``MaruL2Adapter`` store → load round-trip preserves bytes.
+    T7. ``MaruL2Adapter`` constructs (lazy — handler stays ``None``).
+    T8. First store triggers the lazy ``MaruHandler.connect`` and
+        the store → load round-trip preserves bytes.
 
 Usage::
 
@@ -331,7 +332,7 @@ def t6_register_kv_layout(server_url: str, pool_bytes: int) -> bool:
 
 
 def t7_l2_adapter_connect(server_url: str, pool_bytes: int) -> bool:
-    hdr("T7 — MaruL2Adapter construction + connect")
+    hdr("T7 — MaruL2Adapter construction (lazy — no RPC yet)")
     # First Party
     from lmcache.v1.distributed.l2_adapters.maru_l2_adapter import (
         MaruL2Adapter,
@@ -363,7 +364,11 @@ def t7_l2_adapter_connect(server_url: str, pool_bytes: int) -> bool:
         fail(f"expected 3 distinct event fds, got {len(fds)}")
         adapter.close()
         return False
-    ok(f"connected; event fds = {sorted(fds)}")
+    if adapter._handler is not None:
+        fail("handler populated before any store (lazy contract broken)")
+        adapter.close()
+        return False
+    ok(f"constructed; handler=None, event fds = {sorted(fds)}")
 
     t7_l2_adapter_connect._adapter = adapter  # type: ignore[attr-defined]
     t7_l2_adapter_connect._chunk_size_bytes = chunk_size_bytes  # type: ignore[attr-defined]
@@ -371,7 +376,7 @@ def t7_l2_adapter_connect(server_url: str, pool_bytes: int) -> bool:
 
 
 def t8_l2_store_load_roundtrip() -> bool:
-    hdr("T8 — MaruL2Adapter store → load round-trip")
+    hdr("T8 — first store triggers lazy connect + store → load round-trip")
     # Standard
     from unittest import mock
     import time
