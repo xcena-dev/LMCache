@@ -17,10 +17,14 @@ Coverage:
 7. ``close()`` — idempotent teardown without inflight work.
 8. ``_object_key_to_string`` — encoding parity with the L1 dispatcher.
 
-``MaruHandler`` is monkey-patched (``MaruL2Adapter._create_handler``
-returns a ``MagicMock``) so no MaruServer is needed. Worker pools
-are replaced with an inline ``_SyncExecutor`` so each ``submit_*``
-returns deterministically before assertions.
+``MaruHandler`` is monkey-patched: ``MaruL2Adapter._connect_handler``
+is replaced so it returns a ``MagicMock`` instead of dialing
+MaruServer. The default ``adapter`` fixture additionally pre-pins
+``_handler`` and ``_chunk_size_bytes`` so each ``submit_*`` runs as
+if the lazy connect already fired (tests that care about the lazy
+behaviour itself use ``lazy_adapter``). Worker pools are swapped
+for an inline ``_SyncExecutor`` so submit_* returns
+deterministically before assertions.
 """
 
 # Standard
@@ -129,9 +133,21 @@ def fake_handler() -> mock.MagicMock:
 
 @pytest.fixture
 def adapter(base_cfg, fake_handler):
-    """Build a ``MaruL2Adapter`` with the handler + executors stubbed."""
-    with mock.patch.object(MaruL2Adapter, "_create_handler", return_value=fake_handler):
+    """Build a ``MaruL2Adapter`` with the handler pre-installed.
+
+    Bypasses the lazy connect path so existing store/load/lookup
+    tests see a working handler immediately. ``_connect_handler`` is
+    also patched so any test that does trigger ``_ensure_connected``
+    picks up the same mock instead of dialing MaruServer.
+    """
+    with mock.patch.object(
+        MaruL2Adapter, "_connect_handler", return_value=fake_handler
+    ):
         a = MaruL2Adapter(base_cfg)
+    # Simulate the post-connect state: handler is wired in and the
+    # chunk size is locked to the config value.
+    a._handler = fake_handler
+    a._chunk_size_bytes = base_cfg.chunk_size_bytes
     # Swap async executors for the inline sync stub.
     a._store_executor = _SyncExecutor()
     a._lookup_executor = _SyncExecutor()
@@ -142,6 +158,35 @@ def adapter(base_cfg, fake_handler):
         # ``close()`` walks every executor; ``_SyncExecutor.shutdown``
         # is a no-op, so this is cheap.
         a.close()
+
+
+@pytest.fixture
+def lazy_adapter(base_cfg, fake_handler):
+    """Build a ``MaruL2Adapter`` with NO pre-installed handler.
+
+    For tests that exercise ``_ensure_connected`` directly:
+    ``_connect_handler`` is patched so the first internal call
+    returns ``fake_handler``. Tests assert when (and with which
+    chunk-size hint) the call fired.
+    """
+    connect_mock = mock.MagicMock(return_value=fake_handler)
+    with mock.patch.object(MaruL2Adapter, "_connect_handler", connect_mock):
+        # No chunk_size_bytes in config — derived lazily.
+        cfg = MaruL2AdapterConfig(
+            server_url=base_cfg.server_url,
+            pool_size_gb=base_cfg.pool_size_gb,
+            chunk_size_bytes=None,
+            instance_id=base_cfg.instance_id,
+        )
+        a = MaruL2Adapter(cfg)
+        # Inline-sync executors so submit_* finishes before assertions.
+        a._store_executor = _SyncExecutor()
+        a._lookup_executor = _SyncExecutor()
+        a._load_executor = _SyncExecutor()
+        try:
+            yield a, connect_mock
+        finally:
+            a.close()
 
 
 # =====================================================================
@@ -263,7 +308,7 @@ class TestRegistration:
         )
 
         with mock.patch.object(
-            MaruL2Adapter, "_create_handler", return_value=fake_handler
+            MaruL2Adapter, "_connect_handler", return_value=fake_handler
         ):
             a = _create_maru_l2_adapter(base_cfg, l1_memory_desc=None)
         try:
@@ -288,7 +333,7 @@ class TestLifecycle:
 
     def test_close_idempotent(self, base_cfg, fake_handler):
         with mock.patch.object(
-            MaruL2Adapter, "_create_handler", return_value=fake_handler
+            MaruL2Adapter, "_connect_handler", return_value=fake_handler
         ):
             a = MaruL2Adapter(base_cfg)
         a._store_executor = _SyncExecutor()
@@ -299,7 +344,7 @@ class TestLifecycle:
 
     def test_submit_after_close_raises(self, base_cfg, fake_handler):
         with mock.patch.object(
-            MaruL2Adapter, "_create_handler", return_value=fake_handler
+            MaruL2Adapter, "_connect_handler", return_value=fake_handler
         ):
             a = MaruL2Adapter(base_cfg)
         a._store_executor = _SyncExecutor()
@@ -581,3 +626,155 @@ class TestMemoryviewAddr:
         buf = bytearray(b"\x00" * 16)
         mv = memoryview(buf)
         assert _memoryview_addr(mv) == _memoryview_addr(mv)
+
+
+# =====================================================================
+# (10) Lazy MaruHandler connect
+# =====================================================================
+
+
+class TestLazyConnect:
+    def test_handler_none_at_init(self, lazy_adapter):
+        a, connect_mock = lazy_adapter
+        assert a._handler is None
+        assert a._chunk_size_bytes is None
+        connect_mock.assert_not_called()
+
+    def test_first_store_triggers_connect_with_physical_size_hint(
+        self, lazy_adapter, fake_handler
+    ):
+        a, connect_mock = lazy_adapter
+        keys = [_mk_key(0)]
+        size = 4096
+        src = np.zeros(size, dtype=np.uint8)
+        obj = _make_dram_memory_obj(src, size_override=size)
+        # Distinct logical vs physical size — the lazy path must pick
+        # the *physical* size for the page allocation.
+        obj.get_physical_size = mock.MagicMock(return_value=size * 2)
+
+        fake_handler.alloc.return_value = _FakeAllocHandle(size)
+        fake_handler.batch_store.return_value = [True]
+
+        task_id = a.submit_store_task(keys, [obj])
+
+        connect_mock.assert_called_once()
+        # ``_connect_handler(config, chunk_size_bytes)`` — second arg
+        # is what we care about.
+        passed_chunk = connect_mock.call_args.args[1]
+        assert passed_chunk == size * 2
+        assert a._chunk_size_bytes == size * 2
+        assert a._handler is fake_handler
+
+        # And the task itself succeeded.
+        assert a.pop_completed_store_tasks() == {task_id: True}
+
+    def test_explicit_chunk_size_wins_over_hint(self, base_cfg, fake_handler):
+        """Config-level ``chunk_size_bytes`` is authoritative; the
+        first store's physical-size hint is ignored.
+        """
+        # Pin an explicit chunk size in config.
+        cfg = MaruL2AdapterConfig(
+            server_url=base_cfg.server_url,
+            pool_size_gb=base_cfg.pool_size_gb,
+            chunk_size_bytes=999_999,
+            instance_id=base_cfg.instance_id,
+        )
+        connect_mock = mock.MagicMock(return_value=fake_handler)
+        # NB: the patch must wrap the full test body, not just the
+        # constructor — ``submit_store_task`` triggers ``_ensure_connected``
+        # which calls ``_connect_handler``. Letting the patch lapse
+        # before the store would dial the real MaruServer.
+        with mock.patch.object(MaruL2Adapter, "_connect_handler", connect_mock):
+            a = MaruL2Adapter(cfg)
+            a._store_executor = _SyncExecutor()
+            a._lookup_executor = _SyncExecutor()
+            a._load_executor = _SyncExecutor()
+            try:
+                obj = _make_dram_memory_obj(np.zeros(64, dtype=np.uint8))
+                obj.get_physical_size = mock.MagicMock(return_value=12345)
+                fake_handler.alloc.return_value = _FakeAllocHandle(64)
+                fake_handler.batch_store.return_value = [True]
+
+                a.submit_store_task([_mk_key(0)], [obj])
+
+                connect_mock.assert_called_once()
+                assert connect_mock.call_args.args[1] == 999_999
+            finally:
+                a.close()
+
+    def test_lookup_before_store_yields_all_miss(self, lazy_adapter):
+        """Lookup without a prior store + no config chunk_size_bytes
+        can't connect — ``_ensure_connected`` raises and the worker
+        records an all-miss bitmap.
+        """
+        a, connect_mock = lazy_adapter
+        keys = [_mk_key(i) for i in range(2)]
+        task_id = a.submit_lookup_and_lock_task(keys)
+        bm = a.query_lookup_and_lock_result(task_id)
+        assert bm is not None
+        assert [bm.test(i) for i in range(2)] == [False, False]
+        # connect never happened.
+        connect_mock.assert_not_called()
+        assert a._handler is None
+
+    def test_load_first_triggers_connect_with_hint(self, lazy_adapter, fake_handler):
+        """Load also seeds the lazy connect via the destination
+        MemoryObj's physical size.
+        """
+        a, connect_mock = lazy_adapter
+        size = 2048
+        dst = np.zeros(size, dtype=np.uint8)
+        obj = _make_dram_memory_obj(dst, size_override=size)
+        obj.get_physical_size = mock.MagicMock(return_value=size)
+
+        fake_handler.batch_retrieve.return_value = [None]  # miss
+        task_id = a.submit_load_task([_mk_key(0)], [obj])
+        bm = a.query_load_result(task_id)
+        assert bm is not None and bm.test(0) is False
+
+        connect_mock.assert_called_once()
+        assert connect_mock.call_args.args[1] == size
+
+    def test_unlock_skips_when_not_connected(self, lazy_adapter):
+        a, connect_mock = lazy_adapter
+        # Must not raise — and must not attempt to connect, since
+        # there can be no live pins on a never-connected handler.
+        a.submit_unlock([_mk_key(0), _mk_key(1)])
+        connect_mock.assert_not_called()
+        assert a._handler is None
+
+    def test_delete_skips_when_not_connected(self, lazy_adapter):
+        a, connect_mock = lazy_adapter
+        a.delete([_mk_key(0)])
+        connect_mock.assert_not_called()
+        assert a._handler is None
+
+    def test_second_call_reuses_handler(self, lazy_adapter, fake_handler):
+        """``_ensure_connected`` is idempotent — only the first store
+        triggers ``_connect_handler``.
+        """
+        a, connect_mock = lazy_adapter
+        size = 4096
+        src = np.zeros(size, dtype=np.uint8)
+        obj = _make_dram_memory_obj(src, size_override=size)
+        obj.get_physical_size = mock.MagicMock(return_value=size)
+        fake_handler.alloc.return_value = _FakeAllocHandle(size)
+        fake_handler.batch_store.return_value = [True]
+
+        a.submit_store_task([_mk_key(0)], [obj])
+        a.submit_store_task([_mk_key(1)], [obj])
+
+        # Single connect across both stores.
+        assert connect_mock.call_count == 1
+
+    def test_from_dict_chunk_size_optional(self):
+        """``chunk_size_bytes`` is no longer required in the
+        ``--l2-adapter`` JSON."""
+        cfg = MaruL2AdapterConfig.from_dict(
+            {
+                "server_url": "maru://localhost:5555",
+                "pool_size_gb": 1,
+                # no chunk_size_bytes
+            }
+        )
+        assert cfg.chunk_size_bytes is None

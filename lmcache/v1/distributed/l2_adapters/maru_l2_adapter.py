@@ -85,16 +85,15 @@ class MaruL2AdapterConfig(L2AdapterConfigBase):
     """Configuration for the maru L2 adapter.
 
     The adapter connects to a ``MaruServer`` at ``server_url`` and
-    requests a CXL pool sized at ``pool_size_gb``. ``chunk_size_bytes``
-    sets the MaruServer page size (must match the LMCache full-chunk
-    byte budget for the running model) and is required at construction
-    because ``MaruHandler.connect()`` needs it eagerly.
+    requests a CXL pool sized at ``pool_size_gb``.
 
-    TODO(maru-l2-lazy-layout): mirror the L1 path's two-phase
-    ``init_layout`` so this adapter can defer ``MaruHandler.connect()``
-    until the first store and derive ``chunk_size_bytes`` from the
-    inbound ``MemoryObj`` metadata, removing the need for the user to
-    spell it out in CLI / yaml.
+    ``chunk_size_bytes`` (the MaruServer page size) is optional —
+    leaving it unset defers ``MaruHandler.connect()`` until the first
+    :meth:`MaruL2Adapter.submit_store_task` and derives the value
+    from the inbound ``MemoryObj.get_physical_size()`` (which
+    LMCache aligns to a full KV chunk). Spell it out only if you
+    need lookup-and-lock or load to fire before any store, or if
+    you want to pin the page size to a specific value.
     """
 
     def __init__(
@@ -102,7 +101,7 @@ class MaruL2AdapterConfig(L2AdapterConfigBase):
         *,
         server_url: str,
         pool_size_gb: float,
-        chunk_size_bytes: int,
+        chunk_size_bytes: Optional[int] = None,
         instance_id: Optional[str] = None,
         num_store_workers: int = 1,
         num_lookup_workers: int = 1,
@@ -118,8 +117,11 @@ class MaruL2AdapterConfig(L2AdapterConfigBase):
             server_url: MaruServer endpoint (``maru://host:port`` or
                 ``tcp://host:port``; the former is rewritten internally).
             pool_size_gb: CXL pool quota requested from MaruServer (GB).
-            chunk_size_bytes: MaruServer page / chunk size. Must equal
-                the running model's full KV chunk byte size.
+            chunk_size_bytes: MaruServer page / chunk size, in bytes.
+                Optional — when ``None``, derived from the first
+                ``MemoryObj`` handed to :meth:`submit_store_task`.
+                Set explicitly to lock the page size or to allow
+                lookup-first usage.
             instance_id: Stable client identifier reported to MaruServer
                 (UUID auto-generated if ``None``).
             num_store_workers: Worker threads for store tasks.
@@ -167,8 +169,11 @@ class MaruL2AdapterConfig(L2AdapterConfigBase):
             raise ValueError("pool_size_gb must be a positive number")
 
         chunk_size_bytes = d.get("chunk_size_bytes")
-        if not isinstance(chunk_size_bytes, int) or chunk_size_bytes <= 0:
-            raise ValueError("chunk_size_bytes must be a positive integer")
+        if chunk_size_bytes is not None:
+            if not isinstance(chunk_size_bytes, int) or chunk_size_bytes <= 0:
+                raise ValueError(
+                    "chunk_size_bytes must be a positive integer when provided"
+                )
 
         instance_id = d.get("instance_id")
         if instance_id is not None and not isinstance(instance_id, str):
@@ -212,8 +217,10 @@ class MaruL2AdapterConfig(L2AdapterConfigBase):
             "- server_url (str): MaruServer endpoint, maru:// or "
             "tcp:// (required)\n"
             "- pool_size_gb (float): CXL pool size to request (required, >0)\n"
-            "- chunk_size_bytes (int): MaruServer page size, must match the "
-            "model's full KV chunk byte size (required, >0)\n"
+            "- chunk_size_bytes (int): MaruServer page size (optional, >0). "
+            "When omitted, derived from the first stored MemoryObj's "
+            "physical size. Set explicitly to pin the size or to allow "
+            "lookup-first usage.\n"
             "- instance_id (str): client identifier (optional; UUID if "
             "omitted)\n"
             "- num_store_workers (int): store worker threads "
@@ -244,21 +251,28 @@ class MaruL2Adapter(L2AdapterInterface):
     """
 
     def __init__(self, config: MaruL2AdapterConfig) -> None:
-        """Connect to MaruServer and prepare worker pools / event fds.
+        """Prepare worker pools / event fds; defer MaruServer connect.
+
+        The MaruHandler connection is built lazily on first use so
+        ``chunk_size_bytes`` can be derived from inbound MemoryObjs
+        when the user did not pin it in config. See
+        :meth:`_ensure_connected`.
 
         Args:
             config: Validated ``MaruL2AdapterConfig``.
-
-        Raises:
-            RuntimeError: If ``MaruHandler.connect()`` fails.
         """
         super().__init__(max_capacity_bytes=int(config.pool_size_gb * 1024**3))
         self._config = config
 
-        # MaruHandler / runtime types are imported lazily so this
-        # module can be imported in environments without the maru
-        # runtime installed (mirroring MaruMemoryAllocator's pattern).
-        self._handler: Any = self._create_handler(config)
+        # Handler stays ``None`` until ``_ensure_connected`` resolves
+        # a concrete ``chunk_size_bytes``. ``MaruHandler`` /
+        # ``maru_lmcache`` imports are also deferred inside
+        # ``_connect_handler`` so this module can load without the
+        # maru runtime installed (mirroring MaruMemoryAllocator).
+        self._handler: Optional[Any] = None
+        # ``None`` while the page size is still unknown; pinned to the
+        # config value (if set) or the first-store hint on connect.
+        self._chunk_size_bytes: Optional[int] = config.chunk_size_bytes
 
         # Three distinct event notifiers — controllers' fd-to-adapter
         # dispatch maps require them to be unique per task type.
@@ -299,11 +313,24 @@ class MaruL2Adapter(L2AdapterInterface):
     # ------------------------------------------------------------------
 
     @staticmethod
-    def _create_handler(config: MaruL2AdapterConfig) -> Any:
-        """Build and connect a ``MaruHandler`` for this adapter.
+    def _connect_handler(config: MaruL2AdapterConfig, chunk_size_bytes: int) -> Any:
+        """Build and connect a ``MaruHandler`` with the resolved page size.
 
         ``maru`` is imported lazily so the adapter module can be
-        loaded without the maru runtime installed.
+        loaded without the maru runtime installed. ``chunk_size_bytes``
+        is taken as an explicit argument rather than from ``config``
+        because the lazy path may derive it from a store payload at
+        first use.
+
+        Args:
+            config: Adapter configuration (everything except chunk size).
+            chunk_size_bytes: Resolved MaruServer page size.
+
+        Returns:
+            A connected ``MaruHandler``.
+
+        Raises:
+            RuntimeError: If ``MaruHandler.connect()`` fails.
         """
         # Third Party
         from maru import MaruConfig, MaruHandler
@@ -316,7 +343,7 @@ class MaruL2Adapter(L2AdapterInterface):
             server_url=server_url,
             instance_id=config.instance_id,
             pool_size=int(config.pool_size_gb * 1024**3),
-            chunk_size_bytes=config.chunk_size_bytes,
+            chunk_size_bytes=chunk_size_bytes,
             auto_connect=False,
             timeout_ms=config.timeout_ms,
             use_async_rpc=config.use_async_rpc,
@@ -333,9 +360,47 @@ class MaruL2Adapter(L2AdapterInterface):
             config.server_url,
             handler.instance_id,
             config.pool_size_gb,
-            config.chunk_size_bytes,
+            chunk_size_bytes,
         )
         return handler
+
+    def _ensure_connected(self, hint_size: Optional[int] = None) -> Any:
+        """Lazy MaruHandler bring-up.
+
+        On first call the page size is resolved (config value wins;
+        otherwise ``hint_size`` is used) and the handler is connected.
+        Subsequent calls just return the cached handler.
+
+        Args:
+            hint_size: A page-size suggestion, typically
+                ``MemoryObj.get_physical_size()`` of the first store
+                payload. Ignored once ``chunk_size_bytes`` is known.
+
+        Returns:
+            The connected ``MaruHandler``.
+
+        Raises:
+            RuntimeError: If the adapter has been closed, or if no
+                page size is known and no ``hint_size`` is provided
+                (which happens when a lookup / load fires before any
+                store and the user did not pin ``chunk_size_bytes``
+                in config).
+        """
+        with self._lock:
+            if self._handler is not None:
+                return self._handler
+            self._ensure_open_locked()
+            chunk_size_bytes = self._chunk_size_bytes
+            if chunk_size_bytes is None:
+                if hint_size is None or hint_size <= 0:
+                    raise RuntimeError(
+                        "MaruL2Adapter: chunk_size_bytes is unknown — either "
+                        "set it in config or run a store before lookup / load."
+                    )
+                chunk_size_bytes = hint_size
+            self._handler = self._connect_handler(self._config, chunk_size_bytes)
+            self._chunk_size_bytes = chunk_size_bytes
+            return self._handler
 
     def _get_next_task_id_locked(self) -> L2TaskId:
         """Return a fresh task id; caller must hold ``self._lock``."""
@@ -416,10 +481,17 @@ class MaruL2Adapter(L2AdapterInterface):
         success = True
         stored_sizes: list[int] = []
         try:
+            # First store doubles as the lazy connect trigger — the
+            # MemoryObj's physical size sets the page size if config
+            # didn't pin it. ``get_physical_size`` is LMCache's
+            # chunk-aligned byte count.
+            hint = objects[0].get_physical_size() if objects else None
+            handler = self._ensure_connected(hint_size=hint)
+
             handles: list[Any] = []
             for obj in objects:
                 size = obj.get_size()
-                handle = self._handler.alloc(size)
+                handle = handler.alloc(size)
                 # DRAM → CXL byte copy. ``obj.data_ptr`` is the
                 # source (L1 DRAM); the CXL page is mapped behind
                 # ``handle.buf`` (zero-copy memoryview).
@@ -429,7 +501,7 @@ class MaruL2Adapter(L2AdapterInterface):
                 stored_sizes.append(size)
 
             key_strs = [_object_key_to_string(k) for k in keys]
-            results = self._handler.batch_store(key_strs, handles)
+            results = handler.batch_store(key_strs, handles)
             # ``batch_store`` returns per-key flags. Treat dup-skip
             # (True from server) as success — the KV is in maru regardless.
             success = all(results)
@@ -495,8 +567,13 @@ class MaruL2Adapter(L2AdapterInterface):
         """Worker entry: ``batch_pin`` + record prefix-bitmap."""
         bitmap = Bitmap(len(keys))
         try:
+            # Lookup must follow a store (or an explicit config
+            # ``chunk_size_bytes``) — ``_ensure_connected`` raises
+            # otherwise. The exception turns into an all-miss bitmap
+            # so the caller sees a clean "nothing cached" answer.
+            handler = self._ensure_connected()
             key_strs = [_object_key_to_string(k) for k in keys]
-            pin_results = self._handler.batch_pin(key_strs)
+            pin_results = handler.batch_pin(key_strs)
             # Prefix-stop: first miss ends the contiguous hit run.
             for i, ok in enumerate(pin_results):
                 if not ok:
@@ -524,9 +601,13 @@ class MaruL2Adapter(L2AdapterInterface):
         """Release prior ``submit_lookup_and_lock_task`` locks.
 
         Synchronous — there is no per-task completion contract for
-        unlock (the controller fires it and moves on).
+        unlock (the controller fires it and moves on). If the
+        handler has not been connected yet (no prior store / lookup)
+        the call is a silent no-op since there can be no live pins.
         """
         if not keys:
+            return
+        if self._handler is None:
             return
         key_strs = [_object_key_to_string(k) for k in keys]
         try:
@@ -576,8 +657,15 @@ class MaruL2Adapter(L2AdapterInterface):
         bitmap = Bitmap(len(keys))
         accessed: list[ObjectKey] = []
         try:
+            # Load can also seed the lazy connect: the L1 destination
+            # ``MemoryObj`` is already chunk-aligned, so we use its
+            # physical size as the page-size hint if no prior store
+            # has resolved one.
+            hint = objects[0].get_physical_size() if objects else None
+            handler = self._ensure_connected(hint_size=hint)
+
             key_strs = [_object_key_to_string(k) for k in keys]
-            mem_infos = self._handler.batch_retrieve(key_strs)
+            mem_infos = handler.batch_retrieve(key_strs)
             for i, (obj, info) in enumerate(zip(objects, mem_infos, strict=False)):
                 if info is None:
                     continue
@@ -618,9 +706,11 @@ class MaruL2Adapter(L2AdapterInterface):
         ``MaruHandler.delete`` is per-key and may return ``False`` when
         the key is pinned (still being read) or missing. Both cases
         are logged but not re-raised — eviction is best-effort and the
-        controller can retry later.
+        controller can retry later. A no-op when the handler has not
+        been connected (no prior store / lookup); there is nothing to
+        delete in that case.
         """
-        if not keys:
+        if not keys or self._handler is None:
             return
         for key in keys:
             key_str = _object_key_to_string(key)
