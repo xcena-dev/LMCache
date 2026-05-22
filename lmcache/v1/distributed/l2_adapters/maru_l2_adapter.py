@@ -85,7 +85,11 @@ class MaruL2AdapterConfig(L2AdapterConfigBase):
     """Configuration for the maru L2 adapter.
 
     The adapter connects to a ``MaruServer`` at ``server_url`` and
-    requests a CXL pool sized at ``pool_size_gb``.
+    requests a CXL pool of ``pool_size_gb`` GiB. User-facing name
+    matches the L1 path (``--maru-pool-size-gb`` CLI flag); the value
+    is converted to bytes once inside :meth:`__init__` and exposed
+    internally as :attr:`pool_size_bytes` (matching
+    :class:`MaruL1Config.pool_size_bytes`).
 
     ``chunk_size_bytes`` (the MaruServer page size) is optional —
     leaving it unset defers ``MaruHandler.connect()`` until the first
@@ -116,7 +120,11 @@ class MaruL2AdapterConfig(L2AdapterConfigBase):
         Args:
             server_url: MaruServer endpoint (``maru://host:port`` or
                 ``tcp://host:port``; the former is rewritten internally).
-            pool_size_gb: CXL pool quota requested from MaruServer (GB).
+            pool_size_gb: CXL pool quota requested from MaruServer
+                (GiB; ``1 GiB = 1 << 30 bytes``). Matches the
+                user-facing form of ``--maru-pool-size-gb`` used by
+                the L1 path. Internally converted to
+                :attr:`pool_size_bytes`.
             chunk_size_bytes: MaruServer page / chunk size, in bytes.
                 Optional — when ``None``, derived from the first
                 ``MemoryObj`` handed to :meth:`submit_store_task`.
@@ -135,7 +143,11 @@ class MaruL2AdapterConfig(L2AdapterConfigBase):
                 regions on connect.
         """
         self.server_url = server_url
-        self.pool_size_gb = pool_size_gb
+        self.pool_size_gb = float(pool_size_gb)
+        # Cached bytes form for internal use (matches MaruL1Config
+        # naming). Converted once here so downstream code doesn't
+        # re-multiply.
+        self.pool_size_bytes: int = int(self.pool_size_gb * (1 << 30))
         self.chunk_size_bytes = chunk_size_bytes
         self.instance_id = instance_id
         self.num_store_workers = num_store_workers
@@ -216,7 +228,8 @@ class MaruL2AdapterConfig(L2AdapterConfigBase):
             "Maru L2 adapter config fields:\n"
             "- server_url (str): MaruServer endpoint, maru:// or "
             "tcp:// (required)\n"
-            "- pool_size_gb (float): CXL pool size to request (required, >0)\n"
+            "- pool_size_gb (float): CXL pool size to request, in GiB (required, >0). "
+            "Same user-facing form as the L1 path's --maru-pool-size-gb.\n"
             "- chunk_size_bytes (int): MaruServer page size (optional, >0). "
             "When omitted, derived from the first stored MemoryObj's "
             "physical size. Set explicitly to pin the size or to allow "
@@ -261,7 +274,7 @@ class MaruL2Adapter(L2AdapterInterface):
         Args:
             config: Validated ``MaruL2AdapterConfig``.
         """
-        super().__init__(max_capacity_bytes=int(config.pool_size_gb * 1024**3))
+        super().__init__(max_capacity_bytes=int(config.pool_size_bytes))
         self._config = config
 
         # Handler stays ``None`` until ``_ensure_connected`` resolves
@@ -342,7 +355,7 @@ class MaruL2Adapter(L2AdapterInterface):
         maru_config = MaruConfig(
             server_url=server_url,
             instance_id=config.instance_id,
-            pool_size=int(config.pool_size_gb * 1024**3),
+            pool_size=int(config.pool_size_bytes),
             chunk_size_bytes=chunk_size_bytes,
             auto_connect=False,
             timeout_ms=config.timeout_ms,
@@ -356,10 +369,10 @@ class MaruL2Adapter(L2AdapterInterface):
             raise RuntimeError(f"Failed to connect MaruHandler to {config.server_url}")
         logger.info(
             "[MaruL2Adapter] connected: server=%s instance_id=%s "
-            "pool_gb=%s chunk_size_bytes=%d",
+            "pool_bytes=%s chunk_size_bytes=%d",
             config.server_url,
             handler.instance_id,
-            config.pool_size_gb,
+            config.pool_size_bytes,
             chunk_size_bytes,
         )
         return handler
