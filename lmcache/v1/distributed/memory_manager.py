@@ -1,5 +1,8 @@
 # SPDX-License-Identifier: Apache-2.0
 
+# Third Party
+import torch
+
 # First Party
 from lmcache.logging import init_logger
 from lmcache.v1.distributed.api import MemoryLayoutDesc
@@ -9,6 +12,7 @@ from lmcache.v1.distributed.internal_api import L1MemoryDesc
 from lmcache.v1.lazy_memory_allocator import LazyMemoryAllocator
 from lmcache.v1.memory_management import (
     MemoryAllocatorInterface,
+    MemoryFormat,
     MemoryObj,
     MixedMemoryAllocator,
 )
@@ -27,6 +31,18 @@ def create_memory_allocator(config: L1MemoryManagerConfig) -> MemoryAllocatorInt
     Returns:
         MemoryAllocatorInterface: An instance of a memory allocator.
     """
+    if config.maru_config is not None:
+        # Maru backend — CXL-backed allocator via MaruMemoryAllocator.
+        # Lazy import keeps the maru runtime optional for non-maru builds.
+        # First Party
+        from lmcache.v1.distributed.maru_memory_allocator import MaruMemoryAllocator
+
+        logger.debug(
+            "use maru memory allocator: server=%s pool_size=%d bytes",
+            config.maru_config.server_url,
+            config.maru_config.pool_size_bytes,
+        )
+        return MaruMemoryAllocator(config.maru_config)
     if config.use_lazy:
         logger.debug(
             "use lazy memory allocator, init size is %d bytes, "
@@ -51,6 +67,18 @@ def create_memory_allocator(config: L1MemoryManagerConfig) -> MemoryAllocatorInt
         )
 
 
+def _is_maru_allocator(allocator: MemoryAllocatorInterface) -> bool:
+    """``isinstance(allocator, MaruMemoryAllocator)`` with lazy import.
+
+    Avoids importing the maru-backed allocator (and indirectly the maru
+    runtime types it lazily uses) when not needed.
+    """
+    # First Party
+    from lmcache.v1.distributed.maru_memory_allocator import MaruMemoryAllocator
+
+    return isinstance(allocator, MaruMemoryAllocator)
+
+
 # MAIN CLASS
 class L1MemoryManager:
     """
@@ -65,6 +93,18 @@ class L1MemoryManager:
         self._allocator = create_memory_allocator(config)
         self._size_in_bytes = config.size_in_bytes
         self._align_bytes = config.align_bytes
+
+    @property
+    def allocator(self) -> MemoryAllocatorInterface:
+        """Underlying memory allocator.
+
+        Exposed primarily for callers that need allocator-specific
+        operations not in :class:`MemoryAllocatorInterface` — e.g.
+        ``L1Manager``'s maru branch reaches into
+        :class:`MaruMemoryAllocator` for ``handler`` /
+        ``get_by_location`` / ``create_store_handle``.
+        """
+        return self._allocator
 
     def allocate(
         self, layout_desc: MemoryLayoutDesc, count: int
@@ -121,6 +161,25 @@ class L1MemoryManager:
             In the future, we may want to make a "callback" based mechanism to
             trigger eviction when the memory usage reaches a watermark.
         """
+        # Maru backend: query MaruHandler stats. Eviction is owned by
+        # MaruServer so this is best-effort observability; on failure
+        # return (0, 0) rather than crash the eviction controller.
+        if _is_maru_allocator(self._allocator):
+            allocator = self._allocator
+            # Lazy backend — handler not built until register_kv_layout.
+            if not allocator.is_initialized:  # type: ignore[attr-defined]
+                return 0, 0
+            try:
+                handler = allocator.handler  # type: ignore[attr-defined]
+                stats = handler.get_stats() if hasattr(handler, "get_stats") else {}
+                used = int(stats.get("used_bytes", 0))
+                total = int(
+                    stats.get("pool_size_bytes", 0) or stats.get("pool_size", 0)
+                )
+                return used, total
+            except Exception:
+                logger.exception("Failed to query Maru handler stats")
+                return 0, 0
 
         # HACK: now trying to read this from the address manager in a ad-hoc
         # manner
@@ -152,6 +211,14 @@ class L1MemoryManager:
         Raises:
             NotImplementedError: If the allocator type does not support this operation.
         """
+        if _is_maru_allocator(self._allocator):
+            # No contiguous DRAM buffer to describe — Maru-backed L1 lives in
+            # CXL pages mmap'd via the handler. RDMA-style registration of a
+            # single base pointer does not apply.
+            raise NotImplementedError(
+                "get_l1_memory_desc is not supported for the maru backend "
+                "(L1 lives in CXL via mmap, not a single contiguous buffer)."
+            )
         if isinstance(self._allocator, MixedMemoryAllocator):
             buffer = self._allocator.buffer
         elif isinstance(self._allocator, LazyMemoryAllocator):
@@ -167,6 +234,35 @@ class L1MemoryManager:
             size=self._size_in_bytes,
             align_bytes=self._align_bytes,
         )
+
+    def register_kv_layout(
+        self,
+        shapes: list[torch.Size],
+        dtypes: list[torch.dtype],
+        fmt: MemoryFormat,
+        chunk_size_in_tokens: int,
+    ) -> None:
+        """Bind the KV layout to the underlying allocator.
+
+        Only the maru backend acts on this — its ``CxlMemoryAdapter``
+        pool is typed at first registration. The default DRAM
+        allocators (``LazyMemoryAllocator`` / ``MixedMemoryAllocator``)
+        are layout-agnostic so this call is a no-op for them.
+
+        Idempotent for matching layouts; layout mismatch on a
+        subsequent call raises ``ValueError`` (maru single-model
+        constraint).
+
+        Args:
+            shapes: KV chunk shapes (per-layer-group).
+            dtypes: KV chunk dtypes aligned with ``shapes``.
+            fmt: Memory format.
+            chunk_size_in_tokens: LMCache chunk size in tokens.
+        """
+        if _is_maru_allocator(self._allocator):
+            self._allocator.init_layout(  # type: ignore[attr-defined]
+                shapes, dtypes, fmt, chunk_size_in_tokens
+            )
 
     def close(self) -> None:
         """

@@ -5,8 +5,11 @@ Distributed multi-tier storage manager for MP mode
 
 # Standard
 from contextlib import contextmanager
-from typing import Iterator, Literal
+from typing import Iterator, Literal, Optional
 import time
+
+# Third Party
+import torch
 
 # First Party
 from lmcache.logging import init_logger
@@ -37,7 +40,7 @@ from lmcache.v1.distributed.storage_controllers.store_policy import (
     AdapterDescriptor,
     create_store_policy,
 )
-from lmcache.v1.memory_management import MemoryObj
+from lmcache.v1.memory_management import MemoryFormat, MemoryObj
 from lmcache.v1.mp_observability.event import Event, EventType
 from lmcache.v1.mp_observability.event_bus import get_event_bus
 from lmcache.v1.mp_observability.trace.decorator import (
@@ -54,6 +57,27 @@ class StorageManager:
         self._l1_manager = L1Manager(config.l1_manager_config)
         self._event_bus = get_event_bus()
 
+        # Per-cache_salt quota registry. Always present so the HTTP
+        # layer has a stable ``quota_manager`` reference; populated
+        # below for the default-backend path.
+        self._quota_manager = QuotaManager()
+
+        # Maru-backed L1 bypasses the full controller / L2 adapter
+        # stack — see ``MaruMemoryAllocator`` docstring for the
+        # design rationale. ``L2EvictionController`` / ``StoreController``
+        # / ``PrefetchController`` are not instantiated; ``L2`` adapters
+        # are not created (the pool is the L2 tier, owned by MaruServer).
+        self._is_maru: bool = (
+            config.l1_manager_config.memory_config.maru_config is not None
+        )
+        self._l2_adapters: list[L2AdapterInterface] = []
+        self._eviction_controller: Optional[L1EvictionController] = None
+        self._l2_eviction_controller: Optional[L2EvictionController] = None
+        self._store_controller: Optional[StoreController] = None
+        self._prefetch_controller: Optional[PrefetchController] = None
+        if self._is_maru:
+            return
+
         # L1 eviction controller
         self._eviction_controller = L1EvictionController(
             l1_manager=self._l1_manager,
@@ -66,7 +90,6 @@ class StorageManager:
         # ``SerdeL2AdapterWrapper`` so controllers see a plain L2 adapter
         # and serde is transparent.
         l1_memory_desc = self._l1_manager.get_l1_memory_desc()
-        self._l2_adapters: list[L2AdapterInterface] = []
         for ac in config.l2_adapter_config.adapters:
             adapter: L2AdapterInterface = create_l2_adapter(ac, l1_memory_desc)
             if ac.serde_config is not None:
@@ -76,14 +99,6 @@ class StorageManager:
                     l1_manager=self._l1_manager,
                 )
             self._l2_adapters.append(adapter)
-
-        # Per-cache_salt quota registry. Shared across the L2 eviction
-        # controller (reads quotas each cycle) and the HTTP quota
-        # endpoints (CRUD). Present even when no adapter uses
-        # IsolatedLRU so the HTTP layer has a stable ``quota_manager``
-        # reference. No explicit cleanup on close — the registry is
-        # just a dict protected by a lock and has no OS resources.
-        self._quota_manager = QuotaManager()
 
         # Unified L2 eviction controller for all adapters with eviction
         # config. Aggregate-usage policies (``LRU``, ``noop``) need
@@ -204,14 +219,22 @@ class StorageManager:
     def finish_write(
         self,
         keys: list[ObjectKey],
+        memory_objs: Optional[list[MemoryObj]] = None,
     ) -> None:
         """
         Finish writing the objects into the storage manager.
 
         Args:
             keys (list[ObjectKey]): List of object keys that have been written.
+            memory_objs: ``MemoryObj`` instances aligned with ``keys``.
+                Required when the L1 backend is maru — the caller
+                (``MPCacheEngine.store``) keeps the reserved
+                MemoryObjs alive across the GPU copy and threads them
+                here so the maru branch can issue
+                ``MaruHandler.batch_store``. Ignored by default L1
+                backends, which read state from the in-process dict.
         """
-        finish_result = self._l1_manager.finish_write(keys)
+        finish_result = self._l1_manager.finish_write(keys, memory_objs=memory_objs)
         successful_keys = [k for k, e in finish_result.items() if e == L1Error.SUCCESS]
         failed_keys = [k for k, e in finish_result.items() if e != L1Error.SUCCESS]
         self._event_bus.publish(
@@ -435,6 +458,9 @@ class StorageManager:
         remaining_keys = keys[hit_count:]
         prefetch_request_id = -1
         if remaining_keys and self._l2_adapters:
+            # In maru mode ``_l2_adapters`` is empty, so we never
+            # enter this branch and the controller stays ``None``.
+            assert self._prefetch_controller is not None
             prefetch_request_id = self._prefetch_controller.submit_prefetch_request(
                 remaining_keys,
                 layout_desc,
@@ -492,7 +518,10 @@ class StorageManager:
             # No L2 request, the prefix hit count is final
             return handle.l1_prefix_hit_count
 
-        # Have L2 request, need to check the status from prefetch controller
+        # Have L2 request, need to check the status from prefetch
+        # controller. A non-(-1) request id implies the controller
+        # was constructed (maru mode never submits requests).
+        assert self._prefetch_controller is not None
         l2_r = self._prefetch_controller.query_lookup_result(handle.prefetch_request_id)
 
         if l2_r is None:
@@ -521,6 +550,7 @@ class StorageManager:
 
         # Have L2 request, need to check the result from prefetch controller
         if handle.prefetch_request_id != -1:
+            assert self._prefetch_controller is not None
             l2_r = self._prefetch_controller.query_prefetch_result(
                 handle.prefetch_request_id
             )
@@ -596,14 +626,41 @@ class StorageManager:
         """
         self._l1_manager.clear(force=force)
 
+    def register_kv_layout(
+        self,
+        shapes: list[torch.Size],
+        dtypes: list[torch.dtype],
+        fmt: MemoryFormat,
+        chunk_size_in_tokens: int,
+    ) -> None:
+        """Bind the KV layout to the underlying allocator.
+
+        Called from ``MPCacheEngine.register_kv_cache`` once a vLLM
+        worker exposes its KV cache tensors. Only the maru backend
+        acts on the call (its ``CxlMemoryAdapter`` pool is typed at
+        first registration); default backends ignore it.
+
+        Args:
+            shapes: KV chunk shapes (per-layer-group).
+            dtypes: KV chunk dtypes aligned with ``shapes``.
+            fmt: Memory format.
+            chunk_size_in_tokens: LMCache chunk size in tokens.
+        """
+        self._l1_manager.register_kv_layout(shapes, dtypes, fmt, chunk_size_in_tokens)
+
     def close(self):
         """
         Close the storage manager and release all resources.
         """
-        self._prefetch_controller.stop()
-        self._store_controller.stop()
-        self._eviction_controller.stop()
-        self._l2_eviction_controller.stop()
+        # Maru mode leaves controllers as ``None`` (see __init__).
+        if self._prefetch_controller is not None:
+            self._prefetch_controller.stop()
+        if self._store_controller is not None:
+            self._store_controller.stop()
+        if self._eviction_controller is not None:
+            self._eviction_controller.stop()
+        if self._l2_eviction_controller is not None:
+            self._l2_eviction_controller.stop()
 
         for adapter in self._l2_adapters:
             adapter.close()
@@ -611,13 +668,30 @@ class StorageManager:
         self._l1_manager.close()
 
     def report_status(self) -> dict:
-        """Return a status dict aggregating all sub-component statuses."""
+        """Return a status dict aggregating all sub-component statuses.
+
+        In maru mode the controller / L2-adapter entries are absent;
+        only ``l1_manager`` and ``num_l2_adapters=0`` are reported.
+        """
         l1 = self._l1_manager.report_status()
+        adapters = [a.report_status() for a in self._l2_adapters]
+        if self._is_maru:
+            return {
+                "is_healthy": l1["is_healthy"],
+                "l1_manager": l1,
+                "l2_adapters": adapters,
+                "num_l2_adapters": 0,
+                "backend": "maru",
+            }
+
+        assert self._store_controller is not None
+        assert self._prefetch_controller is not None
+        assert self._eviction_controller is not None
+        assert self._l2_eviction_controller is not None
         store = self._store_controller.report_status()
         prefetch = self._prefetch_controller.report_status()
         l1_eviction = self._eviction_controller.report_status()
         l2_eviction = self._l2_eviction_controller.report_status()
-        adapters = [a.report_status() for a in self._l2_adapters]
         children = [l1, store, prefetch, l1_eviction, l2_eviction] + adapters
         return {
             "is_healthy": all(c["is_healthy"] for c in children),

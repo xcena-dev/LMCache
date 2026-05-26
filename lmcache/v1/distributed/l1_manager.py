@@ -5,8 +5,11 @@ Managing objects and memory for L1 cache
 
 # Standard
 from dataclasses import dataclass
-from typing import Literal
+from typing import Literal, Optional
 import threading
+
+# Third Party
+import torch
 
 # First Party
 from lmcache.logging import init_logger
@@ -14,9 +17,10 @@ from lmcache.native_storage_ops import TTLLock
 from lmcache.v1.distributed.api import MemoryLayoutDesc, ObjectKey
 from lmcache.v1.distributed.config import L1ManagerConfig
 from lmcache.v1.distributed.error import L1Error
-from lmcache.v1.distributed.internal_api import L1ManagerListener
-from lmcache.v1.distributed.memory_manager import L1MemoryManager
-from lmcache.v1.memory_management import MemoryObj
+from lmcache.v1.distributed.internal_api import L1ManagerListener, L1OperationResult
+from lmcache.v1.distributed.maru_l1_dispatch import MaruL1Dispatcher
+from lmcache.v1.distributed.memory_manager import L1MemoryManager, _is_maru_allocator
+from lmcache.v1.memory_management import MemoryFormat, MemoryObj
 from lmcache.v1.mp_observability.event import Event, EventType
 from lmcache.v1.mp_observability.event_bus import get_event_bus
 from lmcache.v1.mp_observability.otel_init import register_gauge
@@ -77,8 +81,6 @@ def l1_mgr_synchronized(func):
 
     return wrapper
 
-
-L1OperationResult = tuple[L1Error, MemoryObj | None]
 
 # Upper bound for the count parameter in reserve_read / finish_read
 # to prevent a single call from holding the global lock for too long.
@@ -193,6 +195,28 @@ class L1Manager:
 
         self._event_bus = get_event_bus()
 
+        # When the L1 allocator is ``MaruMemoryAllocator``, L1Manager
+        # operates in pass-through mode: the state machine / TTLLock /
+        # eviction policy are bypassed and MaruServer RPCs are issued
+        # directly via :class:`MaruL1Dispatcher`, which encapsulates
+        # the maru-specific handler reference and read-side channel.
+        self._maru_dispatcher: Optional[MaruL1Dispatcher] = None
+        if _is_maru_allocator(self._memory_manager.allocator):
+            # Lazy-import the concrete allocator class so the maru
+            # runtime stays optional for non-maru deployments.
+            # First Party
+            from lmcache.v1.distributed.maru_memory_allocator import (
+                MaruMemoryAllocator,
+            )
+
+            assert isinstance(self._memory_manager.allocator, MaruMemoryAllocator)
+            self._maru_dispatcher = MaruL1Dispatcher(
+                allocator=self._memory_manager.allocator,
+                memory_manager=self._memory_manager,
+                write_ttl_seconds=self._write_ttl_seconds,
+                read_ttl_seconds=self._read_ttl_seconds,
+            )
+
         L1Manager._gauge_target = self
         if not L1Manager._gauge_registered:
             L1Manager._gauge_registered = True
@@ -213,12 +237,55 @@ class L1Manager:
                 lambda: _l1_usage_ratio_or_zero(L1Manager._gauge_target),
             )
 
+    def _is_maru_backend(self) -> bool:
+        """True when the L1 allocator is ``MaruMemoryAllocator``.
+
+        In maru mode, L1Manager operates as a pass-through shim:
+        - The object dict / TTLLock state machine / eviction policy are
+          all skipped (the engine flow goes straight to MaruServer via
+          the dispatcher).
+        - Listeners are NOT invoked (controllers / observability paths
+          are bypassed).
+        """
+        return self._maru_dispatcher is not None
+
+    def register_kv_layout(
+        self,
+        shapes: list[torch.Size],
+        dtypes: list[torch.dtype],
+        fmt: MemoryFormat,
+        chunk_size_in_tokens: int,
+    ) -> None:
+        """Bind the KV layout to the underlying memory manager.
+
+        Forwarded from ``StorageManager.register_kv_layout``, which is
+        in turn invoked by ``MPCacheEngine.register_kv_cache`` after a
+        vLLM worker exposes its KV cache tensors. Only the maru
+        backend acts on the call; default DRAM allocators are
+        layout-agnostic so it is a no-op for them.
+
+        Args:
+            shapes: KV chunk shapes (per-layer-group).
+            dtypes: KV chunk dtypes aligned with ``shapes``.
+            fmt: Memory format.
+            chunk_size_in_tokens: LMCache chunk size in tokens.
+        """
+        self._memory_manager.register_kv_layout(
+            shapes, dtypes, fmt, chunk_size_in_tokens
+        )
+
     def register_listener(self, listener: L1ManagerListener) -> None:
         """Register a listener for L1Manager events.
 
         Args:
             listener: The listener to register.
         """
+        if self._is_maru_backend():
+            # Maru mode bypasses StoreController / PrefetchController /
+            # L1EvictionController, so listener callbacks are never
+            # invoked. Registration is silently dropped to keep the API
+            # surface stable.
+            return
         with self._lock:
             self._registered_listeners.append(listener)
 
@@ -248,6 +315,9 @@ class L1Manager:
             KEY_NOT_READABLE: The key exists but is not
                 readable.
         """
+        if self._maru_dispatcher is not None:
+            return self._maru_dispatcher.reserve_read(keys)
+
         extra_count = _validate_extra_count(extra_count)
         total = 1 + extra_count
         ret: dict[ObjectKey, L1OperationResult] = {}
@@ -302,6 +372,9 @@ class L1Manager:
             KEY_NOT_EXIST: The key does not exist.
             KEY_NOT_READABLE: The key is not readable (in this case, not read-locked).
         """
+        if self._maru_dispatcher is not None:
+            return self._maru_dispatcher.unsafe_read(keys)
+
         ret: dict[ObjectKey, L1OperationResult] = {}
 
         for key in keys:
@@ -347,6 +420,9 @@ class L1Manager:
                 non-read-locked, which means the reader may
                 read inconsistent data.
         """
+        if self._maru_dispatcher is not None:
+            return self._maru_dispatcher.finish_read(keys)
+
         extra_count = _validate_extra_count(extra_count)
         total = 1 + extra_count
         need_to_free: list[MemoryObj] = []
@@ -446,6 +522,11 @@ class L1Manager:
             KEY_NOT_WRITABLE: The key exists but is not writable.
             OUT_OF_MEMORY: Not enough memory to allocate for the object.
         """
+        if self._maru_dispatcher is not None:
+            return self._maru_dispatcher.reserve_write(
+                keys, is_temporary, layout_desc, mode
+            )
+
         need_to_allocate: list[tuple[ObjectKey, bool]] = []
         ret: dict[ObjectKey, L1OperationResult] = {}
         successful_keys: list[ObjectKey] = []
@@ -518,11 +599,18 @@ class L1Manager:
     def finish_write(
         self,
         keys: list[ObjectKey],
+        memory_objs: Optional[list[MemoryObj]] = None,
     ) -> dict[ObjectKey, L1Error]:
         """Finish write access for the given keys.
 
         Args:
             keys: The list of object keys to finish write access for.
+            memory_objs: The ``MemoryObj`` instances corresponding to
+                ``keys``. **Required in maru mode** (used to issue
+                ``MaruHandler.batch_store``); ignored in default mode
+                (the in-process dict already holds the MemoryObj).
+                Defaults to ``None`` for backward compatibility with
+                callers that only update L1 state.
 
         Returns:
             A dictionary mapping each object key to an L1Error.
@@ -532,6 +620,9 @@ class L1Manager:
             KEY_IN_WRONG_STATE: The key is not write-locked, or it's read-locked,
                 which means the writer may have caused inconsistent data.
         """
+        if self._maru_dispatcher is not None:
+            return self._maru_dispatcher.finish_write(keys, memory_objs)
+
         ret: dict[ObjectKey, L1Error] = {}
         successful_keys: list[ObjectKey] = []
 
@@ -602,6 +693,15 @@ class L1Manager:
             KEY_IN_WRONG_STATE: The key is not write-locked, or it already
                 has read locks.
         """
+        if self._maru_dispatcher is not None:
+            # Maru flow stages MemoryObjs in the side channel during
+            # ``reserve_read`` and the engine transitions straight to
+            # ``unsafe_read`` → ``finish_read``, so this atomic
+            # write-to-read transition is never exercised by the maru
+            # path. Return a safe SUCCESS response in case any caller
+            # still invokes it.
+            return self._maru_dispatcher.finish_write_and_reserve_read(keys)
+
         extra_count = _validate_extra_count(extra_count)
         total = 1 + extra_count
         ret: dict[ObjectKey, L1OperationResult] = {}
@@ -661,6 +761,9 @@ class L1Manager:
             KEY_IS_LOCKED: The key is locked (either write-locked or read-locked
                 and cannot be deleted).
         """
+        if self._maru_dispatcher is not None:
+            return self._maru_dispatcher.delete(keys)
+
         need_to_free: list[MemoryObj] = []
         ret: dict[ObjectKey, L1Error] = {}
         successful_keys: list[ObjectKey] = []
@@ -698,6 +801,10 @@ class L1Manager:
         Args:
             keys: The list of object keys to touch.
         """
+        if self._is_maru_backend():
+            # No LRU bookkeeping in maru mode — MaruServer owns eviction
+            # decisions and ``touch_keys`` has no observable effect.
+            return
         for listener in self._registered_listeners:
             listener.on_l1_keys_accessed(keys)
 
@@ -711,6 +818,10 @@ class L1Manager:
                 If False (default), only clear unlocked objects, keeping
                 write-locked and read-locked objects intact.
         """
+        if self._maru_dispatcher is not None:
+            self._maru_dispatcher.clear(force)
+            return
+
         if force:
             logger.warning(
                 "L1Manager: force-clearing all %d objects "
@@ -782,6 +893,14 @@ class L1Manager:
             True if the key exists and is not locked (neither read-locked
             nor write-locked), False otherwise.
         """
+        if self._is_maru_backend():
+            # L1EvictionController is not registered in maru mode, so
+            # this method is never consulted on the hot path. Return
+            # True to keep the contract simple for any defensive caller:
+            # MaruServer's ``pin_kv`` / ``delete_kv`` make their own
+            # atomic decisions and the LMCache-side answer has no
+            # bearing on actual eviction.
+            return True
         entry = self._objects.get(key, None)
         if entry is None:
             return False
@@ -806,9 +925,15 @@ class L1Manager:
     def close(self) -> None:
         """Close the L1Manager and free all resources."""
         with self._lock:
-            all_memory_objs = [entry.memory_obj for entry in self._objects.values()]
-            self._memory_manager.free(all_memory_objs)
-            self._objects.clear()
+            if self._maru_dispatcher is not None:
+                # No in-process state machine — just drop any pending
+                # read-side handles so the engine can shut down cleanly.
+                # CXL page lifecycle remains owned by MaruServer.
+                self._maru_dispatcher.clear(force=False)
+            else:
+                all_memory_objs = [entry.memory_obj for entry in self._objects.values()]
+                self._memory_manager.free(all_memory_objs)
+                self._objects.clear()
 
         self._memory_manager.close()
 
@@ -816,6 +941,9 @@ class L1Manager:
     @l1_mgr_synchronized
     def report_status(self) -> dict:
         """Return a status dict describing L1 cache state."""
+        if self._maru_dispatcher is not None:
+            return self._maru_dispatcher.report_status()
+
         write_locked = 0
         read_locked = 0
         temporary = 0
@@ -851,11 +979,20 @@ class L1Manager:
         Returns:
             The L1ObjectState if the object exists, None otherwise.
         """
+        if self._is_maru_backend():
+            # No in-process state machine in maru mode (no TTLLock /
+            # is_temporary / L1ObjectState).
+            return None
         return self._objects.get(key, None)
 
     @l1_mgr_synchronized
     def memcheck(self) -> bool:
         """Perform memory check for L1 cache."""
+        if self._is_maru_backend():
+            # No object dict to introspect; MaruServer + handler own
+            # consistency. Always healthy from LMCache's vantage point.
+            return True
+
         mem_check_result = self._memory_manager.memcheck()
 
         # Log the locked objects for debugging
