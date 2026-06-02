@@ -22,7 +22,7 @@ from typing import Optional, Protocol, runtime_checkable
 
 # First Party
 from lmcache.v1.distributed.api import MemoryLayoutDesc, ObjectKey
-from lmcache.v1.memory_management import MemoryObj
+from lmcache.v1.memory_management import MemoryFormat, MemoryObj
 
 
 @runtime_checkable
@@ -42,9 +42,17 @@ class L1Backend(Protocol):
     3. **Accounting / lifecycle** — it reports its own usage to the eviction
        controller (:meth:`get_memory_usage`) and tears down on :meth:`close`.
 
-    ``L1Manager`` holds at most one backend (see open question #1 in the design
-    doc about supporting more than one at once). With no backend attached, the
-    manager runs the pinned-DRAM path byte-for-byte unchanged.
+    ``L1Manager`` holds **at most one** backend — an *intentional* single-backend
+    interim (a device swap for the pinned slab), NOT a generalization to N. With
+    no backend attached, the manager runs the pinned-DRAM path byte-for-byte
+    unchanged. True multi-L1 (issue #3262 Local-L1 vs Shared-L1) is out of scope
+    here and, when it lands, must add a coordinator ABOVE ``L1Manager`` that
+    mirrors the L2 layer (``list[L1Backend]`` + index + store/lookup policies +
+    a unified eviction controller) — see the "Multi-L1" section of
+    ``docs/design/v1/distributed/l1_adapters/overall.md``. This protocol is the
+    per-backend, coexistence-safe surface (the analogue of ``L2AdapterInterface``,
+    which likewise holds none of that orchestration); it does NOT change with
+    cardinality.
 
     The objects returned here carry the right metadata and have their
     ``parent()`` set to the backend's DMA-able allocator, so the eventual GPU
@@ -56,6 +64,7 @@ class L1Backend(Protocol):
         self,
         key: ObjectKey,
         layout: MemoryLayoutDesc,
+        fmt: MemoryFormat = MemoryFormat.UNDEFINED,
     ) -> MemoryObj:
         """Mint a backend-anchored MemoryObj for a ``reserve_write``.
 
@@ -68,6 +77,8 @@ class L1Backend(Protocol):
         Args:
             key: The cache key being reserved for write.
             layout: Tensor layout (shape/dtype/format) of the chunk.
+            fmt: Memory format of the chunk (matches PR #3420's
+                ``GdsL1Backend.create_memory_obj`` signature).
 
         Returns:
             A backend-anchored MemoryObj owned by this backend's allocator.

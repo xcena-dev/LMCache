@@ -76,6 +76,17 @@ def lmcache_memcpy_async_h2d(memory_obj, gpu_buffer):
 `LazyMemoryAllocator` and `GdsScratchAllocator` each override with their existing
 transfer — byte-for-byte identical behavior, just behind the interface.
 
+> **This level is already multi-L1-safe by construction — and that is all it is.**
+> Dispatch keys off `memory_obj.parent()`, so objects from *different* L1 backends
+> can be interleaved in one transfer batch and each still routes to its own
+> medium. `gpu_ops` never decides *which* L1 — that is predetermined upstream
+> (by `reserve_write` / the retrieve loop) when the `MemoryObj` is created.
+> Making `gpu_ops` polymorphic therefore changes **extensibility / layering only,
+> not cardinality**: it removes the per-device `isinstance` edit and the
+> layering inversion (the diff imports `GdsScratchAllocator` *into* `gpu_ops`),
+> but it adds no multi-L1 capability because none was missing here. All multi-L1
+> *orchestration* lives strictly above this level (see "Multi-L1" below).
+
 ### 2. Allocation, lookup, usage — the `L1Backend` protocol
 
 A non-DRAM L1 backend also owns *where* its bytes live and *what* is resident.
@@ -135,6 +146,69 @@ The whole proposal is best read as "what GDS looks like before vs. after."
 - GDS throughput / cuFile P2P DMA behavior — identical; only its *wiring* moves
   behind the interface.
 
+## Scope: one backend now, multi-L1 later
+
+This proposal deliberately supports **0 or 1** L1 backend — a device *swap* for
+the pinned slab — reflected by the singular `backend: L1Backend | None`. That
+matches how GDS actually behaves in PR #3420: it is a **replacement** for the
+CPU-pinned L1 (one `_objects` index, a single `gds_backend` chosen *either/or*
+against `_memory_manager`), not a tier that coexists with CPU L1.
+
+The #3262 vision of **multiple L1s at once** (Local L1 = DRAM/DAX, Shared L1 =
+CXL-pool, plus GDS) is **explicitly out of scope here.** Four kinds of logic
+exist *only* when more than one L1 coexists, and none of them have — or should
+have — a home in this single-backend proposal:
+
+| Multi-L1 concern | Has no home here | 1:1 precedent already in the L2 layer |
+|---|---|---|
+| (a) write-target selection (which L1 gets a chunk?) | `reserve_write` is a binary `if backend is not None` | `StorePolicy.select_store_targets(keys, adapters)` |
+| (b) cross-L1 read lookup order | fill-on-miss probes exactly one backend | `PrefetchPolicy.select_load_plan` (lowest-index adapter that has the key) |
+| (c) promotion / demotion between L1 tiers | does not exist at any level | *(no L2 analogue — genuinely new; L2 only has vertical L2→L1 load)* |
+| (d) cross-L1 capacity accounting / eviction | `get_memory_usage` returns one scalar tuple | `L2EvictionController` over `list[L2AdapterEvictionState]` |
+
+Stating this boundary explicitly turns a silent gap into a bounded scope: the
+per-backend surface (`L1Backend` + `dma_to_gpu`/`dma_from_gpu`) is the right,
+coexistence-safe contract — it is the direct analogue of `L2AdapterInterface`,
+which likewise holds *none* of (a)–(d). What is missing for true multi-L1 is the
+orchestration **layer above** it, not anything inside the backend.
+
+## Multi-L1: lift the L2 template (forward design, not this PR)
+
+The codebase already solved "multiple coexisting backends" for L2, and the L1
+answer should **lift that template wholesale rather than reinvent it.** There is
+a structural asymmetry to repay: `StorageManager` holds a scalar `_l1_manager`
+but a `list[L2AdapterInterface]` (`storage_manager.py:55` vs `:70`). L2 places
+*every* multi-backend decision **one level above** the per-backend interface —
+exactly where multi-L1 orchestration must sit too. When genuine multi-L1 lands,
+it introduces, **above `L1Manager`** (in `StorageManager` or a new L1
+coordinator) — **never inside `L1Manager` and never inside an `L1Backend`**:
+
+1. **`backends: list[L1Backend]` with positional index identity** (mirror
+   `AdapterDescriptor`) + a `create_l1_backend` registry — replacing
+   `backend: L1Backend | None`.
+2. **An `L1StorePolicy.select_l1_target(...)`** analogous to
+   `StorePolicy.select_store_targets` — where `reserve_write` does its either/or today.
+3. **An L1 lookup-order / fill-on-miss policy** analogous to
+   `PrefetchPolicy.select_load_plan` — probe resident L1 tiers in a defined
+   precedence (fastest / lowest-index wins) and resolve overlap.
+4. **A unified L1 eviction controller** over per-tier eviction states (one
+   `EvictionPolicy` + watermark + usage per backend), mirroring
+   `L2EvictionController` + `L2AdapterEvictionState` — replacing the single
+   `get_memory_usage` tuple.
+
+The one multi-L1 concern that does **not** live in the coordinator is physical:
+the **single `tmp_gpu_buffer_` per `GPUCacheContext`** (`gpu_context.py:142-146`).
+PR #3420 cuFile-registers *every slot* of it, making the staging buffer
+GDS-private. GDS needs cuFile-registered VRAM (4 KiB-aligned, ≤16 MiB regions);
+plain DRAM/CXL need unregistered buffers — two L1s with different registration
+disciplines **cannot share one buffer**. Multi-L1 therefore forces
+`GPUCacheContext` to hold a **buffer-per-backend + allocator-per-backend** set,
+and the store/retrieve loops to pick the slot whose registration matches each
+chunk's target backend. This is a `GPUCacheContext`-level change, not a policy one.
+
+See `docs/design/v1/distributed/l2_adapters/` (`store_policy`, `prefetch_policy`,
+`l2_eviction`) for the prescribed pattern.
+
 ## Rollout
 
 - **One PR**: introduce `dma_to_gpu`/`dma_from_gpu` on the allocator interface +
@@ -148,12 +222,26 @@ The whole proposal is best read as "what GDS looks like before vs. after."
 - **Follow-up PR**: the XCENA CXL-pooled **Maru** L1 backend as the second
   `L1Backend` implementation — a genuinely separate device, so a separate PR.
 
-## Open questions (for #3262 / PR #3420)
+## Decisions & open questions (for #3262 / PR #3420)
 
-1. Can `L1Manager` hold **more than one** backend at once (local DRAM + shared
-   CXL pool), or is one-at-a-time enough for now? (#3262's "Local L1 vs Shared
-   L1" split implies eventually >1.)
-2. NIXL co-tenancy with a backend-registered VRAM region — `get_l1_memory_desc`
-   still returns the pinned-slab desc under GDS today (PR #3420 flags this).
-3. Does the backend own eviction, or does the existing L1 eviction controller
-   stay authoritative via `get_memory_usage`?
+1. **Multiple backends at once — decided: out of scope here, follow the L2
+   template later.** `backend: L1Backend | None` is an *intentional*
+   single-backend interim (a device swap), not a generalization to N. Genuine
+   multi-L1 (#3262 Local-L1 vs Shared-L1) **will** require coexisting backends,
+   and when it arrives it **must** adopt the list+index+policy+unified-controller
+   shape of the L2 layer (see "Multi-L1" above) — **not** more
+   `if backend is not None` branches inside `L1Manager`, which is the
+   non-scaling direction PR #3420 takes (binary, concrete-typed, copy-per-device).
+2. **Staging buffer under multi-L1 — recorded blocker.** Today `GPUCacheContext`
+   holds a single `tmp_gpu_buffer_`; GDS cuFile-registers every slot, making it
+   GDS-private. Multi-L1 needs a buffer-per-backend set at the `GPUCacheContext`
+   level (see "Multi-L1" above). NIXL co-tenancy with a backend-registered VRAM
+   region is the same family of problem; `get_l1_memory_desc` still returns the
+   pinned-slab desc under GDS today (PR #3420 flags this) and stays unresolved
+   until the per-backend buffer model lands.
+3. **Eviction ownership — resolved via the L2 precedent: the controller stays
+   authoritative.** As in L2 (`L2EvictionController` owns the loop; the adapter
+   only reports usage and executes `delete` actions), the `L1Backend` protocol
+   reports `get_memory_usage` and the (future, unified) L1 eviction controller
+   decides and drives eviction. The protocol surface stays free of eviction
+   policy.
