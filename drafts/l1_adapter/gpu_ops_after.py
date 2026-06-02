@@ -1,19 +1,16 @@
 # SPDX-License-Identifier: Apache-2.0
-"""Seam A draft — allocator polymorphism replacing the gpu_ops isinstance chain.
+"""Integration point 1 (the DMA) draft — allocator owns its GPU DMA.
 
-This is a REVIEW DRAFT. It is not imported anywhere.
+REVIEW DRAFT. Not imported anywhere.
 
-Goal: `lmcache/v1/gpu_connector/gpu_ops.py` should not know about any concrete
-allocator type. Today it does:
+L1 ≡ GPU-DMA-able memory (issue #3262). The single operation the core needs from
+any L1 backend is "DMA your bytes into / out of a GPU buffer". Today
+`gpu_ops.py` hard-codes that per medium with an `isinstance` chain
+(LazyMemoryAllocator today; PR #3420 adds a GdsScratchAllocator branch).
 
-    if isinstance(memory_obj.parent(), LazyMemoryAllocator):
-        ...lazy path...
-    else:
-        ...default cudaMemcpy path...
-
-and PR #3420 adds a third `isinstance(parent, GdsScratchAllocator)` branch.
-Instead, each allocator owns its own H2D/D2H transfer behind two new methods on
-`MemoryAllocatorInterface`. Existing behavior is byte-for-byte preserved.
+Make it a method the allocator owns. The default is the DRAM cudaMemcpyAsync
+path; non-DRAM L1 backends override with their native DMA. `gpu_ops` then knows
+no concrete type. Existing behavior is byte-for-byte preserved.
 """
 
 # Third Party
@@ -25,30 +22,29 @@ import lmcache.c_ops as lmc_ops
 
 
 # ---------------------------------------------------------------------------
-# 1) New polymorphic methods on MemoryAllocatorInterface
-#    (added to lmcache/v1/memory_management.py, class at line ~829)
+# 1) New methods on MemoryAllocatorInterface
+#    (lmcache/v1/memory_management.py, class at line ~829)
 # ---------------------------------------------------------------------------
-#
-# Add these two NON-abstract methods so every existing allocator inherits the
-# default DRAM behavior and only special media override them.
-#
-class _MemoryAllocatorInterface_additions:  # illustrative mixin, not real
-    def copy_to_gpu(
+class _MemoryAllocatorInterface_additions:  # illustrative, not real
+    def dma_to_gpu(
         self,
         memory_obj: "MemoryObj",
         gpu_buffer: torch.Tensor,
     ) -> None:
-        """Copy ``memory_obj`` into ``gpu_buffer`` (H2D), stream-ordered.
+        """DMA ``memory_obj``'s bytes INTO ``gpu_buffer`` (load / H2D).
 
-        Default implementation: a non-blocking ``cudaMemcpyAsync`` from the
-        object's host tensor. This is the path used by every DRAM-backed
-        allocator today. Non-DRAM media override this.
+        This is the operation that defines L1: a real DMA into VRAM with no
+        host staging. The default is a stream-ordered ``cudaMemcpyAsync`` from
+        the object's host tensor (the DRAM L1 path). A non-DRAM L1 backend
+        overrides this with its native DMA (cuFile for GDS, etc.).
+
+        Non-blocking; no stream synchronization.
 
         Args:
-            memory_obj: Source object owned by this allocator. Its
-                ``raw_tensor`` must be allocated.
+            memory_obj: Source object owned by this allocator; ``raw_tensor``
+                must be allocated.
             gpu_buffer: Destination GPU buffer; ``nbytes`` must equal
-                ``memory_obj.get_size()`` (checked by the caller).
+                ``memory_obj.get_size()`` (validated by the caller).
 
         Raises:
             ValueError: If ``memory_obj.raw_tensor`` is None.
@@ -64,15 +60,14 @@ class _MemoryAllocatorInterface_additions:  # illustrative mixin, not real
             src_tensor.view(torch.uint8)[:size], non_blocking=True
         )
 
-    def copy_from_gpu(
+    def dma_from_gpu(
         self,
         gpu_buffer: torch.Tensor,
         memory_obj: "MemoryObj",
     ) -> None:
-        """Copy ``gpu_buffer`` into ``memory_obj`` (D2H), stream-ordered.
+        """DMA ``gpu_buffer``'s bytes INTO ``memory_obj`` (evict / D2H).
 
-        Default implementation mirrors :meth:`copy_to_gpu`. Non-DRAM media
-        override this.
+        Default mirrors :meth:`dma_to_gpu`. Non-DRAM L1 backends override.
 
         Raises:
             ValueError: If ``memory_obj.raw_tensor`` is None.
@@ -90,27 +85,24 @@ class _MemoryAllocatorInterface_additions:  # illustrative mixin, not real
 
 
 # ---------------------------------------------------------------------------
-# 2) LazyMemoryAllocator override
-#    (added to lmcache/v1/lazy_memory_allocator.py)
+# 2) LazyMemoryAllocator override (lmcache/v1/lazy_memory_allocator.py)
 # ---------------------------------------------------------------------------
 class _LazyMemoryAllocator_additions:  # illustrative, not real
-    def copy_to_gpu(self, memory_obj, gpu_buffer) -> None:
-        size = memory_obj.get_size()
+    def dma_to_gpu(self, memory_obj, gpu_buffer) -> None:
         lmc_ops.lmcache_memcpy_async(
             gpu_buffer.data_ptr(),
             memory_obj.data_ptr,
-            size,
+            memory_obj.get_size(),
             lmc_ops.TransferDirection.H2D,
             memory_obj.meta.address,
             self.PIN_CHUNK_SIZE,
         )
 
-    def copy_from_gpu(self, gpu_buffer, memory_obj) -> None:
-        size = memory_obj.get_size()
+    def dma_from_gpu(self, gpu_buffer, memory_obj) -> None:
         lmc_ops.lmcache_memcpy_async(
             memory_obj.data_ptr,
             gpu_buffer.data_ptr(),
-            size,
+            memory_obj.get_size(),
             lmc_ops.TransferDirection.D2H,
             memory_obj.meta.address,
             self.PIN_CHUNK_SIZE,
@@ -118,17 +110,15 @@ class _LazyMemoryAllocator_additions:  # illustrative, not real
 
 
 # ---------------------------------------------------------------------------
-# 3) GdsScratchAllocator override (PR #3420)
-#    (the existing cufile_read_into / cufile_write_from, just renamed to the
-#     interface methods — or thin wrappers calling them)
+# 3) GdsScratchAllocator override (PR #3420) — the cuFile P2P DMA
 # ---------------------------------------------------------------------------
 class _GdsScratchAllocator_additions:  # illustrative, not real
-    def copy_to_gpu(self, memory_obj, gpu_buffer) -> None:
-        # NVMe -> registered VRAM via cuFile DMA.
+    def dma_to_gpu(self, memory_obj, gpu_buffer) -> None:
+        # NVMe -> registered VRAM via cuFile P2P DMA (no host staging).
         self.cufile_read_into(memory_obj, gpu_buffer)
 
-    def copy_from_gpu(self, gpu_buffer, memory_obj) -> None:
-        # registered VRAM -> NVMe via cuFile DMA.
+    def dma_from_gpu(self, gpu_buffer, memory_obj) -> None:
+        # registered VRAM -> NVMe via cuFile P2P DMA.
         self.cufile_write_from(memory_obj, gpu_buffer)
 
 
@@ -139,27 +129,25 @@ def lmcache_memcpy_async_h2d(
     memory_obj: MemoryObj,
     gpu_buffer: torch.Tensor,
 ) -> None:
-    """Copy a MemoryObj to a GPU buffer, dispatching on its owning allocator.
+    """DMA a MemoryObj into a GPU buffer; the owning allocator picks the DMA.
 
-    Non-blocking; no stream synchronization. The actual transfer mechanism
-    (cudaMemcpyAsync, lazy-pin, cuFile DMA, ...) is chosen polymorphically by
-    the object's parent allocator.
+    Non-blocking; no stream synchronization.
     """
     _check_size(memory_obj, gpu_buffer)
-    memory_obj.parent().copy_to_gpu(memory_obj, gpu_buffer)
+    memory_obj.parent().dma_to_gpu(memory_obj, gpu_buffer)
 
 
 def lmcache_memcpy_async_d2h(
     gpu_buffer: torch.Tensor,
     memory_obj: MemoryObj,
 ) -> None:
-    """Copy a GPU buffer into a MemoryObj, dispatching on its owning allocator."""
+    """DMA a GPU buffer into a MemoryObj; the owning allocator picks the DMA."""
     _check_size(memory_obj, gpu_buffer)
-    memory_obj.parent().copy_from_gpu(gpu_buffer, memory_obj)
+    memory_obj.parent().dma_from_gpu(gpu_buffer, memory_obj)
 
 
 def _check_size(memory_obj: MemoryObj, gpu_buffer: torch.Tensor) -> None:
-    """Validate that the GPU buffer matches the MemoryObj payload size.
+    """Validate the GPU buffer matches the MemoryObj payload size.
 
     Raises:
         ValueError: On a size mismatch.
