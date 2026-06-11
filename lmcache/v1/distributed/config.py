@@ -6,7 +6,7 @@ Configuration for distributed storage manager
 
 # Standard
 from dataclasses import dataclass, field
-from typing import Literal
+from typing import Literal, Optional
 import argparse
 
 # First Party
@@ -35,8 +35,21 @@ class L1MemoryManagerConfig:
     align_bytes: int = field(default=0x1000)
     """ The alignment size in bytes. Default is 4KB. """
 
+    dax_path: Optional[str] = field(default=None)
+    """ Path to a Device-DAX device (e.g. /dev/dax9.0) to back the L1 pinned
+    pool instead of cudaHostAlloc'd host DRAM. When set, the L1 buffer is
+    mmap'd from the DAX device and registered via cudaHostRegister, so
+    cudaMemcpyAsync(H<->D) DMAs PCIe-direct between the GPU and the DAX
+    region (e.g. a CXL.mem interleaved region) with no host DRAM staging.
+    Mutually exclusive with the shm_name extra-config knob. """
+
     def __post_init__(self):
         self.init_size_in_bytes = min(self.init_size_in_bytes, self.size_in_bytes)
+        # 2nd iteration: Lazy + DAX path IS now supported — LazyMemoryAllocator
+        # takes optional dax_path and mmap's the dax device, chunk-level
+        # cudaHostRegister via background thread (same as DRAM lazy).
+        # No double-pinning since lazy uses chunk-level register, not the
+        # whole-region register that the eager DAX path uses.
 
 
 @dataclass
@@ -150,6 +163,16 @@ def add_storage_manager_args(
         type=int,
         default=4096,
         help="The alignment size in bytes. Default is 4KB (4096 bytes).",
+    )
+    memory_group.add_argument(
+        "--l1-dax-path",
+        type=str,
+        default=None,
+        help="Back the L1 pool with a Device-DAX device (e.g. /dev/dax9.0) "
+        "instead of cudaHostAlloc'd host DRAM. The region is mmap'd and "
+        "cudaHostRegister'd so H<->D copies DMA PCIe-direct against the "
+        "DAX-backed memory (e.g. an interleaved CXL.mem region), avoiding "
+        "DRAM-channel contention with vLLM. Default is None (DRAM L1).",
     )
 
     # L1 Manager Config (TTL settings)
@@ -279,6 +302,7 @@ def parse_args_to_config(
         use_lazy=args.l1_use_lazy,
         init_size_in_bytes=int(args.l1_init_size_gb * (1 << 30)),
         align_bytes=args.l1_align_bytes,
+        dax_path=args.l1_dax_path,
     )
 
     l1_manager_config = L1ManagerConfig(

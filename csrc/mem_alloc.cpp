@@ -162,3 +162,54 @@ void free_shm_pinned_ptr(uintptr_t ptr, size_t size,
   }
   shm_unlink(shm_name.c_str());
 }
+
+// Map a Device-DAX region as the L1 pinned pool. The DAX device is mmap'd
+// MAP_SHARED so the mapping aliases the underlying byte-addressable memory
+// (e.g. a 2-way interleaved CXL.mem region), then cudaHostRegister is called
+// over the whole range so subsequent cudaMemcpyAsync(H<->D) issues PCIe DMA
+// directly between the GPU and the DAX-backed pages — avoiding a host DRAM
+// staging hop and the DDR-channel contention that staging would cause when
+// vLLM is concurrently using the same NUMA's DRAM.
+//
+// Pre-faulted by the dax driver, so no first_touch loop is required.
+// Caller must pick a size that is page-size aligned for the device (devdax
+// typically uses 2 MiB alignment).
+uintptr_t alloc_dax_pinned_ptr(size_t size, const std::string& dax_path) {
+  int fd = open(dax_path.c_str(), O_RDWR);
+  if (fd < 0) {
+    throw std::runtime_error(std::string("open(") + dax_path +
+                             ") failed: " + strerror(errno));
+  }
+
+  void* ptr = mmap(nullptr, size, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
+  int mmap_errno = errno;
+  close(fd);  // mapping survives close(2)
+  if (ptr == MAP_FAILED) {
+    throw std::runtime_error(std::string("mmap(") + dax_path +
+                             ") failed: " + strerror(mmap_errno));
+  }
+
+  cudaError_t st = cudaHostRegister(ptr, size, 0);
+  if (st != cudaSuccess) {
+    munmap(ptr, size);
+    throw std::runtime_error(std::string("cudaHostRegister on DAX (") +
+                             dax_path +
+                             ") failed: " + cudaGetErrorString(st));
+  }
+
+  return reinterpret_cast<uintptr_t>(ptr);
+}
+
+void free_dax_pinned_ptr(uintptr_t ptr, size_t size) {
+  void* p = reinterpret_cast<void*>(ptr);
+  cudaError_t st = cudaHostUnregister(p);
+  if (st != cudaSuccess) {
+    munmap(p, size);
+    throw std::runtime_error(std::string("cudaHostUnregister on DAX failed: ") +
+                             cudaGetErrorString(st));
+  }
+  if (munmap(p, size) != 0) {
+    throw std::runtime_error(std::string("munmap on DAX failed: ") +
+                             strerror(errno));
+  }
+}

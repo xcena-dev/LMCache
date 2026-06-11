@@ -30,24 +30,30 @@ def create_memory_allocator(config: L1MemoryManagerConfig) -> MemoryAllocatorInt
     if config.use_lazy:
         logger.debug(
             "use lazy memory allocator, init size is %d bytes, "
-            "final size is %d bytes, align bytes is %d bytes",
+            "final size is %d bytes, align bytes is %d bytes, dax_path=%s",
             config.init_size_in_bytes,
             config.size_in_bytes,
             config.align_bytes,
+            config.dax_path,
         )
         return LazyMemoryAllocator(
-            config.init_size_in_bytes, config.size_in_bytes, config.align_bytes
+            config.init_size_in_bytes,
+            config.size_in_bytes,
+            config.align_bytes,
+            dax_path=config.dax_path,
         )
     else:
         logger.debug(
             "use mixed memory allocator, total size is %d bytes, "
-            "align bytes is %d bytes",
+            "align bytes is %d bytes, dax_path=%s",
             config.size_in_bytes,
             config.align_bytes,
+            config.dax_path,
         )
         return MixedMemoryAllocator(
             config.size_in_bytes,
             align_bytes=config.align_bytes,
+            dax_path=config.dax_path,
         )
 
 

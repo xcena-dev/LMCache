@@ -375,6 +375,7 @@ class MemoryObj(metaclass=abc.ABCMeta):
 def _resolve_pinned_alloc_free(
     numa_mapping: Optional[NUMAMapping] = None,
     shm_name: Optional[str] = None,
+    dax_path: Optional[str] = None,
     size: Optional[int] = None,
 ) -> Tuple[
     tuple,  # (alloc_fn, *alloc_args)
@@ -382,11 +383,20 @@ def _resolve_pinned_alloc_free(
 ]:
     """Resolve the alloc/free function pair based on memory type.
 
+    Exactly one of ``shm_name``, ``numa_mapping``, ``dax_path`` may be
+    provided; otherwise the default ``cudaHostAlloc`` path is used. The
+    caller is responsible for enforcing mutual exclusion.
+
     Returns:
         A tuple of (alloc_info, free_info) where:
         - alloc_info: (alloc_fn, *args) to call as alloc_fn(size, *args)
         - free_info: (free_fn, *args) to call as free_fn(ptr, *args)
     """
+    if dax_path:
+        return (
+            (lmc_ops.alloc_dax_pinned_ptr, dax_path),
+            (lmc_ops.free_dax_pinned_ptr, size),
+        )
     if shm_name:
         return (
             (lmc_ops.alloc_shm_pinned_ptr, shm_name),
@@ -417,6 +427,7 @@ def _allocate_cpu_memory(
     size: int,
     numa_mapping: Optional[NUMAMapping] = None,
     shm_name: Optional[str] = None,
+    dax_path: Optional[str] = None,
 ) -> torch.Tensor:
     if size == 0:
         return torch.empty(0, dtype=torch.uint8)
@@ -424,6 +435,7 @@ def _allocate_cpu_memory(
     alloc_info, _ = _resolve_pinned_alloc_free(
         numa_mapping,
         shm_name,
+        dax_path,
     )
     alloc_fn, *alloc_args = alloc_info
     ptr = alloc_fn(size, *alloc_args)
@@ -440,6 +452,7 @@ def _free_cpu_memory(
     size: int | None = None,
     numa_mapping: Optional[NUMAMapping] = None,
     shm_name: Optional[str] = None,
+    dax_path: Optional[str] = None,
 ) -> None:
     if torch_dev.is_available():
         torch_dev.synchronize()
@@ -447,6 +460,7 @@ def _free_cpu_memory(
     _, free_info = _resolve_pinned_alloc_free(
         numa_mapping,
         shm_name,
+        dax_path,
         size=size,
     )
     free_fn, *free_args = free_info
@@ -2081,9 +2095,17 @@ class MixedMemoryAllocator(MemoryAllocatorInterface):
         else:
             self.shm_name = kwargs.get("shm_name", None)
 
+        self.dax_path: Optional[str] = kwargs.get("dax_path", None)
+        if self.dax_path and (self.shm_name or self.numa_mapping):
+            raise ValueError(
+                "dax_path is mutually exclusive with shm_name and numa_mapping"
+            )
+
         self.size = size
 
-        self.buffer = _allocate_cpu_memory(size, self.numa_mapping, self.shm_name)
+        self.buffer = _allocate_cpu_memory(
+            size, self.numa_mapping, self.shm_name, self.dax_path
+        )
 
         self._unregistered = False
 
@@ -2218,6 +2240,7 @@ class MixedMemoryAllocator(MemoryAllocatorInterface):
                 self.size,
                 self.numa_mapping,
                 self.shm_name,
+                self.dax_path,
             )
             self._unregistered = True
 

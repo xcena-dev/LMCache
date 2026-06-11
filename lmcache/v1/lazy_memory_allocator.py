@@ -76,12 +76,16 @@ class LazyMemoryAllocator(MemoryAllocatorInterface):
         final_size: int,
         align_bytes: int = AddressManager.ALIGN_BYTES,
         numa_mapping: NUMAMapping | None = None,
+        dax_path: Optional[str] = None,
     ):
         """
         Args:
             init_size (int): Initial size of the memory allocation in bytes.
             final_size (int): Final size of the memory allocation in bytes.
             align_bytes (int, optional): Alignment in for the underlying allocations
+            dax_path (str, optional): If set, back the buffer with mmap on this dax
+                device. CXL lazy mode — chunk-level cudaHostRegister via background
+                thread, same as DRAM lazy but on dax-backed memory.
         """
         # Whether using NUMA allocation
         self._use_numa = numa_mapping is not None
@@ -91,6 +95,10 @@ class LazyMemoryAllocator(MemoryAllocatorInterface):
         self._final_size = align_to(final_size, self.PIN_CHUNK_SIZE)
         # Underlying buffer for the memory allocation
         self._buffer: torch.Tensor
+        # dax-backed lazy mode (CXL devdax)
+        self._dax_path: Optional[str] = dax_path
+        self._dax_fd: Optional[int] = None
+        self._dax_mm = None
         # Not all backends support cudart() for host memory pinning (CUDA-specific)
         if not hasattr(torch_dev, "cudart"):
             raise RuntimeError(
@@ -106,7 +114,26 @@ class LazyMemoryAllocator(MemoryAllocatorInterface):
         self._pin_record: list[tuple[int, int]] = []
 
         # Detect numa mapping
-        if numa_mapping is not None:
+        if dax_path is not None:
+            import os
+            import mmap as _mmap
+            logger.info(
+                "LazyMemoryAllocator: backing buffer with CXL devdax %s (%d MB)",
+                dax_path,
+                self._final_size >> 20,
+            )
+            self._dax_fd = os.open(dax_path, os.O_RDWR)
+            # MAP_SHARED | MAP_POPULATE — dax PFN mapping (no zero-fill, no alloc)
+            self._dax_mm = _mmap.mmap(
+                self._dax_fd,
+                self._final_size,
+                _mmap.MAP_SHARED | _mmap.MAP_POPULATE,
+                _mmap.PROT_READ | _mmap.PROT_WRITE,
+            )
+            arr_type = ctypes.c_uint8 * self._final_size
+            buf = arr_type.from_buffer(self._dax_mm)
+            self._buffer = torch.frombuffer(buf, dtype=torch.uint8)
+        elif numa_mapping is not None:
             numa_id = get_numa_id(numa_mapping)
             ptr = lmc_ops.alloc_numa_ptr(self._final_size, numa_id)
             arr_type = ctypes.c_uint8 * self._final_size
@@ -207,6 +234,23 @@ class LazyMemoryAllocator(MemoryAllocatorInterface):
         # Free the underlying buffer if using NUMA allocation
         if self._use_numa:
             lmc_ops.free_numa_ptr(self._buffer.data_ptr(), self._final_size)
+
+        # Cleanup dax mmap (CXL lazy mode)
+        if self._dax_mm is not None:
+            # Drop tensor ref before closing mmap (avoid BufferError)
+            self._buffer = torch.empty(0, dtype=torch.uint8)
+            try:
+                self._dax_mm.close()
+            except Exception:
+                pass
+            self._dax_mm = None
+        if self._dax_fd is not None:
+            import os as _os
+            try:
+                _os.close(self._dax_fd)
+            except Exception:
+                pass
+            self._dax_fd = None
 
     def memcheck(self) -> bool:
         return self._allocator.memcheck()

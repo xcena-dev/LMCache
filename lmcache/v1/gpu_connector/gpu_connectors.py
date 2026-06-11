@@ -398,6 +398,7 @@ class VLLMPagedMemGPUConnectorV2(GPUConnectorInterface):
             memory_obj.metadata.fmt = MemoryFormat.KV_MLA_FMT
 
     # TODO(Jiayi): need to optimize to enable real batching
+    @_lmcache_nvtx_annotate  # nsys: bulk L1->L0 load (CPU/CXL -> GPU H2D DMA)
     def batched_to_gpu(self, memory_objs, starts, ends, **kwargs):
         with torch.cuda.stream(self.load_stream):
             for memory_obj, start, end in zip(memory_objs, starts, ends, strict=False):
@@ -405,6 +406,7 @@ class VLLMPagedMemGPUConnectorV2(GPUConnectorInterface):
         self.load_stream.synchronize()
 
     # TODO(Jiayi): need to optimize to enable real batching
+    @_lmcache_nvtx_annotate  # nsys: bulk L0->L1 store (GPU -> CPU/CXL D2H DMA)
     def batched_from_gpu(self, memory_objs, starts, ends, **kwargs):
         for memory_obj, start, end in zip(memory_objs, starts, ends, strict=False):
             self.from_gpu(memory_obj, start, end, **kwargs)
@@ -622,12 +624,14 @@ class VLLMPagedMemGPUConnectorV3(GPUConnectorInterface):
         if self.use_mla:
             memory_obj.metadata.fmt = MemoryFormat.KV_MLA_FMT
 
+    @_lmcache_nvtx_annotate  # nsys: bulk L1->L0 load (CPU/CXL -> GPU H2D DMA)
     def batched_to_gpu(self, memory_objs, starts, ends, **kwargs):
         with torch.cuda.stream(self.load_stream):
             for memory_obj, start, end in zip(memory_objs, starts, ends, strict=False):
                 self.to_gpu(memory_obj, start, end, **kwargs)
         self.load_stream.synchronize()
 
+    @_lmcache_nvtx_annotate  # nsys: bulk L0->L1 store (GPU -> CPU/CXL D2H DMA)
     def batched_from_gpu(self, memory_objs, starts, ends, **kwargs):
         for memory_obj, start, end in zip(memory_objs, starts, ends, strict=False):
             self.from_gpu(memory_obj, start, end, **kwargs)
