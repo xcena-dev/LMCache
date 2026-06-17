@@ -46,7 +46,7 @@ Welcome to LMCache!
 For more information, check out the following:
 
 * `LMCache blogs <https://lmcache.github.io>`_
-* `Join LMCache slack workspace <https://join.slack.com/t/lmcacheworkspace/shared_invite/zt-3eck2v8ub-j2hPn0AdzcfyykatTBXSTg>`_
+* `Join LMCache slack workspace <https://join.slack.com/t/lmcacheworkspace/shared_invite/zt-3zxjao8h0-lRfBfnLqbALOtLsWn2ITxA>`_
 * Our papers:
 
   * `CacheGen: KV Cache Compression and Streaming for Fast Large Language Model Serving <https://dl.acm.org/doi/10.1145/3651890.3672274>`_
@@ -62,154 +62,84 @@ Documentation
 
 .. toctree::
    :maxdepth: 2
-   :caption: Welcome to LMCache
 
-   self
-
-.. toctree::
-   :maxdepth: 2
-   :caption: Getting Started
-
-   getting_started/installation
-   getting_started/quickstart
-   getting_started/quickstart/index
-   getting_started/benchmarking
-   getting_started/kv_cache_calculator
-   getting_started/cli
-   getting_started/troubleshoot
-   getting_started/faq
-   getting_started/quickstart/standalone_starter
-   
+   getting_started/index
 
 :raw-html:`<br />`
 
 .. toctree::
-   :maxdepth: 2
-   :caption: Recipes
+   :maxdepth: 3
+
+   interacting_with_server
+
+:raw-html:`<br />`
+
+.. toctree::
+   :maxdepth: 3
 
    recipes/index
 
 :raw-html:`<br />`
 
 .. toctree::
-   :maxdepth: 2
-   :caption: KV Cache offloading and sharing
+   :maxdepth: 4
 
-   kv_cache/storage_backends/index
-   kv_cache/async_loading
-   kv_cache/caching_policies
-   kv_cache/p2p_sharing
+   mp/l2_storage/index
 
 :raw-html:`<br />`
 
 .. toctree::
    :maxdepth: 2
-   :caption: Non-KV caching
 
-   non_kv_cache/encoder_cache
-
-:raw-html:`<br />`
-
-.. toctree::
-   :maxdepth: 3
-   :caption: Multiprocess Mode
-
-   mp/index
+   distributed_kv_cache
 
 :raw-html:`<br />`
 
 .. toctree::
    :maxdepth: 2
-   :caption: Disaggregated prefill
 
-   disaggregated_prefill/nixl/index
-   disaggregated_prefill/shared_storage
+   production/index
 
 :raw-html:`<br />`
 
 .. toctree::
    :maxdepth: 2
-   :caption: KV Cache management
 
-   kv_cache_management/index
-
-:raw-html:`<br />`
-
-.. toctree::
-   :maxdepth: 2
-   :caption: KV Cache Optimizations
-
-   kv_cache_optimizations/compression/index
-   kv_cache_optimizations/blending
-   kv_cache_optimizations/layerwise
+   mp/observability/index
 
 :raw-html:`<br />`
 
 .. toctree::
    :maxdepth: 2
-   :caption: Use LMCache in production
 
-   production/docker_deployment
-   production/kubernetes_deployment
-   production/kv_cache_events
-   production/observability/index
-   production/performance_tuning
+   community/index
 
 :raw-html:`<br />`
 
 .. toctree::
    :maxdepth: 2
-   :caption: CLI
 
-   cli/index
-
-:raw-html:`<br />`
-
-.. toctree::
-   :maxdepth: 2
-   :caption: Internal API Server
-
-   internal_api_server/internal_api_server
+   kv_cache_optimizations/index
 
 :raw-html:`<br />`
 
 .. toctree::
    :maxdepth: 2
-   :caption: Controller WebUI
-   
-   controller/index
 
-:raw-html:`<br />`
-
-.. toctree::
-   :caption: Developer Guide
-
-   developer_guide/contributing
-   developer_guide/docker_file
-   developer_guide/architecture
-   developer_guide/integration
-   developer_guide/extending_lmcache/index
-   developer_guide/cli
-   developer_guide/usage/index
+   developer_guide/index
 
 :raw-html:`<br />`
 
 .. toctree::
    :maxdepth: 2
-   :caption: API Reference
 
-   api_reference/configurations
-   api_reference/storage_backends
-   api_reference/dynamic_connector
-   api_reference/multimodality
-   
+   non_kv_cache/index
+
 :raw-html:`<br />`
 
 .. toctree::
    :maxdepth: 2
-   :caption: Community
 
-   community/meetings
-   community/blogs
+   legacy/index
 
 :raw-html:`<br />`

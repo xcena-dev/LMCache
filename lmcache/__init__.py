@@ -4,6 +4,7 @@
 from typing import Any
 import importlib
 import sys
+import types
 
 # First Party
 from lmcache.logging import init_logger
@@ -30,10 +31,8 @@ def _detect_device() -> tuple[Any, str]:
 
     Returns:
         tuple[Any, str]: A tuple of (torch_device_module, device_type_string),
-            e.g. ``(torch.cuda, "cuda")`` or ``(torch.xpu, "xpu")``.
-
-    Raises:
-        RuntimeError: If no supported accelerator is found (checked CUDA, XPU, HPU).
+            e.g. ``(torch.cuda, "cuda")``, ``(torch.musa, "musa")``, or
+            ``(torch.xpu, "xpu")``.
     """
     try:
         # Third Party
@@ -41,17 +40,26 @@ def _detect_device() -> tuple[Any, str]:
     except ImportError:
         return None, "cpu"  # fallback，CLI-only
 
-    if hasattr(torch, "xpu") and torch.xpu.is_available():
+    if hasattr(torch, "musa") and torch.musa.is_available():  # type: ignore[attr-defined]
+        logger.info("MUSA device is available. Using MUSA for LMCache engine.")
+        return torch.musa, "musa"  # type: ignore[attr-defined]
+    elif hasattr(torch, "xpu") and torch.xpu.is_available():
         return torch.xpu, "xpu"
     elif hasattr(torch, "hpu") and torch.hpu.is_available():
         return torch.hpu, "hpu"
-    else:
-        # Fallback: always return torch.cuda for backward compatibility
-        # with existing tests and code paths that assume CUDA is the default.
+    elif torch.cuda.is_available():
         return torch.cuda, "cuda"
+    else:
+        # First Party
+        from lmcache.v1.platform.cpu.stub_cpu_device import StubCPUDevice
+
+        # Fallback: always return torch, cpu as stub
+        return StubCPUDevice("cpu"), "cpu"
 
 
 torch_dev, torch_device_type = _detect_device()
+
+logger.info(" torch_dev=%s, torch_device_type=%s", torch_dev, torch_device_type)
 
 
 # --------------------------
@@ -61,10 +69,16 @@ def _get_backend() -> Any:
     """
     Try backends in order, first successful import wins.
     """
+    default_module = importlib.import_module("lmcache.python_ops_fallback")
     # Third Party
     import torch
 
     backend_candidates = [
+        (
+            "lmcache.xpu_ops",
+            "xpu_ops",
+            lambda: torch.xpu.is_available(),
+        ),
         (
             "lmcache.c_ops",
             "cuda_ops",
@@ -73,8 +87,6 @@ def _get_backend() -> Any:
         # should extend to more HWs..
     ]
 
-    imported = False
-    module = None
     for module_name, backend_name, predicate in backend_candidates:
         # 1 Check whether the backend is available before importing
         try:
@@ -93,21 +105,16 @@ def _get_backend() -> Any:
             continue
         # 2 Run availability check for the backend
         try:
-            module = importlib.import_module(module_name)
+            backend_module = importlib.import_module(module_name)
+            merged_module = types.ModuleType("lmcache.c_ops")
+            merged_module.__dict__.update(default_module.__dict__)
+            merged_module.__dict__.update(backend_module.__dict__)
             logger.info("Using backend: %s", module_name)
-            imported = True
-            break
+            return merged_module
         except Exception as e:
             logger.warning("Failed to import backend %s: %s", module_name, e)
 
-    if not imported:
-        try:
-            logger.warning("Fallback to python backend lmcache.non_cuda_equivalents")
-            module = importlib.import_module("lmcache.non_cuda_equivalents")
-            logger.info("Using backend: lmcache.non_cuda_equivalents")
-        except ImportError as e:
-            raise ImportError("No backend could be imported for lmcache.") from e
-    return module
+    return default_module
 
 
 # --------------------------
@@ -115,6 +122,10 @@ def _get_backend() -> Any:
 # --------------------------
 try:
     _ops = _get_backend()
+    # override lmcache.c_ops with merged module,
+    # in which:
+    #     python_ops_fallback as base,
+    #     use backend implementation if exists
     sys.modules["lmcache.c_ops"] = _ops
 except (ImportError, ModuleNotFoundError):
     logger.debug("No compute backend loaded; CLI-only mode (torch/numba not installed)")

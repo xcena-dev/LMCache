@@ -33,6 +33,7 @@ import numpy as np
 from lmcache.logging import init_logger
 from lmcache.native_storage_ops import Bitmap
 from lmcache.v1.distributed.api import ObjectKey
+from lmcache.v1.distributed.internal_api import L2StoreResult
 from lmcache.v1.distributed.l2_adapters.base import (
     L2AdapterInterface,
     L2TaskId,
@@ -311,7 +312,7 @@ class MaruL2Adapter(L2AdapterInterface):
         # Task bookkeeping — shape matches the DAX adapter so the store
         # / prefetch controllers see a familiar surface.
         self._next_task_id: L2TaskId = 0
-        self._completed_store_tasks: dict[L2TaskId, bool] = {}
+        self._completed_store_tasks: dict[L2TaskId, L2StoreResult] = {}
         self._completed_lookup_tasks: dict[L2TaskId, Bitmap] = {}
         self._completed_load_tasks: dict[L2TaskId, Bitmap] = {}
         self._inflight_store_tasks = 0
@@ -537,14 +538,16 @@ class MaruL2Adapter(L2AdapterInterface):
             success = False
 
         with self._lock:
-            self._completed_store_tasks[task_id] = success
+            self._completed_store_tasks[task_id] = L2StoreResult(
+                success, sum(stored_sizes) if success else 0
+            )
             self._inflight_store_tasks -= 1
 
         if success and stored_sizes:
             self._notify_keys_stored(keys, stored_sizes)
         self._signal_eventfd(self._store_efd)
 
-    def pop_completed_store_tasks(self) -> dict[L2TaskId, bool]:
+    def pop_completed_store_tasks(self) -> dict[L2TaskId, L2StoreResult]:
         """Hand the controller every completed store task at once."""
         with self._lock:
             out = self._completed_store_tasks

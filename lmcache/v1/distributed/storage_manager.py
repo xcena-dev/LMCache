@@ -13,16 +13,23 @@ import torch
 
 # First Party
 from lmcache.logging import init_logger
+from lmcache.native_storage_ops import Bitmap, PeriodicEventNotifier
 from lmcache.v1.distributed.api import (
     MemoryLayoutDesc,
     ObjectKey,
     PrefetchHandle,
+    TrimPolicy,
 )
 from lmcache.v1.distributed.config import StorageManagerConfig
 from lmcache.v1.distributed.error import L1Error, strerror
+from lmcache.v1.distributed.internal_api import L2AdapterListener
 from lmcache.v1.distributed.l1_manager import L1Manager
 from lmcache.v1.distributed.l2_adapters import create_l2_adapter
 from lmcache.v1.distributed.l2_adapters.base import L2AdapterInterface
+from lmcache.v1.distributed.l2_adapters.reconfiguration import (
+    L2ReconfigurableAdapter,
+    L2ReconfigureError,
+)
 from lmcache.v1.distributed.l2_adapters.serde_wrapper import SerdeL2AdapterWrapper
 from lmcache.v1.distributed.quota_manager import QuotaManager
 from lmcache.v1.distributed.serde import create_serde_processor
@@ -43,11 +50,13 @@ from lmcache.v1.distributed.storage_controllers.store_policy import (
 from lmcache.v1.memory_management import MemoryFormat, MemoryObj
 from lmcache.v1.mp_observability.event import Event, EventType
 from lmcache.v1.mp_observability.event_bus import get_event_bus
+from lmcache.v1.mp_observability.otel_init import register_gauge
 from lmcache.v1.mp_observability.trace.decorator import (
     enable_tracing,
     is_tracing_enabled,
     publish_call_event,
 )
+from lmcache.v1.platform import HAS_EVENTFD
 
 logger = init_logger(__name__)
 
@@ -100,6 +109,14 @@ class StorageManager:
                 )
             self._l2_adapters.append(adapter)
 
+        PeriodicEventNotifier.create(
+            interval_ms=config.periodic_notifier_interval_ms,
+            use_eventfd=HAS_EVENTFD,
+        )
+
+        # NOTE: ``self._quota_manager`` is initialized earlier (before the maru
+        # early-return) so the HTTP layer always has a stable reference; do not
+        # re-create it here.
         # Unified L2 eviction controller for all adapters with eviction
         # config. Aggregate-usage policies (``LRU``, ``noop``) need
         # ``max_capacity_bytes > 0`` to compute a usage fraction;
@@ -134,7 +151,7 @@ class StorageManager:
         )
         self._l2_eviction_controller.start()
 
-        adapter_descriptors = [
+        self._adapter_descriptors = [
             AdapterDescriptor(index=i, config=ac)
             for i, ac in enumerate(config.l2_adapter_config.adapters)
         ]
@@ -142,7 +159,7 @@ class StorageManager:
         self._store_controller = StoreController(
             l1_manager=self._l1_manager,
             l2_adapters=self._l2_adapters,
-            adapter_descriptors=adapter_descriptors,
+            adapter_descriptors=self._adapter_descriptors,
             policy=create_store_policy(config.store_policy),
         )
         self._store_controller.start()
@@ -151,11 +168,23 @@ class StorageManager:
         self._prefetch_controller = PrefetchController(
             l1_manager=self._l1_manager,
             l2_adapters=self._l2_adapters,
-            adapter_descriptors=adapter_descriptors,
+            adapter_descriptors=self._adapter_descriptors,
             policy=create_prefetch_policy(config.prefetch_policy),
             max_in_flight=config.prefetch_max_in_flight,
         )
         self._prefetch_controller.start()
+
+        # L2 usage gauge — one observation per adapter, tagged by
+        # ``l2_name``.  Parallel to L1Manager's ``l1_memory_usage_bytes``.
+        register_gauge(
+            "lmcache.l2",
+            "lmcache_mp.l2_usage_bytes",
+            (
+                "Bytes currently held in each L2 adapter, tagged by "
+                "``l2_name`` (one observation per adapter)."
+            ),
+            self.get_l2_usages,
+        )
 
     # External APIs for serving engine integration code to call
     @enable_tracing()
@@ -401,6 +430,7 @@ class StorageManager:
         layout_desc: MemoryLayoutDesc,
         extra_count: int = 0,
         external_request_id: str = "",
+        policy: TrimPolicy = TrimPolicy.PREFIX,
     ) -> PrefetchHandle:
         """Prefetch objects into L1 asynchronously.
 
@@ -412,6 +442,9 @@ class StorageManager:
                 key.  Total locks = 1 + extra_count.
             external_request_id: Request ID from the caller
                 for end-to-end log tracing.
+            policy: Which retained-subset policy to apply (see
+                :class:`TrimPolicy`).  ``PREFIX`` keeps the contiguous prefix;
+                ``SPARSE`` keeps every found key (gap-tolerant).
 
         Returns:
             PrefetchHandle to track the task.
@@ -420,6 +453,56 @@ class StorageManager:
         # objects are already in L1, and adding read locks to them.
 
         l1_read_result = self._l1_manager.reserve_read(keys, extra_count=extra_count)
+
+        if policy is TrimPolicy.SPARSE:
+            # SPARSE: retain a read lock on every L1 hit (not just the leading
+            # prefix) and send all L1 misses to L2 as one coalesced request.
+            # reserve_read locks only SUCCESS keys, so the found-set already
+            # equals the locked set -- nothing to release.
+            l1_found_indices: list[int] = []
+            succeeded_keys: list[ObjectKey] = []
+            sparse_l2_indices: list[int] = []
+            remaining_keys: list[ObjectKey] = []
+            for i, key in enumerate(keys):
+                ent = l1_read_result.get(key)
+                if ent is not None and ent[0] == L1Error.SUCCESS and ent[1] is not None:
+                    l1_found_indices.append(i)
+                    succeeded_keys.append(key)
+                else:
+                    sparse_l2_indices.append(i)
+                    remaining_keys.append(key)
+
+            self._event_bus.publish(
+                Event(
+                    event_type=EventType.SM_READ_PREFETCHED,
+                    metadata={
+                        "succeeded_keys": succeeded_keys,
+                        "failed_keys": remaining_keys,
+                    },
+                )
+            )
+
+            prefetch_request_id = -1
+            if remaining_keys and self._l2_adapters:
+                # Non-empty ``_l2_adapters`` implies a non-maru server, where
+                # the controller is always constructed (maru mode skips L2
+                # setup via the early return in ``__init__``).
+                assert self._prefetch_controller is not None
+                prefetch_request_id = self._prefetch_controller.submit_prefetch_request(
+                    remaining_keys,
+                    layout_desc,
+                    extra_count=extra_count,
+                    policy=TrimPolicy.SPARSE,
+                )
+            return PrefetchHandle(
+                prefetch_request_id=prefetch_request_id,
+                external_request_id=external_request_id,
+                l1_found_indices=tuple(l1_found_indices),
+                total_requested_keys=len(keys),
+                submit_time=time.monotonic(),
+                l2_orig_indices=tuple(sparse_l2_indices),
+            )
+
         hit_count = 0
         for key in keys:
             entry = l1_read_result.get(key, None)
@@ -457,6 +540,7 @@ class StorageManager:
         # Submit remaining keys to L2 prefetch controller
         remaining_keys = keys[hit_count:]
         prefetch_request_id = -1
+        l2_orig_indices: tuple[int, ...] = ()
         if remaining_keys and self._l2_adapters:
             # In maru mode ``_l2_adapters`` is empty, so we never
             # enter this branch and the controller stays ``None``.
@@ -465,7 +549,11 @@ class StorageManager:
                 remaining_keys,
                 layout_desc,
                 extra_count=extra_count,
+                policy=policy,
             )
+            # The controller indexes its result bitmap over remaining_keys
+            # (0-based); map those local indices back to original positions.
+            l2_orig_indices = tuple(range(hit_count, len(keys)))
 
         submit_time = time.monotonic()
         logger.debug(
@@ -484,25 +572,44 @@ class StorageManager:
         return PrefetchHandle(
             prefetch_request_id=prefetch_request_id,
             external_request_id=external_request_id,
-            l1_prefix_hit_count=hit_count,
+            l1_found_indices=tuple(range(hit_count)),
             total_requested_keys=len(keys),
             submit_time=submit_time,
+            l2_orig_indices=l2_orig_indices,
         )
+
+    def _combine_found(
+        self, handle: PrefetchHandle, l2_local: "Bitmap | None"
+    ) -> Bitmap:
+        """Merge the L1 found indices with an L2 result bitmap into one bitmap
+        over the original key positions.
+
+        ``l2_local`` is indexed over the keys submitted to L2 (0-based); its
+        set bits are mapped back to original positions via
+        ``handle.l2_orig_indices``.
+        """
+        found = Bitmap(handle.total_requested_keys)
+        found.batched_set(handle.l1_found_indices)
+        if l2_local is not None:
+            # gather maps each L2 set bit i to its original position
+            # ``l2_orig_indices[i]``; batched_set drops any position >= size.
+            found.batched_set(l2_local.gather(handle.l2_orig_indices))
+        return found
 
     def query_prefetch_lookup_hits(
         self,
         handle: PrefetchHandle,
     ) -> int | None:
         """
-        Query the number of prefix hit chunks for a prefetch task before
-        the L2 prefetching is done.
+        Query the number of prefix-hit chunks for a prefetch task before the
+        L2 prefetching is done.
 
         Args:
             handle (PrefetchHandle): The handle of the lookup task.
 
         Returns:
-            the number of prefix hit chunks if the lookup is done, None if
-            it's still in progress,  or the prefetch task is already done.
+            the number of prefix-hit chunks (L1 + L2) if the lookup is done,
+            None if it's still in progress or the prefetch task is already done.
 
         Note:
             This function is designed for the scenario where the caller wants
@@ -514,28 +621,27 @@ class StorageManager:
             Therefore, it's the caller’s responsibility to make sure not calling
             this function after the prefetch task is done.
         """
+        # Prefix-path only: l1_found_indices is contiguous, so len() == prefix hits.
+        l1_hits = len(handle.l1_found_indices)
         if handle.prefetch_request_id == -1:
-            # No L2 request, the prefix hit count is final
-            return handle.l1_prefix_hit_count
+            # No L2 request: the L1 prefix hit count is final.
+            return l1_hits
 
         # Have L2 request, need to check the status from prefetch
         # controller. A non-(-1) request id implies the controller
         # was constructed (maru mode never submits requests).
         assert self._prefetch_controller is not None
         l2_r = self._prefetch_controller.query_lookup_result(handle.prefetch_request_id)
-
         if l2_r is None:
-            # L2 prefetch is still in progress or it's already done and
-            # the result has been consumed by `query_prefetch_status`
+            # Still in progress, or already consumed by query_prefetch_status.
             return None
-
-        # L2 lookup is done, return the total prefix hit count (L1 + L2)
-        return handle.l1_prefix_hit_count + l2_r
+        # L2 lookup done: total prefix hits are L1 plus the L2 continuation.
+        return l1_hits + l2_r
 
     def query_prefetch_status(
         self,
         handle: PrefetchHandle,
-    ) -> int | None:
+    ) -> Bitmap | None:
         """
         Query the status of the prefetch task.
 
@@ -543,41 +649,42 @@ class StorageManager:
             handle (PrefetchHandle): The handle of the prefetch task.
 
         Returns:
-            the number of prefix hit chunks if the prefetch is done, None if
-            it's still in progress.
+            the found-key bitmap (over original positions) if the prefetch is
+            done, None if it's still in progress. Derive the prefix hit count
+            via ``count_leading_ones``.
         """
-        l2_result: int = 0
-
-        # Have L2 request, need to check the result from prefetch controller
+        l2_r: Bitmap | None = None
         if handle.prefetch_request_id != -1:
             assert self._prefetch_controller is not None
             l2_r = self._prefetch_controller.query_prefetch_result(
                 handle.prefetch_request_id
             )
-
             if l2_r is None:
                 return None
-            l2_result = l2_r  # Just to make linter happy
 
-        total_hits = handle.l1_prefix_hit_count + l2_result
+        found = self._combine_found(handle, l2_r)
+        # popcount (not count_leading_ones) so the log is accurate for
+        # non-contiguous policies (SEGMENTED_PREFIX / SPARSE) too.
+        total_hits = found.popcount()
         elapsed_ms = (time.monotonic() - handle.submit_time) * 1000
 
         if total_hits > 0:
+            # L1 and L2 sets are disjoint (only L1-misses go to L2).
+            l1_hits = len(handle.l1_found_indices)
+            l2_hits = l2_r.popcount() if l2_r is not None else 0
             logger.info(
                 "Prefetch request completed (L1+L2): "
-                "%d/%d prefix hits (%d L1, %d L2) "
-                "in %.1f ms "
-                "(external_request_id=%s, "
-                "prefetch_request_id=%d)",
+                "%d/%d retained keys (%d L1, %d L2) in %.1f ms "
+                "(external_request_id=%s, prefetch_request_id=%d)",
                 total_hits,
                 handle.total_requested_keys,
-                handle.l1_prefix_hit_count,
-                l2_result,
+                l1_hits,
+                l2_hits,
                 elapsed_ms,
                 handle.external_request_id,
                 handle.prefetch_request_id,
             )
-        return total_hits
+        return found
 
     def touch_l1_keys(self, keys: list[ObjectKey]):
         """
@@ -589,6 +696,21 @@ class StorageManager:
         """
         self._l1_manager.touch_keys(keys)
 
+    def unsafe_read(
+        self, keys: list[ObjectKey]
+    ) -> tuple[list[ObjectKey], list[MemoryObj]]:
+        """Read already read-locked objects without acquiring new read locks."""
+        read_results = self._l1_manager.unsafe_read(keys)
+        good_keys: list[ObjectKey] = []
+        good_objs: list[MemoryObj] = []
+        for key in keys:
+            err, obj = read_results.get(key, (L1Error.KEY_NOT_EXIST, None))
+            if err != L1Error.SUCCESS or obj is None:
+                continue
+            good_keys.append(key)
+            good_objs.append(obj)
+        return good_keys, good_objs
+
     @property
     def quota_manager(self) -> QuotaManager:
         """Per-cache_salt quota registry.
@@ -598,6 +720,35 @@ class StorageManager:
         storage manager creates the registry at construction time.
         """
         return self._quota_manager
+
+    def get_l2_usages(
+        self,
+    ) -> list[tuple[int | float, dict[str, object]]]:
+        """Per-adapter L2 usage in OTel-observation shape.
+
+        Backing data for the ``lmcache_mp.l2_usage_bytes`` observable
+        gauge.  One entry per configured adapter.
+
+        Returns:
+            A list of ``(total_bytes_used, {"l2_name": <type_name>})``
+            tuples — empty when no L2 adapters are configured.  Adapters
+            whose ``get_usage()`` raises are skipped (the gauge prefers
+            silence over a poison observation).
+        """
+        out: list[tuple[int | float, dict[str, object]]] = []
+        for adapter, desc in zip(
+            self._l2_adapters, self._adapter_descriptors, strict=True
+        ):
+            try:
+                usage = adapter.get_usage()
+            except Exception:
+                logger.exception(
+                    "L2 adapter %s get_usage() failed; skipping in gauge",
+                    desc.type_name,
+                )
+                continue
+            out.append((int(usage.total_bytes_used), {"l2_name": desc.type_name}))
+        return out
 
     def get_usage_bytes_by_cache_salt(self) -> dict[str, int]:
         """Aggregate ``cache_salt`` byte usage across every L2 adapter.
@@ -613,6 +764,54 @@ class StorageManager:
             for salt, used in snap.items():
                 totals[salt] = totals.get(salt, 0) + used
         return totals
+
+    def get_l2_adapter_reconfigure_status(self) -> dict:
+        """Return status for all runtime-reconfigurable L2 adapters.
+
+        Returns:
+            JSON-serializable status. If no reconfigurable adapter is configured,
+            ``enabled`` is ``False`` and the adapter list is empty.
+        """
+        adapters = []
+        for adapter_index, (
+            l2_adapter_index,
+            adapter,
+        ) in enumerate(self._list_reconfigurable_l2_adapters()):
+            status = dict(adapter.reconfigure_status())
+            if l2_adapter_index < len(getattr(self, "_adapter_descriptors", [])):
+                status["backend"] = self._adapter_descriptors[
+                    l2_adapter_index
+                ].type_name
+            status["adapter_index"] = adapter_index
+            status["l2_adapter_index"] = l2_adapter_index
+            adapters.append(status)
+
+        return {
+            "enabled": bool(adapters),
+            "num_adapters": len(adapters),
+            "adapters": adapters,
+        }
+
+    def reconfigure_l2_adapter(
+        self,
+        adapter_index: int,
+        operation: str,
+        payload: dict[str, object],
+    ) -> dict:
+        """Route a runtime reconfiguration request to one L2 adapter.
+
+        Args:
+            adapter_index: Zero-based reconfigurable-adapter index.
+            operation: Adapter-specific operation name.
+            payload: Adapter-specific operation payload.
+
+        Returns:
+            JSON-serializable operation result.
+        """
+        adapter = self._get_reconfigurable_l2_adapter(adapter_index)
+        result = adapter.reconfigure(operation, payload)
+        result["adapter_index"] = adapter_index
+        return result
 
     def clear(self, force: bool = False):
         """
@@ -662,6 +861,8 @@ class StorageManager:
         if self._l2_eviction_controller is not None:
             self._l2_eviction_controller.stop()
 
+        PeriodicEventNotifier.shutdown()
+
         for adapter in self._l2_adapters:
             adapter.close()
 
@@ -704,6 +905,15 @@ class StorageManager:
             "num_l2_adapters": len(self._l2_adapters),
         }
 
+    def register_l2_listener(self, listener: L2AdapterListener) -> None:
+        """Register a listener on all L2 adapters.
+
+        Args:
+            listener: The listener to register.
+        """
+        for adapter in self._l2_adapters:
+            adapter.register_listener(listener)
+
     # Functions for debugging and testing
     def memcheck(self) -> bool:
         """
@@ -713,3 +923,35 @@ class StorageManager:
             True if memory is consistent, False otherwise.
         """
         return self._l1_manager.memcheck()
+
+    def _unwrap_reconfigurable_l2_adapter(
+        self,
+        adapter: L2AdapterInterface,
+    ) -> Optional[L2ReconfigurableAdapter]:
+        if isinstance(adapter, L2ReconfigurableAdapter):
+            return adapter
+
+        inner = getattr(adapter, "inner_adapter", None)
+        if inner is not None and isinstance(inner, L2ReconfigurableAdapter):
+            return inner
+
+        return None
+
+    def _list_reconfigurable_l2_adapters(
+        self,
+    ) -> list[tuple[int, L2ReconfigurableAdapter]]:
+        adapters: list[tuple[int, L2ReconfigurableAdapter]] = []
+        for l2_adapter_index, adapter in enumerate(self._l2_adapters):
+            reconfigurable_adapter = self._unwrap_reconfigurable_l2_adapter(adapter)
+            if reconfigurable_adapter is not None:
+                adapters.append((l2_adapter_index, reconfigurable_adapter))
+        return adapters
+
+    def _get_reconfigurable_l2_adapter(
+        self,
+        adapter_index: int,
+    ) -> L2ReconfigurableAdapter:
+        adapters = self._list_reconfigurable_l2_adapters()
+        if adapter_index < 0 or adapter_index >= len(adapters):
+            raise L2ReconfigureError(404, "L2 adapter not reconfigurable")
+        return adapters[adapter_index][1]

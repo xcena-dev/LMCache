@@ -140,11 +140,32 @@ Install LMCache
                             uv pip install torch torchvision --index-url https://download.pytorch.org/whl/rocm7.0
 
                             # Build LMCache. BUILD_WITH_HIP=1 makes setup.py pick cupy-rocm-7-0 automatically.
-                            PYTORCH_ROCM_ARCH="gfx942" \
+                            # PYTORCH_ROCM_ARCH selects the target GPU(s):
+                            #   gfx942  -> MI300X / MI325X
+                            #   gfx950  -> MI350X / MI355X
+                            # Comma-separate to build a fat binary for multiple archs.
+                            PYTORCH_ROCM_ARCH="gfx942,gfx950" \
                             TORCH_DONT_CHECK_COMPILER_ABI=1 \
                             CXX=hipcc \
                             BUILD_WITH_HIP=1 \
                             uv pip install -e . --no-build-isolation
+
+                    .. tab-item:: Intel XPU
+
+                        .. code-block:: bash
+
+                            git clone https://github.com/LMCache/LMCache.git
+                            cd LMCache
+
+                            uv venv --python 3.12
+                            source .venv/bin/activate
+
+                            # Need to install these packages manually to avoid build isolation
+                            uv pip install -r requirements/build.txt
+
+                            # Build LMCache with SYCL backend.
+                            BUILD_WITH_SYCL=1 uv pip install --no-build-isolation -e .
+
 
     .. tab-item:: Docker
 
@@ -188,6 +209,12 @@ Install LMCache
 
                     docker pull rocm/vllm-dev:nightly_0624_rc2_0624_rc2_20250620
 
+            .. tab-item:: Intel XPU
+
+                .. code-block:: bash
+
+                    docker pull intel/vllm:0.17.0-xpu
+
         See :ref:`docker_deployment` for running the container and ROCm images.
 
     .. tab-item:: CLI Only  
@@ -204,21 +231,26 @@ Install LMCache
             ``lmcache-cli`` and ``lmcache`` ship the same ``lmcache`` CLI command.
             Do not install both in the same environment.
 
+Build the Docker Image
+----------------------
+
+Instead of pulling a prebuilt image, you can build the LMCache (integrated with
+vLLM) image yourself from the provided Dockerfile, located in
+`docker/ <https://github.com/LMCache/LMCache/tree/dev/docker>`_.
+
+From the root of the LMCache repository:
+
+.. code-block:: bash
+
+    docker build --tag <IMAGE_NAME>:<TAG> --target image-build --file docker/Dockerfile .
+
+Replace ``<IMAGE_NAME>`` and ``<TAG>`` with your desired image name and tag. See
+the example build file in `docker/ <https://github.com/LMCache/LMCache/tree/dev/docker>`_
+for an explanation of all build arguments.
+
 Verify Installation
 -------------------
 
 .. code-block:: bash
 
     python -c "import lmcache.c_ops"
-
-Compatibility Matrix
-~~~~~~~~~~~~~~~~~~~~
-
-✅ compatible · ❌ API incompatible · 🕯️ torch mismatch (use ``--no-build-isolation``)
-
-
-.. container:: compat-table-scroll
-
-   .. csv-table::
-      :file: Installation_compatibility_matrix.csv
-      :header-rows: 1

@@ -46,7 +46,7 @@ class _RecordingListener(L2AdapterListener):
         self.accessed: list[list[ObjectKey]] = []
         self.deleted: list[list[ObjectKey]] = []
 
-    def on_l2_keys_stored(self, keys: list[ObjectKey]):
+    def on_l2_keys_stored(self, keys: list[ObjectKey], sizes: list[int]):
         self.stored.append(list(keys))
 
     def on_l2_keys_accessed(self, keys: list[ObjectKey]):
@@ -255,7 +255,7 @@ class TestStoreInterface:
 
         completed = adpt.pop_completed_store_tasks()
         assert task_id in completed
-        assert completed[task_id] is True
+        assert completed[task_id].is_successful()
 
     def test_store_creates_file_on_disk(self, adapter):
         adpt, buf, tmp_dir = adapter
@@ -407,7 +407,7 @@ class TestEndToEnd:
         store_task = adpt.submit_store_task([key], [store_obj])
         wait_for_event_fd(adpt.get_store_event_fd())
         completed = adpt.pop_completed_store_tasks()
-        assert completed[store_task] is True
+        assert completed[store_task].is_successful()
 
         # Lookup
         lookup_task = adpt.submit_lookup_and_lock_task([key])

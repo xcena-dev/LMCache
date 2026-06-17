@@ -22,9 +22,9 @@ defaults:
     run:
         shell: bash
 
-# Cancel stale runs per ref; PR and dev-push refs differ, so workflow_call is unaffected.
+# Cancel older in-flight runs on the same PR / branch.
 concurrency:
-    group: ${{ github.workflow }}-${{ github.ref }}
+    group: build-cli-${{ github.workflow }}-${{ github.ref }}
     cancel-in-progress: true
 
 permissions:
@@ -39,14 +39,7 @@ jobs:
               uses: step-security/harden-runner@20cf305ff2072d973412fa9b1e3a4f227bda3c76 # v2.14.0
               with:
                 disable-sudo-and-containers: false
-                egress-policy: block
-                allowed-endpoints: >
-                  api.github.com:443
-                  github.com:443
-                  azure.archive.ubuntu.com:80
-                  pypi.org:443
-                  files.pythonhosted.org:443
-                  objects.githubusercontent.com:443
+                egress-policy: audit
 
             - name: Checkout code
               uses: actions/checkout@8e8c483db84b4bee98b60c0593521ed34d9990e8 # v6.0.1
@@ -70,10 +63,10 @@ jobs:
               run: |
                 rm -rf dist/
 
-            - name: Build lmcache-cli wheel (pure Python, no CUDA)
+            - name: Build lmcache-cli wheel (pure Python, no native extensions)
               run: |
                 cp pyproject_cli.toml pyproject.toml
-                NO_CUDA_EXT=1 python -m build --wheel
+                NO_NATIVE_EXT=1 python -m build --wheel
 
             - name: Smoke-test CLI wheel (no torch)
               run: |
