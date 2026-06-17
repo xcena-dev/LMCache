@@ -248,22 +248,14 @@ class StorageManager:
     def finish_write(
         self,
         keys: list[ObjectKey],
-        memory_objs: Optional[list[MemoryObj]] = None,
     ) -> None:
         """
         Finish writing the objects into the storage manager.
 
         Args:
             keys (list[ObjectKey]): List of object keys that have been written.
-            memory_objs: ``MemoryObj`` instances aligned with ``keys``.
-                Required when the L1 backend is maru — the caller
-                (``MPCacheEngine.store``) keeps the reserved
-                MemoryObjs alive across the GPU copy and threads them
-                here so the maru branch can issue
-                ``MaruHandler.batch_store``. Ignored by default L1
-                backends, which read state from the in-process dict.
         """
-        finish_result = self._l1_manager.finish_write(keys, memory_objs=memory_objs)
+        finish_result = self._l1_manager.finish_write(keys)
         successful_keys = [k for k, e in finish_result.items() if e == L1Error.SUCCESS]
         failed_keys = [k for k, e in finish_result.items() if e != L1Error.SUCCESS]
         self._event_bus.publish(
@@ -831,11 +823,12 @@ class StorageManager:
         dtypes: list[torch.dtype],
         fmt: MemoryFormat,
         chunk_size_in_tokens: int,
+        num_object_groups: int,
     ) -> None:
         """Bind the KV layout to the underlying allocator.
 
-        Called from ``MPCacheEngine.register_kv_cache`` once a vLLM
-        worker exposes its KV cache tensors. Only the maru backend
+        Called from ``LMCacheDrivenTransfer.register_kv_cache`` once a
+        vLLM worker exposes its KV cache tensors. Only the maru backend
         acts on the call (its ``CxlMemoryAdapter`` pool is typed at
         first registration); default backends ignore it.
 
@@ -844,7 +837,20 @@ class StorageManager:
             dtypes: KV chunk dtypes aligned with ``shapes``.
             fmt: Memory format.
             chunk_size_in_tokens: LMCache chunk size in tokens.
+            num_object_groups: Number of object groups in the model's KV
+                layout. Only ``shapes``/``dtypes`` for object group 0 are
+                forwarded, so the maru backend (single-object-group only)
+                rejects models with more than one.
+
+        Raises:
+            ValueError: If the maru backend is active and
+                ``num_object_groups > 1`` (unsupported layout).
         """
+        if self._is_maru and num_object_groups > 1:
+            raise ValueError(
+                "maru L1 backend supports a single object group only, got "
+                f"num_object_groups={num_object_groups}"
+            )
         self._l1_manager.register_kv_layout(shapes, dtypes, fmt, chunk_size_in_tokens)
 
     def close(self):

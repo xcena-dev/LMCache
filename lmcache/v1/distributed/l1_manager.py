@@ -622,18 +622,11 @@ class L1Manager:
     def finish_write(
         self,
         keys: list[ObjectKey],
-        memory_objs: Optional[list[MemoryObj]] = None,
     ) -> dict[ObjectKey, L1Error]:
         """Finish write access for the given keys.
 
         Args:
             keys: The list of object keys to finish write access for.
-            memory_objs: The ``MemoryObj`` instances corresponding to
-                ``keys``. **Required in maru mode** (used to issue
-                ``MaruHandler.batch_store``); ignored in default mode
-                (the in-process dict already holds the MemoryObj).
-                Defaults to ``None`` for backward compatibility with
-                callers that only update L1 state.
 
         Returns:
             A dictionary mapping each object key to an L1Error.
@@ -644,7 +637,7 @@ class L1Manager:
                 which means the writer may have caused inconsistent data.
         """
         if self._maru_dispatcher is not None:
-            return self._maru_dispatcher.finish_write(keys, memory_objs)
+            return self._maru_dispatcher.finish_write(keys)
 
         ret: dict[ObjectKey, L1Error] = {}
         successful_keys: list[ObjectKey] = []

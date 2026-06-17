@@ -27,7 +27,7 @@ guarded by a separate lock here.
 from __future__ import annotations
 
 # Standard
-from typing import TYPE_CHECKING, Any, Optional
+from typing import TYPE_CHECKING, Any
 
 # First Party
 from lmcache.logging import init_logger
@@ -86,6 +86,11 @@ class MaruL1Dispatcher:
         self._write_ttl_seconds = write_ttl_seconds
         self._read_ttl_seconds = read_ttl_seconds
         self._pending_read_memobjs: dict[ObjectKey, MemoryObj] = {}
+        # Write-side channel: reserve_write stashes reserved MemoryObjs here so
+        # the keys-only finish_write drain can recover them (mirrors
+        # _pending_read_memobjs). finish_write pops them. See reserve_write for
+        # the store-failure leak caveat; the count is surfaced in report_status.
+        self._pending_write_memobjs: dict[ObjectKey, MemoryObj] = {}
 
     @property
     def handler(self) -> Any:
@@ -252,51 +257,97 @@ class MaruL1Dispatcher:
 
         for k, obj in zip(keys, allocated_objs, strict=False):
             ret[k] = (L1Error.SUCCESS, obj)
+            # Stash for the keys-only finish_write drain to recover (the post-
+            # merge completion path carries only keys). finish_write pops these.
+            #
+            # KNOWN LIMITATION (deferred): if the engine's store FAILS after
+            # reserve_write, finish_write is never submitted (see
+            # lmcache_driven_transfer.store's fail-closed ``finally``), so this
+            # entry is never popped AND the underlying CXL page is never freed.
+            # maru has NO orphan reclamation: ``handler.alloc`` consumes an
+            # ``OwnedRegionManager`` slot that is released only by ``batch_store``
+            # (dup / register-fail) or ``delete``/eviction -- none of which run
+            # on a failed store -- and ``MaruMemoryAllocator.free`` is a no-op.
+            # Accepted for now: store failures are rare and maru L1 eviction is
+            # disabled anyway. Proper reclamation (a write-TTL sweep keyed off
+            # ``self._write_ttl_seconds``, or an explicit abort path) is left to
+            # a dedicated memory-lifecycle design. ``report_status`` surfaces the
+            # pending count so any growth is observable.
+            self._pending_write_memobjs[k] = obj
         return ret
 
     def finish_write(
         self,
         keys: list[ObjectKey],
-        memory_objs: Optional[list[MemoryObj]],
     ) -> dict[ObjectKey, L1Error]:
-        """Register KVs with MaruServer via ``batch_store``.
+        """Register reserved KVs with MaruServer via ``batch_store``.
+
+        The post-merge completion drain is keys-only, so the
+        ``MemoryObj``s reserved in :meth:`reserve_write` are recovered
+        from ``_pending_write_memobjs`` (the write-side equivalent of
+        ``_pending_read_memobjs``). Every requested key is popped from
+        the side channel before returning -- on success, failure, or
+        exception -- so the channel never grows on the normal path.
 
         ``batch_store`` performs dup-skip + auto-free transparently:
         keys that already exist have their newly-allocated CXL page
-        returned to the pool. Both "newly registered" and
-        "skipped because already present" are functional successes.
+        returned to the pool. Both "newly registered" and "skipped
+        because already present" are functional successes.
         """
         handler = self.handler
-
-        if memory_objs is None or len(memory_objs) != len(keys):
-            actual = 0 if memory_objs is None else len(memory_objs)
-            logger.error(
-                "Maru finish_write requires memory_objs matching keys "
-                "(keys=%d, memory_objs=%d)",
-                len(keys),
-                actual,
-            )
-            return {k: L1Error.KEY_IN_WRONG_STATE for k in keys}
-
-        key_strs = [object_key_to_string(k) for k in keys]
         try:
-            handles = [self._allocator.create_store_handle(mo) for mo in memory_objs]
-        except Exception:
-            logger.exception(
-                "create_store_handle failed for %d MemoryObjs", len(memory_objs)
-            )
-            return {k: L1Error.KEY_IN_WRONG_STATE for k in keys}
+            memory_objs = [self._pending_write_memobjs.get(k) for k in keys]
+            present_keys = [
+                k for k, mo in zip(keys, memory_objs, strict=False) if mo is not None
+            ]
+            present_objs = [mo for mo in memory_objs if mo is not None]
 
-        try:
-            results = handler.batch_store(key_strs, handles)
-        except Exception:
-            logger.exception("MaruHandler.batch_store failed for %d keys", len(keys))
-            return {k: L1Error.KEY_IN_WRONG_STATE for k in keys}
+            # Keys absent from the side channel were never reserved (or already
+            # finished). This should not happen on the normal store path.
+            ret: dict[ObjectKey, L1Error] = {
+                k: L1Error.KEY_IN_WRONG_STATE
+                for k, mo in zip(keys, memory_objs, strict=False)
+                if mo is None
+            }
+            if ret:
+                logger.error(
+                    "Maru finish_write: %d/%d keys missing from the write side "
+                    "channel (never reserved or already finished)",
+                    len(ret),
+                    len(keys),
+                )
+            if not present_keys:
+                return ret
 
-        ret: dict[ObjectKey, L1Error] = {}
-        for k, ok in zip(keys, results, strict=False):
-            ret[k] = L1Error.SUCCESS if ok else L1Error.KEY_IN_WRONG_STATE
-        return ret
+            key_strs = [object_key_to_string(k) for k in present_keys]
+            try:
+                handles = [
+                    self._allocator.create_store_handle(mo) for mo in present_objs
+                ]
+            except Exception:
+                logger.exception(
+                    "create_store_handle failed for %d MemoryObjs", len(present_objs)
+                )
+                for k in present_keys:
+                    ret[k] = L1Error.KEY_IN_WRONG_STATE
+                return ret
+
+            try:
+                results = handler.batch_store(key_strs, handles)
+            except Exception:
+                logger.exception(
+                    "MaruHandler.batch_store failed for %d keys", len(present_keys)
+                )
+                for k in present_keys:
+                    ret[k] = L1Error.KEY_IN_WRONG_STATE
+                return ret
+
+            for k, ok in zip(present_keys, results, strict=False):
+                ret[k] = L1Error.SUCCESS if ok else L1Error.KEY_IN_WRONG_STATE
+            return ret
+        finally:
+            for k in keys:
+                self._pending_write_memobjs.pop(k, None)
 
     def finish_write_and_reserve_read(
         self, keys: list[ObjectKey]
@@ -357,11 +408,13 @@ class MaruL1Dispatcher:
         """
         if force:
             logger.warning(
-                "L1Manager (maru): force-clear drops %d pending read "
-                "MemoryObjs but does NOT touch MaruServer.",
+                "L1Manager (maru): force-clear drops %d pending read + %d "
+                "pending write MemoryObjs but does NOT touch MaruServer.",
                 len(self._pending_read_memobjs),
+                len(self._pending_write_memobjs),
             )
         self._pending_read_memobjs.clear()
+        self._pending_write_memobjs.clear()
 
     def report_status(self) -> dict:
         """Maru-flavoured status snapshot."""
@@ -374,6 +427,7 @@ class MaruL1Dispatcher:
             "read_locked_count": 0,
             "temporary_count": 0,
             "pending_read_memobjs": len(self._pending_read_memobjs),
+            "pending_write_memobjs": len(self._pending_write_memobjs),
             "memory_used_bytes": used,
             "memory_total_bytes": total,
             "memory_usage_ratio": used / total if total > 0 else 0.0,
