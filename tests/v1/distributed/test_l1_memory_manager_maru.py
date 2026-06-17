@@ -44,8 +44,14 @@ try:
     )
     from lmcache.v1.distributed.memory_manager import (
         L1MemoryManager,
-        _is_maru_allocator,
         create_memory_allocator,
+    )
+
+    # ``_is_maru_allocator`` is a private helper not re-exported by the package
+    # ``__init__``; import it from the submodule (else this whole module would
+    # ImportError and silently skip).
+    from lmcache.v1.distributed.memory_manager.l1_memory_manager import (
+        _is_maru_allocator,
     )
 except ImportError:
     pytest.skip(

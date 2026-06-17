@@ -222,71 +222,112 @@ class TestMaruReserveWrite:
             assert err is L1Error.OUT_OF_MEMORY
             assert returned is None
 
+    def test_populates_write_side_channel(self, maru_mgr):
+        # reserve_write must stash the reserved objs so the keys-only
+        # finish_write drain can recover them.
+        keys = [_mk_key(i) for i in range(2)]
+        fake_objs = [mock.MagicMock(spec=[]) for _ in keys]
+        maru_mgr._memory_manager = mock.MagicMock()
+        maru_mgr._maru_dispatcher._memory_manager = maru_mgr._memory_manager
+        maru_mgr._memory_manager.allocate.return_value = (L1Error.SUCCESS, fake_objs)
+
+        maru_mgr.reserve_write(
+            keys,
+            is_temporary=[False] * len(keys),
+            layout_desc=mock.MagicMock(),
+            mode="new",
+        )
+
+        chan = maru_mgr._maru_dispatcher._pending_write_memobjs
+        for k, obj in zip(keys, fake_objs, strict=False):
+            assert chan[k] is obj
+
 
 class TestMaruFinishWrite:
+    # finish_write is keys-only post-merge: the reserved MemoryObjs are
+    # recovered from the write side channel that reserve_write populates.
+    @staticmethod
+    def _seed(maru_mgr, keys, memory_objs):
+        """Populate the write side channel as reserve_write would."""
+        maru_mgr._maru_dispatcher._pending_write_memobjs = dict(
+            zip(keys, memory_objs, strict=True)
+        )
+
     def test_happy_path_calls_batch_store(self, maru_mgr, maru_handler, maru_adapter):
         keys = [_mk_key(i) for i in range(2)]
         memory_objs = [mock.MagicMock(name=f"mo-{i}") for i in range(2)]
+        self._seed(maru_mgr, keys, memory_objs)
         # ``MaruMemoryAllocator.create_store_handle`` forwards to the
         # underlying ``CxlMemoryAdapter`` — we configure that mock to
         # observe and override the return values.
         handles = [mock.MagicMock(name=f"handle-{i}") for i in range(2)]
         maru_adapter.create_store_handle.side_effect = handles
-        maru_handler.batch_store.return_value = [
-            True,
-            True,
-        ]
+        maru_handler.batch_store.return_value = [True, True]
 
-        ret = maru_mgr.finish_write(keys, memory_objs=memory_objs)
+        ret = maru_mgr.finish_write(keys)
 
         # Verify batch_store was called with key strings + handles.
-        called_args = maru_handler.batch_store.call_args
-        called_key_strs, called_handles = called_args.args
+        called_key_strs, called_handles = maru_handler.batch_store.call_args.args
         assert called_key_strs == [object_key_to_string(k) for k in keys]
         assert called_handles == handles
         for k in keys:
             assert ret[k] is L1Error.SUCCESS
+        # The side channel is drained on success.
+        assert maru_mgr._maru_dispatcher._pending_write_memobjs == {}
 
     def test_dup_skip_returns_success(self, maru_mgr, maru_handler, maru_adapter):
         # ``batch_store`` returns True for both newly registered AND
         # dup-skipped keys; both are functional successes.
         keys = [_mk_key(i) for i in range(2)]
         memory_objs = [mock.MagicMock() for _ in keys]
+        self._seed(maru_mgr, keys, memory_objs)
         maru_adapter.create_store_handle.side_effect = [mock.MagicMock() for _ in keys]
         # MaruHandler returns True even for dup-skipped keys.
-        maru_handler.batch_store.return_value = [
-            True,
-            True,
-        ]
+        maru_handler.batch_store.return_value = [True, True]
 
-        ret = maru_mgr.finish_write(keys, memory_objs=memory_objs)
+        ret = maru_mgr.finish_write(keys)
         for k in keys:
             assert ret[k] is L1Error.SUCCESS
 
-    def test_missing_memory_objs_returns_error(self, maru_mgr, maru_handler):
+    def test_missing_from_side_channel_returns_error(self, maru_mgr, maru_handler):
+        # Keys never reserved (absent from the side channel): error, no RPC.
         keys = [_mk_key(i) for i in range(2)]
-        ret = maru_mgr.finish_write(keys, memory_objs=None)
+        ret = maru_mgr.finish_write(keys)
         for k in keys:
             assert ret[k] is L1Error.KEY_IN_WRONG_STATE
         maru_handler.batch_store.assert_not_called()
 
-    def test_length_mismatch_returns_error(self, maru_mgr, maru_handler):
-        keys = [_mk_key(i) for i in range(3)]
-        ret = maru_mgr.finish_write(keys, memory_objs=[mock.MagicMock()])
-        for k in keys:
-            assert ret[k] is L1Error.KEY_IN_WRONG_STATE
-        maru_handler.batch_store.assert_not_called()
+    def test_partial_side_channel(self, maru_mgr, maru_handler, maru_adapter):
+        # Only some keys were reserved: present keys are stored, missing keys
+        # report an error, and the channel is fully drained either way.
+        keys = [_mk_key(i) for i in range(2)]
+        present_obj = mock.MagicMock(name="mo-present")
+        self._seed(maru_mgr, keys[:1], [present_obj])
+        maru_adapter.create_store_handle.side_effect = [mock.MagicMock()]
+        maru_handler.batch_store.return_value = [True]
+
+        ret = maru_mgr.finish_write(keys)
+
+        called_key_strs, _ = maru_handler.batch_store.call_args.args
+        assert called_key_strs == [object_key_to_string(keys[0])]
+        assert ret[keys[0]] is L1Error.SUCCESS
+        assert ret[keys[1]] is L1Error.KEY_IN_WRONG_STATE
+        assert maru_mgr._maru_dispatcher._pending_write_memobjs == {}
 
     def test_batch_store_exception_returns_error(
         self, maru_mgr, maru_handler, maru_adapter
     ):
         keys = [_mk_key(i) for i in range(2)]
         memory_objs = [mock.MagicMock() for _ in keys]
+        self._seed(maru_mgr, keys, memory_objs)
         maru_adapter.create_store_handle.side_effect = [mock.MagicMock() for _ in keys]
         maru_handler.batch_store.side_effect = RuntimeError("rpc fail")
-        ret = maru_mgr.finish_write(keys, memory_objs=memory_objs)
+
+        ret = maru_mgr.finish_write(keys)
         for k in keys:
             assert ret[k] is L1Error.KEY_IN_WRONG_STATE
+        # Even on RPC failure the side channel must be drained (no leak).
+        assert maru_mgr._maru_dispatcher._pending_write_memobjs == {}
 
 
 # =========================================================================

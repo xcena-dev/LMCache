@@ -7,7 +7,7 @@ Coverage:
    adapters are not constructed; ``_is_maru`` is True.
 2. ``register_kv_layout`` — forwards down through L1Manager and
    L1MemoryManager to ``MaruMemoryAllocator.init_layout``.
-3. ``finish_write`` — threads ``memory_objs`` to ``L1Manager.finish_write``.
+3. ``finish_write`` — forwards keys (keys-only) to ``L1Manager.finish_write``.
 4. ``close()`` — succeeds with controllers absent.
 5. ``report_status()`` — returns a maru-shaped dict.
 
@@ -145,7 +145,7 @@ class TestRegisterKvLayoutChain:
         try:
             shapes = [torch.Size([2, 32, 256, 128])]
             dtypes = [torch.float16]
-            mgr.register_kv_layout(shapes, dtypes, MemoryFormat.KV_2LTD, 256)
+            mgr.register_kv_layout(shapes, dtypes, MemoryFormat.KV_2LTD, 256, 1)
 
             alloc = mgr._l1_manager._memory_manager._allocator
             assert alloc._shapes == shapes
@@ -163,9 +163,9 @@ class TestRegisterKvLayoutChain:
             shapes_a = [torch.Size([2, 32, 256, 128])]
             shapes_b = [torch.Size([2, 32, 128, 128])]  # different
             dtypes = [torch.float16]
-            mgr.register_kv_layout(shapes_a, dtypes, MemoryFormat.KV_2LTD, 256)
+            mgr.register_kv_layout(shapes_a, dtypes, MemoryFormat.KV_2LTD, 256, 1)
             with pytest.raises(ValueError, match="layout mismatch"):
-                mgr.register_kv_layout(shapes_b, dtypes, MemoryFormat.KV_2LTD, 256)
+                mgr.register_kv_layout(shapes_b, dtypes, MemoryFormat.KV_2LTD, 256, 1)
         finally:
             mgr.close()
 
@@ -176,46 +176,46 @@ class TestRegisterKvLayoutChain:
         try:
             shapes = [torch.Size([2, 32, 256, 128])]
             dtypes = [torch.float16]
-            mgr.register_kv_layout(shapes, dtypes, MemoryFormat.KV_2LTD, 256)
+            mgr.register_kv_layout(shapes, dtypes, MemoryFormat.KV_2LTD, 256, 1)
             # Second call with the same layout: no exception.
-            mgr.register_kv_layout(shapes, dtypes, MemoryFormat.KV_2LTD, 256)
+            mgr.register_kv_layout(shapes, dtypes, MemoryFormat.KV_2LTD, 256, 1)
+        finally:
+            mgr.close()
+
+    def test_multi_object_group_rejected(
+        self, maru_storage_config, fake_maru_init_layout
+    ):
+        # maru only forwards object group 0's layout, so it rejects models
+        # with more than one object group.
+        mgr = StorageManager(maru_storage_config)
+        try:
+            shapes = [torch.Size([2, 32, 256, 128])]
+            dtypes = [torch.float16]
+            with pytest.raises(ValueError, match="single object group"):
+                mgr.register_kv_layout(shapes, dtypes, MemoryFormat.KV_2LTD, 256, 2)
         finally:
             mgr.close()
 
 
 # =========================================================================
-# (3) finish_write threads memory_objs
+# (3) finish_write forwards keys (keys-only post-merge)
 # =========================================================================
 
 
-class TestFinishWriteThreading:
-    def test_memory_objs_forwarded_to_l1_manager(
+class TestFinishWriteForwarding:
+    def test_forwards_keys_to_l1_manager(
         self, maru_storage_config, fake_maru_init_layout
     ):
         mgr = StorageManager(maru_storage_config)
         try:
             keys = [mock.MagicMock(name=f"k-{i}") for i in range(3)]
-            memory_objs = [mock.MagicMock(name=f"mo-{i}") for i in range(3)]
             with mock.patch.object(
                 mgr._l1_manager, "finish_write", return_value={}
             ) as patched:
-                mgr.finish_write(keys, memory_objs=memory_objs)
-            patched.assert_called_once()
-            # Whether ``memory_objs`` was passed positionally or by
-            # keyword, the second binding should be the same list.
-            call = patched.call_args
-            assert call.kwargs.get("memory_objs") is memory_objs
-        finally:
-            mgr.close()
-
-    def test_default_call_passes_none(self, maru_storage_config, fake_maru_init_layout):
-        mgr = StorageManager(maru_storage_config)
-        try:
-            with mock.patch.object(
-                mgr._l1_manager, "finish_write", return_value={}
-            ) as patched:
-                mgr.finish_write([mock.MagicMock()])
-            assert patched.call_args.kwargs.get("memory_objs") is None
+                mgr.finish_write(keys)
+            # Keys-only: the maru store now recovers MemoryObjs from its own
+            # write side channel, so no memory_objs are threaded here.
+            patched.assert_called_once_with(keys)
         finally:
             mgr.close()
 

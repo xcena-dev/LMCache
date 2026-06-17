@@ -390,7 +390,9 @@ class TestStore:
 
         # Completion bookkeeping.
         results = adapter.pop_completed_store_tasks()
-        assert results == {task_id: True}
+        assert results[task_id].is_successful()
+        # bytes_transferred is now encoded in the L2StoreResult.
+        assert results[task_id].bytes_transferred() > 0
 
     def test_batch_store_partial_failure_marks_overall_false(
         self, adapter, fake_handler
@@ -408,7 +410,7 @@ class TestStore:
         fake_handler.batch_store.return_value = [True, False]
 
         task_id = adapter.submit_store_task(keys, objs)
-        assert adapter.pop_completed_store_tasks() == {task_id: False}
+        assert not adapter.pop_completed_store_tasks()[task_id].is_successful()
 
     def test_alloc_exception_marks_failure(self, adapter, fake_handler):
         keys = [_mk_key(0)]
@@ -421,7 +423,7 @@ class TestStore:
 
         # batch_store must not have been reached.
         fake_handler.batch_store.assert_not_called()
-        assert adapter.pop_completed_store_tasks() == {task_id: False}
+        assert not adapter.pop_completed_store_tasks()[task_id].is_successful()
 
     def test_pop_drains_completed_dict(self, adapter, fake_handler):
         keys = [_mk_key(0)]
@@ -431,7 +433,7 @@ class TestStore:
         fake_handler.batch_store.return_value = [True]
 
         task_id = adapter.submit_store_task(keys, [_make_dram_memory_obj(src)])
-        assert adapter.pop_completed_store_tasks() == {task_id: True}
+        assert adapter.pop_completed_store_tasks()[task_id].is_successful()
         # Second pop yields nothing — single-consumer contract.
         assert adapter.pop_completed_store_tasks() == {}
 
@@ -666,7 +668,7 @@ class TestLazyConnect:
         assert a._handler is fake_handler
 
         # And the task itself succeeded.
-        assert a.pop_completed_store_tasks() == {task_id: True}
+        assert a.pop_completed_store_tasks()[task_id].is_successful()
 
     def test_explicit_chunk_size_wins_over_hint(self, base_cfg, fake_handler):
         """Config-level ``chunk_size_bytes`` is authoritative; the
