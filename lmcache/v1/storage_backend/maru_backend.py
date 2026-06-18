@@ -70,6 +70,9 @@ class MaruBackend(AllocatorBackendInterface):
         self._single_token_size: int = (
             self._full_chunk_size_bytes // metadata.chunk_size
         )
+        # Chunk size in tokens — maps a chunk's cumulative token offset to its
+        # absolute prompt position for the Maru 'prefix' pin policy.
+        self._chunk_size: int = metadata.chunk_size
 
         self._mla_worker_id_as0_mode: bool = (
             config.get_extra_config_value(
@@ -481,11 +484,14 @@ class MaruBackend(AllocatorBackendInterface):
     def batched_get_blocking(
         self,
         keys: List[CacheEngineKey],
+        positions: Optional[List[int]] = None,
     ) -> List[Optional[MemoryObj]]:
         """Blocking batched get via single batch_retrieve RPC.
 
         Args:
             keys: The cache keys.
+            positions: Optional per-key absolute chunk index (prompt position),
+                threaded from the cache engine for the Maru 'prefix' pin policy.
 
         Returns:
             List of MemoryObj (None for misses).
@@ -494,7 +500,7 @@ class MaruBackend(AllocatorBackendInterface):
             keys = [k.with_new_worker_id(0) for k in keys]
 
         key_strs = [k.to_string() for k in keys]
-        mem_infos = self._handler.batch_retrieve(key_strs)
+        mem_infos = self._handler.batch_retrieve(key_strs, positions=positions)
 
         allocator = self.memory_allocator
         assert isinstance(allocator, CxlMemoryAdapter)
@@ -560,11 +566,25 @@ class MaruBackend(AllocatorBackendInterface):
         Args:
             lookup_id: Unique request identifier.
             keys: Keys to retrieve (already confirmed by contains).
-            transfer_spec: Unused.
+            transfer_spec: Optional dict; its ``cum_chunk_lengths`` is used to
+                derive each key's absolute prompt position for the Maru
+                'prefix' pin policy.
 
         Returns:
             List of MemoryObjs backed by CXL memory.
         """
+
+        # Recover each chunk's absolute prompt position from the cumulative
+        # token offsets threaded via transfer_spec: cum_chunk_lengths[i+1] is the
+        # absolute END token offset of chunk i, so (end // chunk_size - 1) is its
+        # absolute chunk index. None if unavailable (handler treats it as no-op).
+        positions: Optional[List[int]] = None
+        if isinstance(transfer_spec, dict):
+            ccl = transfer_spec.get("cum_chunk_lengths")
+            if ccl is not None and len(ccl) >= len(keys) + 1:
+                positions = [
+                    ccl[i + 1] // self._chunk_size - 1 for i in range(len(keys))
+                ]
 
         def _batch_get() -> list[MemoryObj]:
             if self._mla_worker_id_as0_mode:
@@ -573,7 +593,7 @@ class MaruBackend(AllocatorBackendInterface):
                 actual_keys = list(keys)
 
             key_strs = [k.to_string() for k in actual_keys]
-            mem_infos = self._handler.batch_retrieve(key_strs)
+            mem_infos = self._handler.batch_retrieve(key_strs, positions=positions)
 
             allocator = self.memory_allocator
             assert isinstance(allocator, CxlMemoryAdapter)

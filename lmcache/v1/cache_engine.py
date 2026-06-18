@@ -1723,9 +1723,14 @@ class LMCacheEngine:
         last_failed_block_start = None
         for location, blocks in block_mapping.items():
             keys = [key for key, _, _ in blocks]
+            # Absolute chunk index per key, for MaruBackend's 'prefix' pin policy.
+            positions = [
+                start // self.token_database.chunk_size for _, start, _ in blocks
+            ]
             memory_objs = self.storage_manager.batched_get(
                 keys=keys,
                 location=location,
+                positions=positions,
             )
 
             used_keys: set[CacheEngineKey] = set()

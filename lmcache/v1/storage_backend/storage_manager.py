@@ -480,13 +480,22 @@ class StorageManager:
         self,
         keys: List[CacheEngineKey],
         location: Optional[str] = None,
+        positions: Optional[List[int]] = None,
     ) -> List[Optional[MemoryObj]]:
         """
         Blocking function to get the memory objects from the storages.
+
+        ``positions`` (optional) is the per-key absolute chunk index, forwarded
+        only to MaruBackend for its 'prefix' pin policy; other backends ignore it.
         """
         # TODO (ApostaC): remove the nested optional here
         for backend_name, storage_backend in self.get_active_storage_backends(location):
-            memory_objs = storage_backend.batched_get_blocking(keys)
+            if backend_name == "MaruBackend":
+                memory_objs = storage_backend.batched_get_blocking(
+                    keys, positions=positions
+                )
+            else:
+                memory_objs = storage_backend.batched_get_blocking(keys)
             if memory_objs:
                 # Align with single-key `get()` logic:
                 # auto-write remote data to local CPU cache
