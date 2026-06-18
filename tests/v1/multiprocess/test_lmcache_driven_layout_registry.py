@@ -72,6 +72,8 @@ def test_unregister_one_shared_gpu_layout_keeps_registry_until_last_instance(
     ctx = MagicMock()
     ctx.chunk_size = 16
     ctx.layout_desc_registry = LayoutDescRegistry()
+    # Default (non-maru) backend: skip the maru-only CXL pool bring-up.
+    ctx.storage_manager.is_maru = False
 
     def fake_create_cache_context(
         kv_caches: object,

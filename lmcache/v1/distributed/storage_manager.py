@@ -713,6 +713,16 @@ class StorageManager:
         """
         return self._quota_manager
 
+    @property
+    def is_maru(self) -> bool:
+        """True when the L1 backend is maru.
+
+        Exposed so the engine modules can gate maru-only setup (e.g. the
+        CXL pool bring-up via ``register_kv_layout``) without touching the
+        default-backend path.
+        """
+        return self._is_maru
+
     def get_l2_usages(
         self,
     ) -> list[tuple[int | float, dict[str, object]]]:

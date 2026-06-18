@@ -674,18 +674,24 @@ class LMCacheDrivenTransferModule(InstanceLivenessTarget):
         self._ctx.layout_desc_registry.register(model_name, world_size, layout_desc)
 
         # Bring up the maru CXL pool on first registration: the maru L1 backend
-        # types its allocator from the KV layout here. No-op for default DRAM /
-        # GDS backends. Only object group 0's layout is forwarded, so the maru
-        # backend (single-object-group only) rejects num_object_groups > 1.
-        num_object_groups = cache_context.kv_layer_groups_manager.num_object_groups
-        fmt = MemoryFormat.KV_MLA_FMT if cache_context.is_mla else MemoryFormat.KV_2LTD
-        self._ctx.storage_manager.register_kv_layout(
-            layout_desc.shapes,
-            layout_desc.dtypes,
-            fmt,
-            self._ctx.chunk_size,
-            num_object_groups,
-        )
+        # types its allocator from the KV layout here. Gated on the maru backend
+        # so the default DRAM / GDS path is untouched. Only object group 0's
+        # layout is forwarded, so maru (single-object-group only) rejects
+        # num_object_groups > 1.
+        if self._ctx.storage_manager.is_maru:
+            num_object_groups = cache_context.kv_layer_groups_manager.num_object_groups
+            fmt = (
+                MemoryFormat.KV_MLA_FMT
+                if cache_context.is_mla
+                else MemoryFormat.KV_2LTD
+            )
+            self._ctx.storage_manager.register_kv_layout(
+                layout_desc.shapes,
+                layout_desc.dtypes,
+                fmt,
+                self._ctx.chunk_size,
+                num_object_groups,
+            )
 
         with self._lock:
             self._cache_contexts[instance_id] = ContextEntry(
