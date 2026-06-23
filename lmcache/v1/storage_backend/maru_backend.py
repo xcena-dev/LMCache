@@ -4,6 +4,7 @@
 from concurrent.futures import Future
 from typing import Any, Callable, List, Optional, Sequence, Union
 import asyncio
+import os
 import threading
 import time
 
@@ -89,6 +90,22 @@ class MaruBackend(AllocatorBackendInterface):
         # 4. State
         self.put_lock = threading.Lock()
         self.put_tasks: set[CacheEngineKey] = set()
+
+        # 5. Lookahead prefetch (record-order -> prefetch the batch k ahead).
+        # 0 = disabled (current reactive behavior). Relies on a replayed
+        # retrieve-batch order (e.g. the cache_hit pass of repeat_count>=2):
+        # batches are matched by their exact key sequence.
+        self._lookahead_depth: int = int(
+            os.environ.get("MARU_GAIA_LOOKAHEAD_DEPTH", "0")
+        )
+        self._lookahead_lock = threading.Lock()
+        self._seen_order: list[list[str]] = []
+        self._batch_index: dict[tuple[str, ...], int] = {}
+        if self._lookahead_depth > 0:
+            logger.info(
+                "[Maru] lookahead prefetch enabled (MARU_GAIA_LOOKAHEAD_DEPTH=%d)",
+                self._lookahead_depth,
+            )
 
     def __str__(self) -> str:
         return self.__class__.__name__
@@ -478,6 +495,43 @@ class MaruBackend(AllocatorBackendInterface):
         )
         return memory_obj
 
+    def _lookahead_prefetch(self, key_strs: list[str]) -> None:
+        """Record the retrieve-batch order and, on a replayed order, prefetch
+        the batch ``MARU_GAIA_LOOKAHEAD_DEPTH`` positions ahead.
+
+        The first time a batch (identified by its exact key sequence) is seen
+        it is only recorded. When the same batch is seen again — e.g. the
+        cache_hit pass of a ``repeat_count>=2`` benchmark — the batch that is
+        ``depth`` positions later in the recorded order is prefetched via
+        ``MaruHandler.prefetch_batch`` so it is warm in CXL DRAM by the time it
+        is retrieved. No-op when the depth is 0 or the batch is empty.
+
+        Args:
+            key_strs: The string keys of the batch currently being retrieved.
+        """
+        depth = self._lookahead_depth
+        if depth <= 0 or not key_strs:
+            return
+        sig = tuple(key_strs)
+        target_keys: Optional[list[str]] = None
+        with self._lookahead_lock:
+            idx = self._batch_index.get(sig)
+            if idx is None:
+                # First sighting — recording pass; nothing to prefetch yet.
+                self._batch_index[sig] = len(self._seen_order)
+                self._seen_order.append(key_strs)
+                return
+            target = idx + depth
+            if 0 <= target < len(self._seen_order):
+                target_keys = self._seen_order[target]
+        if target_keys is not None:
+            try:
+                self._handler.prefetch_batch(target_keys)
+            except Exception:
+                logger.warning(
+                    "[Maru] lookahead prefetch_batch failed", exc_info=True
+                )
+
     def batched_get_blocking(
         self,
         keys: List[CacheEngineKey],
@@ -494,6 +548,9 @@ class MaruBackend(AllocatorBackendInterface):
             keys = [k.with_new_worker_id(0) for k in keys]
 
         key_strs = [k.to_string() for k in keys]
+        # Lookahead: prefetch the batch k ahead before reading the current one,
+        # so it fills CXL DRAM during this request's read/decode window.
+        self._lookahead_prefetch(key_strs)
         mem_infos = self._handler.batch_retrieve(key_strs)
 
         allocator = self.memory_allocator
@@ -573,6 +630,8 @@ class MaruBackend(AllocatorBackendInterface):
                 actual_keys = list(keys)
 
             key_strs = [k.to_string() for k in actual_keys]
+            # Lookahead: prefetch the batch k ahead before the current read.
+            self._lookahead_prefetch(key_strs)
             mem_infos = self._handler.batch_retrieve(key_strs)
 
             allocator = self.memory_allocator
