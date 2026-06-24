@@ -107,6 +107,19 @@ class MaruBackend(AllocatorBackendInterface):
                 self._lookahead_depth,
             )
 
+        # 6. Lookup-time prefetch (issue Gaia prefetch at the admission-stage
+        # lookup, not only at retrieve). The request's admission wait then
+        # doubles as the SSD->CXL fill window, so a later retrieve reads warm
+        # CXL DRAM instead of racing the fill. Independent of lookahead depth;
+        # 0 = off (reactive). See design note 20260623_lookup-time-prefetch.
+        self._prefetch_on_lookup: bool = (
+            os.environ.get("MARU_GAIA_PREFETCH_ON_LOOKUP", "0") == "1"
+        )
+        if self._prefetch_on_lookup:
+            logger.info(
+                "[Maru] lookup-time prefetch enabled (MARU_GAIA_PREFETCH_ON_LOOKUP=1)"
+            )
+
     def __str__(self) -> str:
         return self.__class__.__name__
 
@@ -528,9 +541,34 @@ class MaruBackend(AllocatorBackendInterface):
             try:
                 self._handler.prefetch_batch(target_keys)
             except Exception:
-                logger.warning(
-                    "[Maru] lookahead prefetch_batch failed", exc_info=True
-                )
+                logger.warning("[Maru] lookahead prefetch_batch failed", exc_info=True)
+
+    def _lookup_prefetch(self, keys: List[CacheEngineKey], num_hit: int) -> None:
+        """Issue a Gaia prefetch for the hit prefix at the lookup stage.
+
+        Called from ``batched_async_contains`` (the scheduler's admission-time
+        lookup). Firing the prefetch here -- rather than only inside
+        ``batch_retrieve`` -- lets the request's admission wait double as the
+        SSD->CXL fill window, so the later retrieve reads warm CXL DRAM instead
+        of racing the fill. Keys are transformed identically to the retrieve
+        path so the prefetched regions match the eventual read. No-op when
+        lookup-time prefetch is disabled or nothing hit.
+
+        Args:
+            keys: The looked-up keys in prefix order.
+            num_hit: Number of contiguous prefix keys that exist (from the
+                contains check); only this prefix is prefetched.
+        """
+        if not self._prefetch_on_lookup or num_hit <= 0:
+            return
+        hit_keys = keys[:num_hit]
+        if self._mla_worker_id_as0_mode:
+            hit_keys = [k.with_new_worker_id(0) for k in hit_keys]
+        key_strs = [k.to_string() for k in hit_keys]
+        try:
+            self._handler.prefetch_batch(key_strs)
+        except Exception:
+            logger.warning("[Maru] lookup-time prefetch_batch failed", exc_info=True)
 
     def batched_get_blocking(
         self,
@@ -590,7 +628,10 @@ class MaruBackend(AllocatorBackendInterface):
         """Check how many prefix keys exist via single batch_exists RPC.
 
         Returns the count of contiguous keys starting from index 0
-        that exist. Stops at first miss.
+        that exist. Stops at first miss. When ``MARU_GAIA_PREFETCH_ON_LOOKUP``
+        is enabled and the prefix hits, also issues a Gaia prefetch for the
+        hit keys here (admission stage) so they fill CXL DRAM during the
+        request's admission wait -- see ``_lookup_prefetch``.
 
         Args:
             lookup_id: Unique request identifier.
@@ -600,7 +641,10 @@ class MaruBackend(AllocatorBackendInterface):
         Returns:
             Number of prefix-contiguous keys that exist.
         """
-        return await asyncio.to_thread(self.batched_contains, keys, pin)
+        num_hit = await asyncio.to_thread(self.batched_contains, keys, pin)
+        if self._prefetch_on_lookup and num_hit > 0:
+            await asyncio.to_thread(self._lookup_prefetch, keys, num_hit)
+        return num_hit
 
     async def batched_get_non_blocking(
         self,
