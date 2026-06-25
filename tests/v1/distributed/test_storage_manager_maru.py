@@ -121,7 +121,9 @@ class TestStorageManagerMaruInit:
             assert mgr._l2_eviction_controller is None
             assert mgr._store_controller is None
             assert mgr._prefetch_controller is None
-            assert mgr._l2_adapters == []
+            # ``_l2_adapters`` is a dict keyed by adapter_id since the dev
+            # L2 add/delete refactor; maru keeps it empty.
+            assert mgr._l2_adapters == {}
         finally:
             mgr.close()
 

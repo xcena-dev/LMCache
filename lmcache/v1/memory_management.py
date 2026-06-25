@@ -77,6 +77,14 @@ class MemoryFormat(Enum):
     """[num_tokens, hidden_dim]
     """
 
+    # Hidden-state store (HS) tensor format. Same logical shape as EC_TD
+    # ([num_tokens, hidden_dim]) but tagged separately so the allocator and
+    # any future mp/serialization paths can distinguish encoder-cache entries
+    # from hidden-state entries.
+    HS_TD = auto()
+    """[num_tokens, hidden_dim]
+    """
+
     def token_dim(self) -> int:
         if self == MemoryFormat.KV_2LTD:
             return 2
@@ -91,6 +99,8 @@ class MemoryFormat(Enum):
         elif self == MemoryFormat.KV_MLA_FMT:
             return 2
         elif self == MemoryFormat.EC_TD:
+            return 0
+        elif self == MemoryFormat.HS_TD:
             return 0
         return 0
 
@@ -1806,15 +1816,15 @@ class TensorMemoryAllocator(MemoryAllocatorInterface):
         """
         clear = True
         logger.info("Checking memory allocator consistency")
-        logger.info(f" - Total active allocations: {self.num_active_allocations}")
+        logger.info(" - Total active allocations: %d", self.num_active_allocations)
         logger.info(
-            f" - Total allocated size: "
-            f"{self.address_manager.total_allocated_size / 1048576} MB"
+            " - Total allocated size: %f MB",
+            self.address_manager.total_allocated_size / 1048576,
         )
 
         # Check the real total free size
         total_free_size = self.address_manager.get_free_size()
-        logger.info(f" - Total free size: {total_free_size / 1048576} MB")
+        logger.info(" - Total free size: %f MB", total_free_size / 1048576)
 
         # Check if the numbers are consistent
         if (
@@ -2100,14 +2110,14 @@ class PagedTensorMemoryAllocator(MemoryAllocatorInterface):
         """
 
         logger.info("Checking memory allocator consistency")
-        logger.info(f" - Total active allocations: {self.num_active_allocations}")
+        logger.info(" - Total active allocations: %d", self.num_active_allocations)
         logger.info(
-            f" - Total allocated size: {self.total_allocated_size / 1048576} MB"
+            " - Total allocated size: %f MB", self.total_allocated_size / 1048576
         )
 
         # Check the real total free size
         total_free_size = len(self.free_blocks) * self.align_bytes
-        logger.info(f" - Total free size: {total_free_size / 1048576} MB")
+        logger.info(" - Total free size: %f MB", total_free_size / 1048576)
 
         # Check if the numbers are consistent
         if total_free_size + self.total_allocated_size != self.buffer.numel():
@@ -2434,6 +2444,7 @@ class MixedMemoryAllocator(MemoryAllocatorInterface):
             MemoryFormat.KV_T2D,
             MemoryFormat.KV_MLA_FMT,
             MemoryFormat.EC_TD,
+            MemoryFormat.HS_TD,
         ]:
             with self.host_mem_lock:
                 obj = self.pin_allocator.allocate(shapes, dtypes, fmt, str(self))
@@ -2462,6 +2473,7 @@ class MixedMemoryAllocator(MemoryAllocatorInterface):
             MemoryFormat.KV_T2D,
             MemoryFormat.KV_MLA_FMT,
             MemoryFormat.EC_TD,
+            MemoryFormat.HS_TD,
         ]:
             with self.host_mem_lock:
                 objs = self.pin_allocator.batched_allocate(
@@ -2486,6 +2498,7 @@ class MixedMemoryAllocator(MemoryAllocatorInterface):
             MemoryFormat.KV_T2D,
             MemoryFormat.KV_MLA_FMT,
             MemoryFormat.EC_TD,
+            MemoryFormat.HS_TD,
         ]:
             with self.host_mem_lock:
                 self.pin_allocator.free(memory_obj)
@@ -2512,6 +2525,7 @@ class MixedMemoryAllocator(MemoryAllocatorInterface):
             MemoryFormat.KV_T2D,
             MemoryFormat.KV_MLA_FMT,
             MemoryFormat.EC_TD,
+            MemoryFormat.HS_TD,
         ]:
             with self.host_mem_lock:
                 self.pin_allocator.batched_free(memory_objs)
