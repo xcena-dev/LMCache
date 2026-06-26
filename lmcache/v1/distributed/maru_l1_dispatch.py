@@ -27,7 +27,9 @@ guarded by a separate lock here.
 from __future__ import annotations
 
 # Standard
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, Optional
+import os
+import threading
 
 # First Party
 from lmcache.logging import init_logger
@@ -92,6 +94,23 @@ class MaruL1Dispatcher:
         # the store-failure leak caveat; the count is surfaced in report_status.
         self._pending_write_memobjs: dict[ObjectKey, MemoryObj] = {}
 
+        # Lookahead prefetch (record-order -> prefetch the batch k ahead).
+        # 0 = disabled (current reactive behavior). Relies on a replayed
+        # retrieve-batch order (e.g. the cache_hit pass of repeat_count>=2):
+        # batches are matched by their exact key sequence. MP maru-L1 path
+        # mirror of MaruBackend._lookahead_prefetch (single-process).
+        self._lookahead_depth: int = int(
+            os.environ.get("MARU_GAIA_LOOKAHEAD_DEPTH", "0")
+        )
+        self._lookahead_lock = threading.Lock()
+        self._seen_order: list[list[str]] = []
+        self._batch_index: dict[tuple[str, ...], int] = {}
+        if self._lookahead_depth > 0:
+            logger.info(
+                "[Maru] L1 lookahead prefetch enabled (MARU_GAIA_LOOKAHEAD_DEPTH=%d)",
+                self._lookahead_depth,
+            )
+
     @property
     def handler(self) -> Any:
         """The connected ``MaruHandler``.
@@ -107,6 +126,43 @@ class MaruL1Dispatcher:
     # ------------------------------------------------------------------
     # Read path
     # ------------------------------------------------------------------
+
+    def _lookahead_prefetch(self, key_strs: list[str]) -> None:
+        """Record the retrieve-batch order and, on a replayed order, prefetch
+        the batch ``MARU_GAIA_LOOKAHEAD_DEPTH`` positions ahead.
+
+        First sighting of a batch (by its exact key sequence) is only
+        recorded. When the same batch is seen again -- e.g. the cache_hit
+        pass of a ``repeat_count>=2`` benchmark -- the batch ``depth``
+        positions later in the recorded order is prefetched via
+        ``MaruHandler.prefetch_batch`` so it is warm in CXL DRAM by the time
+        it is retrieved. No-op when depth is 0 or the batch is empty.
+
+        Args:
+            key_strs: The string keys of the batch currently being retrieved.
+        """
+        depth = self._lookahead_depth
+        if depth <= 0 or not key_strs:
+            return
+        sig = tuple(key_strs)
+        target_keys: Optional[list[str]] = None
+        with self._lookahead_lock:
+            idx = self._batch_index.get(sig)
+            if idx is None:
+                # First sighting -- recording pass; nothing to prefetch yet.
+                self._batch_index[sig] = len(self._seen_order)
+                self._seen_order.append(key_strs)
+                return
+            target = idx + depth
+            if 0 <= target < len(self._seen_order):
+                target_keys = self._seen_order[target]
+        if target_keys is not None:
+            try:
+                self.handler.prefetch_batch(target_keys)
+            except Exception:
+                logger.warning(
+                    "[Maru] L1 lookahead prefetch_batch failed", exc_info=True
+                )
 
     def reserve_read(self, keys: list[ObjectKey]) -> dict[ObjectKey, L1OperationResult]:
         """Pin + retrieve + stage MemoryObjs in the side channel.
@@ -125,6 +181,7 @@ class MaruL1Dispatcher:
         """
         handler = self.handler
         key_strs = [object_key_to_string(k) for k in keys]
+        self._lookahead_prefetch(key_strs)
         try:
             pin_results = handler.batch_pin(key_strs)
         except Exception:
