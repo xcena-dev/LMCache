@@ -317,12 +317,21 @@ class LookupModule:
         )
         obj_keys = self._chunk_major_object_keys(key, chunk_hashes)
 
+        # Absolute chunk index (prompt position) per key, for the maru/GAIA
+        # "prefix" pin policy. lookup hashes from token 0, so chunk index i is
+        # prompt chunk i. obj_keys is chunk-major (see _chunk_major_object_keys):
+        # each chunk occupies a contiguous block of num_groups * num_ranks keys,
+        # so the block size is len(obj_keys) // len(chunk_hashes).
+        block = len(obj_keys) // len(chunk_hashes) if chunk_hashes else 1
+        positions = [i // block for i in range(len(obj_keys))]
+
         handle = self._ctx.storage_manager.submit_prefetch_task(
             obj_keys,
             layout_desc,
             extra_count=extra_count,
             external_request_id=key.request_id,
             attn_desc=attn_desc,
+            positions=positions,
         )
         self._register_prefetch_job(
             _PrefetchJob(

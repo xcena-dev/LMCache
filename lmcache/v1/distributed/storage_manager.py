@@ -426,6 +426,7 @@ class StorageManager:
         policy: TrimPolicy = TrimPolicy.PREFIX,
         attn_desc: AttnWindowDesc = DEFAULT_ATTN_WINDOW_DESC,
         skip_l2: bool = False,
+        positions: list[int] | None = None,
     ) -> PrefetchHandle:
         """Prefetch objects into L1 asynchronously.
 
@@ -443,6 +444,11 @@ class StorageManager:
             attn_desc: Cross-chunk attention windows of all object groups, in
                 object-group order.
             skip_l2: If True, only check L1 and return without submitting to L2.
+            positions: ``positions[i]`` is the absolute chunk index (prompt
+                position) of ``keys[i]``; forwarded to the L1 reserve_read so
+                the maru/GAIA "prefix" pin policy admits only the first N
+                chunks.  ``None`` lets the handler fall back to the enumerate
+                index.
 
         Returns:
             PrefetchHandle to track the task.
@@ -450,7 +456,9 @@ class StorageManager:
         # NOTE: now we only have L1, so the prefetch is essentially checking how many
         # objects are already in L1, and adding read locks to them.
 
-        l1_read_result = self._l1_manager.reserve_read(keys, extra_count=extra_count)
+        l1_read_result = self._l1_manager.reserve_read(
+            keys, extra_count=extra_count, positions=positions
+        )
 
         if policy is TrimPolicy.SPARSE:
             # SPARSE: retain a read lock on every L1 hit (not just the leading

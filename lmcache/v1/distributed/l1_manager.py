@@ -317,6 +317,7 @@ class L1Manager:
         self,
         keys: list[ObjectKey],
         extra_count: int = 0,
+        positions: list[int] | None = None,
     ) -> dict[ObjectKey, L1OperationResult]:
         """Reserve read access for the given keys.
 
@@ -328,6 +329,11 @@ class L1Manager:
                 key = 1 + extra_count.  Useful when multiple
                 workers each consume one read lock for the
                 same key (e.g. MLA models with TP > 1).
+            positions: ``positions[i]`` is the absolute chunk
+                index (prompt position) of ``keys[i]``; only used
+                by the maru dispatch path to drive the GAIA
+                "prefix" pin policy.  ``None`` lets the handler
+                fall back to the enumerate index.
 
         Returns:
             A dictionary mapping each object key to a tuple
@@ -339,7 +345,7 @@ class L1Manager:
                 readable.
         """
         if self._maru_dispatcher is not None:
-            return self._maru_dispatcher.reserve_read(keys)
+            return self._maru_dispatcher.reserve_read(keys, positions=positions)
 
         extra_count = _validate_extra_count(extra_count)
         total = 1 + extra_count

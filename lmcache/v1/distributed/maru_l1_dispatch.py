@@ -108,7 +108,11 @@ class MaruL1Dispatcher:
     # Read path
     # ------------------------------------------------------------------
 
-    def reserve_read(self, keys: list[ObjectKey]) -> dict[ObjectKey, L1OperationResult]:
+    def reserve_read(
+        self,
+        keys: list[ObjectKey],
+        positions: list[int] | None = None,
+    ) -> dict[ObjectKey, L1OperationResult]:
         """Pin + retrieve + stage MemoryObjs in the side channel.
 
         ``MaruHandler.batch_pin`` has prefix-stop semantics — it only
@@ -122,6 +126,18 @@ class MaruL1Dispatcher:
         If a pinned key cannot be resolved (race between pin and
         retrieve), we unpin the unused tail to keep MaruServer's
         ``pin_count`` accurate.
+
+        Args:
+            keys: The object keys to pin and retrieve.
+            positions: ``positions[i]`` is the absolute chunk index
+                (prompt position) of ``keys[i]``; forwarded to
+                ``batch_retrieve`` so the GAIA "prefix" pin policy admits
+                only the first N chunks. ``None`` lets the handler fall
+                back to the enumerate index.
+
+        Returns:
+            A dictionary mapping each object key to a tuple of
+            (L1Error, Optional[MemoryObj]).
         """
         handler = self.handler
         key_strs = [object_key_to_string(k) for k in keys]
@@ -144,7 +160,10 @@ class MaruL1Dispatcher:
             return ret
 
         try:
-            mem_infos = handler.batch_retrieve(key_strs[:num_pinned])
+            mem_infos = handler.batch_retrieve(
+                key_strs[:num_pinned],
+                positions=(positions[:num_pinned] if positions is not None else None),
+            )
         except Exception:
             logger.exception(
                 "MaruHandler.batch_retrieve failed for %d keys", num_pinned
