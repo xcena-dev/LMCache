@@ -597,6 +597,12 @@ class LMCacheMPSchedulerAdapter:
             legacy_block_size,
             mq_timeout,
         )
+        # Back-compat: vLLM's bundled LMCacheMPConnector (older than LMCache
+        # PR #3248) passes a single server_url *string* positionally. Without
+        # this, list("tcp://host:port") explodes into characters and connect()
+        # gets addr='t'. Wrap a lone string into a one-element list.
+        if isinstance(server_urls, str):
+            server_urls = [server_urls]
         assert len(server_urls) >= 1, "At least one server url required"
         self._server_urls: list[str] = list(server_urls)
         self.mq_clients: dict[str, MessageQueueClient] = {
