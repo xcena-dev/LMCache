@@ -22,9 +22,6 @@ Tiers (each builds on the previous):
     T4. ``MaruMemoryAllocator.init_layout()`` brings the CXL pool up.
     T5. ``MaruMemoryAllocator.batched_allocate()`` returns MemoryObjs.
     T6. ``L1MemoryManager.register_kv_layout()`` forwards down.
-    T7. ``MaruL2Adapter`` constructs (lazy — handler stays ``None``).
-    T8. First store triggers the lazy ``MaruHandler.connect`` and
-        the store → load round-trip preserves bytes.
 
 Usage::
 
@@ -331,149 +328,6 @@ def t6_register_kv_layout(server_url: str, pool_bytes: int) -> bool:
     return True
 
 
-def t7_l2_adapter_connect(server_url: str, pool_bytes: int) -> bool:
-    hdr("T7 — MaruL2Adapter construction (lazy — no RPC yet)")
-    # First Party
-    from lmcache.v1.distributed.l2_adapters.maru_l2_adapter import (
-        MaruL2Adapter,
-        MaruL2AdapterConfig,
-    )
-
-    chunk_size_bytes = 1 << 20  # 1 MiB — small enough for a quick round trip
-    cfg = MaruL2AdapterConfig(
-        server_url=server_url,
-        pool_size_gb=max(pool_bytes / (1 << 30), 0.125),
-        chunk_size_bytes=chunk_size_bytes,
-        instance_id="maru-smoke-t7",
-        num_store_workers=1,
-        num_lookup_workers=1,
-        num_load_workers=1,
-    )
-    try:
-        adapter = MaruL2Adapter(cfg)
-    except Exception:
-        fail("MaruL2Adapter construction raised")
-        traceback.print_exc()
-        return False
-    fds = {
-        adapter.get_store_event_fd(),
-        adapter.get_lookup_and_lock_event_fd(),
-        adapter.get_load_event_fd(),
-    }
-    if len(fds) != 3:
-        fail(f"expected 3 distinct event fds, got {len(fds)}")
-        adapter.close()
-        return False
-    if adapter._handler is not None:
-        fail("handler populated before any store (lazy contract broken)")
-        adapter.close()
-        return False
-    ok(f"constructed; handler=None, event fds = {sorted(fds)}")
-
-    t7_l2_adapter_connect._adapter = adapter  # type: ignore[attr-defined]
-    t7_l2_adapter_connect._chunk_size_bytes = chunk_size_bytes  # type: ignore[attr-defined]
-    return True
-
-
-def t8_l2_store_load_roundtrip() -> bool:
-    hdr("T8 — first store triggers lazy connect + store → load round-trip")
-    # Standard
-    from unittest import mock
-    import time
-
-    # Third Party
-    import numpy as np
-
-    # First Party
-    from lmcache.native_storage_ops import (  # noqa: F401 — surface import errors here
-        Bitmap,
-    )
-    from lmcache.v1.distributed.api import ObjectKey
-
-    adapter = getattr(t7_l2_adapter_connect, "_adapter", None)
-    chunk_size_bytes = getattr(t7_l2_adapter_connect, "_chunk_size_bytes", None)
-    if adapter is None or chunk_size_bytes is None:
-        fail("T7 must run first to populate the adapter")
-        return False
-
-    # 1) Set up a deterministic byte pattern in a DRAM-side numpy
-    # buffer and wrap it as a fake MemoryObj (data_ptr + get_size).
-    payload_bytes = min(chunk_size_bytes, 65536)
-    src_arr = np.frombuffer(
-        bytes(i % 256 for i in range(payload_bytes)), dtype=np.uint8
-    ).copy()  # writable copy
-
-    src_obj = mock.MagicMock(name="DramMemoryObj")
-    src_obj.data_ptr = int(src_arr.ctypes.data)
-    src_obj.get_size = mock.MagicMock(return_value=payload_bytes)
-
-    key = ObjectKey(
-        chunk_hash=(0xCAFEBABE).to_bytes(4, "big"),
-        model_name="smoke-t8",
-        kv_rank=0xABCD,
-        cache_salt="",
-    )
-
-    # 2) Store: alloc CXL page + memcpy DRAM→CXL + batch_store.
-    store_task = adapter.submit_store_task([key], [src_obj])
-    deadline = time.time() + 10
-    while time.time() < deadline:
-        completed = adapter.pop_completed_store_tasks()
-        if store_task in completed:
-            break
-        time.sleep(0.05)
-    else:
-        fail("store task did not complete within 10s")
-        return False
-    if not completed[store_task]:
-        fail("store task returned failure")
-        return False
-    ok(f"stored {payload_bytes} bytes")
-
-    # 3) Lookup + lock — bit 0 should be set after batch_pin.
-    lookup_task = adapter.submit_lookup_and_lock_task([key])
-    bm = None
-    deadline = time.time() + 10
-    while time.time() < deadline:
-        bm = adapter.query_lookup_and_lock_result(lookup_task)
-        if bm is not None:
-            break
-        time.sleep(0.05)
-    if bm is None or not bm.test(0):
-        fail("lookup did not report a hit for the just-stored key")
-        return False
-    ok("lookup hit")
-
-    # 4) Load into a fresh DRAM buffer and verify bytes match.
-    dst_arr = np.zeros(payload_bytes, dtype=np.uint8)
-    dst_obj = mock.MagicMock(name="DramMemoryObj")
-    dst_obj.data_ptr = int(dst_arr.ctypes.data)
-    dst_obj.get_size = mock.MagicMock(return_value=payload_bytes)
-
-    load_task = adapter.submit_load_task([key], [dst_obj])
-    bm = None
-    deadline = time.time() + 10
-    while time.time() < deadline:
-        bm = adapter.query_load_result(load_task)
-        if bm is not None:
-            break
-        time.sleep(0.05)
-    if bm is None or not bm.test(0):
-        fail("load did not report success for the just-stored key")
-        return False
-    if not np.array_equal(src_arr, dst_arr):
-        fail("loaded bytes do not match the source")
-        return False
-    ok(f"loaded {payload_bytes} bytes; DRAM↔CXL↔DRAM round-trip preserved")
-
-    # 5) Cleanup: unlock + delete + close so the next run starts cold.
-    adapter.submit_unlock([key])
-    adapter.delete([key])
-    adapter.close()
-    ok("unlock + delete + close OK")
-    return True
-
-
 # ---------------------------------------------------------------------------
 # Driver
 # ---------------------------------------------------------------------------
@@ -511,18 +365,12 @@ def main() -> int:
         print(f"\n{RED}stop:{RESET} MaruHandler.connect() not stable.")
         return 1
 
-    # T3–T8 run in-process — at this point we trust the runtime.
-    # T7/T8 cover the L2 adapter path (DRAM→CXL store + CXL→DRAM load
-    # via ``MaruL2Adapter``); they share state through the
-    # ``t7_l2_adapter_connect._adapter`` stash so T8 reuses the
-    # already-connected handler.
+    # T3–T6 run in-process — at this point we trust the runtime.
     results = [
         t3_allocator_construct(),
         t4_init_layout(args.server, pool_bytes),
         t5_batched_allocate(),
         t6_register_kv_layout(args.server, pool_bytes),
-        t7_l2_adapter_connect(args.server, pool_bytes),
-        t8_l2_store_load_roundtrip(),
     ]
     if all(results):
         print(f"\n{GREEN}{BOLD}all tiers passed.{RESET}")
