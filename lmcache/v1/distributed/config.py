@@ -608,20 +608,26 @@ def parse_args_to_config(
             instance_id=args.maru_instance_id,
         )
 
-    # ``shm_name`` is only forwarded when explicitly set so the field's
-    # default factory (per-PID name) is preserved otherwise.
-    memory_config_kwargs: dict[str, Any] = dict(
-        size_in_bytes=int(args.l1_size_gb * (1 << 30)),
-        use_lazy=args.l1_use_lazy,
-        init_size_in_bytes=int(args.l1_init_size_gb * (1 << 30)),
-        align_bytes=args.l1_align_bytes,
-        maru_config=maru_config,
-        devdax_path=args.l1_devdax_path,
-    )
     shm_name = getattr(args, "shm_name", None)
-    if shm_name is not None:
-        memory_config_kwargs["shm_name"] = shm_name
-    memory_config = L1MemoryManagerConfig(**memory_config_kwargs)
+    if shm_name is None:
+        memory_config = L1MemoryManagerConfig(
+            size_in_bytes=int(args.l1_size_gb * (1 << 30)),
+            use_lazy=args.l1_use_lazy,
+            init_size_in_bytes=int(args.l1_init_size_gb * (1 << 30)),
+            align_bytes=args.l1_align_bytes,
+            maru_config=maru_config,
+            devdax_path=args.l1_devdax_path,
+        )
+    else:
+        memory_config = L1MemoryManagerConfig(
+            size_in_bytes=int(args.l1_size_gb * (1 << 30)),
+            use_lazy=args.l1_use_lazy,
+            init_size_in_bytes=int(args.l1_init_size_gb * (1 << 30)),
+            align_bytes=args.l1_align_bytes,
+            shm_name=shm_name,
+            maru_config=maru_config,
+            devdax_path=args.l1_devdax_path,
+        )
 
     gds_l1_config: GdsL1Config | None = None
     if getattr(args, "gds_l1_path", None):
