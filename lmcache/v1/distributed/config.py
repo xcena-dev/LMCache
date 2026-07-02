@@ -6,7 +6,7 @@ Configuration for distributed storage manager
 
 # Standard
 from dataclasses import dataclass, field
-from typing import Any, Literal, cast
+from typing import TYPE_CHECKING, Any, Literal, Optional, cast
 import argparse
 import os
 
@@ -20,6 +20,10 @@ from lmcache.v1.distributed.l2_adapters.config import (
     get_type_name_for_config,
     parse_args_to_l2_adapters_config,
 )
+
+if TYPE_CHECKING:
+    # First Party
+    from lmcache.v1.distributed.maru_memory_allocator import MaruL1Config
 
 logger = init_logger(__name__)
 
@@ -108,16 +112,22 @@ class L1MemoryManagerConfig:
     """
 
     size_in_bytes: int
-    """ The size of L1 memory in bytes. """
+    """ The size of L1 memory in bytes. (Ignored when ``maru_config`` is set.) """
 
     use_lazy: bool
-    """ Whether to use lazy initialization for L1 memory. """
+    """ Whether to use lazy initialization for L1 memory.
+    (Ignored when ``maru_config`` is set.) """
 
     init_size_in_bytes: int = field(default=20 << 30)
     """ The initial size when using lazy allocation. Default is 20GB. """
 
     align_bytes: int = field(default=0x1000)
     """ The alignment size in bytes. Default is 4KB. """
+
+    maru_config: Optional["MaruL1Config"] = None
+    """ Optional Maru backend config. When set, the L1 allocator is
+    constructed as ``MaruMemoryAllocator`` (CXL-backed) and the DRAM
+    fields above are ignored. """
 
     shm_name: str = field(default_factory=lambda: f"lmcache_l1_pool_{os.getpid()}")
     """ POSIX shared-memory segment name for L1 pool. Empty disables SHM. """
@@ -129,7 +139,9 @@ class L1MemoryManagerConfig:
     """ Optional Device-DAX overflow size for hybrid DRAM + DAX L1. """
 
     def __post_init__(self):
-        self.init_size_in_bytes = min(self.init_size_in_bytes, self.size_in_bytes)
+        # The DRAM init-size clamp only makes sense for default backends.
+        if self.maru_config is None:
+            self.init_size_in_bytes = min(self.init_size_in_bytes, self.size_in_bytes)
 
         if self.devdax_path is not None:
             self.devdax_path = self.devdax_path.strip()
@@ -399,6 +411,38 @@ def add_storage_manager_args(
         ),
     )
 
+    # Maru L1 backend (optional). When --maru-server-url is set, the
+    # L1 allocator becomes CXL-backed and the DRAM L1 settings above
+    # (--l1-size-gb / --l1-use-lazy / --l1-init-size-gb) are ignored.
+    # Pass ``--l1-size-gb 0`` in that case to satisfy the required flag.
+    maru_group = parser.add_argument_group(
+        "Maru L1 Backend",
+        "Optional CXL-backed L1 via Maru. Overrides DRAM L1 settings.",
+    )
+    maru_group.add_argument(
+        "--maru-server-url",
+        type=str,
+        default=None,
+        help="MaruServer endpoint (e.g. maru://host:port or tcp://host:port). "
+        "When set, the L1 allocator is CXL-backed and the DRAM L1 settings "
+        "(--l1-size-gb, --l1-use-lazy, --l1-init-size-gb) are ignored.",
+    )
+    maru_group.add_argument(
+        "--maru-pool-size-gb",
+        type=float,
+        default=0.0,
+        help="CXL pool size to request from MaruServer (GB). "
+        "Required when --maru-server-url is set.",
+    )
+    maru_group.add_argument(
+        "--maru-instance-id",
+        type=str,
+        default=None,
+        help="Stable client identifier reported to MaruServer for ownership "
+        "tracking and restart recovery. Auto-generated if omitted "
+        "(acceptable for single-node setups; recommended for multi-node).",
+    )
+
     # GDS L1 tier (optional, opt-in via --gds-l1-path)
     gds_group = parser.add_argument_group(
         "GDS L1 tier",
@@ -549,6 +593,21 @@ def parse_args_to_config(
     Returns:
         StorageManagerConfig: The configuration object.
     """
+    maru_config: Optional["MaruL1Config"] = None
+    if args.maru_server_url is not None:
+        if args.maru_pool_size_gb <= 0:
+            raise ValueError(
+                "--maru-pool-size-gb must be positive when --maru-server-url is set"
+            )
+        # First Party
+        from lmcache.v1.distributed.maru_memory_allocator import MaruL1Config
+
+        maru_config = MaruL1Config(
+            server_url=args.maru_server_url,
+            pool_size_bytes=int(args.maru_pool_size_gb * (1 << 30)),
+            instance_id=args.maru_instance_id,
+        )
+
     shm_name = getattr(args, "shm_name", None)
     if shm_name is None:
         memory_config = L1MemoryManagerConfig(
@@ -556,6 +615,7 @@ def parse_args_to_config(
             use_lazy=args.l1_use_lazy,
             init_size_in_bytes=int(args.l1_init_size_gb * (1 << 30)),
             align_bytes=args.l1_align_bytes,
+            maru_config=maru_config,
             devdax_path=args.l1_devdax_path,
         )
     else:
@@ -565,6 +625,7 @@ def parse_args_to_config(
             init_size_in_bytes=int(args.l1_init_size_gb * (1 << 30)),
             align_bytes=args.l1_align_bytes,
             shm_name=shm_name,
+            maru_config=maru_config,
             devdax_path=args.l1_devdax_path,
         )
 

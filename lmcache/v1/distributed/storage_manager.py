@@ -9,6 +9,9 @@ from typing import Iterator, Literal, Optional
 import threading
 import time
 
+# Third Party
+import torch
+
 # First Party
 from lmcache.logging import init_logger
 from lmcache.native_storage_ops import Bitmap, PeriodicEventNotifier
@@ -25,6 +28,10 @@ from lmcache.v1.distributed.config import EvictionConfig, StorageManagerConfig
 from lmcache.v1.distributed.error import L1Error, strerror
 from lmcache.v1.distributed.internal_api import L1MemoryDesc, L2AdapterListener
 from lmcache.v1.distributed.l1_manager import L1Manager
+from lmcache.v1.distributed.l1_protocol import (
+    L1ManagerInterface,
+    MaruL1ManagerInterface,
+)
 from lmcache.v1.distributed.l2_adapters import create_l2_adapter
 from lmcache.v1.distributed.l2_adapters.base import L2AdapterInterface
 from lmcache.v1.distributed.l2_adapters.config import L2AdapterConfigBase
@@ -33,6 +40,7 @@ from lmcache.v1.distributed.l2_adapters.reconfiguration import (
     L2ReconfigureError,
 )
 from lmcache.v1.distributed.l2_adapters.serde_wrapper import SerdeL2AdapterWrapper
+from lmcache.v1.distributed.maru_l1_manager import MaruL1Manager
 from lmcache.v1.distributed.quota_manager import QuotaManager
 from lmcache.v1.distributed.serde import create_serde_processor
 from lmcache.v1.distributed.storage_controllers import (
@@ -49,7 +57,7 @@ from lmcache.v1.distributed.storage_controllers.store_policy import (
     AdapterDescriptor,
     create_store_policy,
 )
-from lmcache.v1.memory_management import MemoryObj
+from lmcache.v1.memory_management import MemoryFormat, MemoryObj
 from lmcache.v1.mp_observability.errors import LMCacheTimeoutError
 from lmcache.v1.mp_observability.event import Event, EventType
 from lmcache.v1.mp_observability.event_bus import get_event_bus
@@ -66,8 +74,54 @@ logger = init_logger(__name__)
 
 class StorageManager:
     def __init__(self, config: StorageManagerConfig):
-        self._l1_manager = L1Manager(config.l1_manager_config)
+        # PR1 parity: one branch selects the L1 manager. ``L1Manager`` and
+        # its maru sibling ``MaruL1Manager`` both satisfy the structural
+        # ``L1ManagerInterface`` (control-plane seam, see l1_protocol.py),
+        # so everything downstream types against that one interface.
+        self._l1_manager: L1ManagerInterface
+        if config.l1_manager_config.memory_config.maru_config is not None:
+            self._l1_manager = MaruL1Manager(config.l1_manager_config)
+        else:
+            self._l1_manager = L1Manager(config.l1_manager_config)
         self._event_bus = get_event_bus()
+
+        # Per-cache_salt quota registry. Always present so the HTTP
+        # layer has a stable ``quota_manager`` reference; populated
+        # below for the default-backend path.
+        self._quota_manager = QuotaManager()
+
+        # PR1 parity: maru bypasses the L2 controller stack; removed when
+        # L2 tiering lands (PR3). ``L2EvictionController`` /
+        # ``StoreController`` / ``PrefetchController`` / ``L1EvictionController``
+        # are not instantiated and no L2 adapters are created (the CXL pool
+        # is the shared L1 tier, owned by MaruServer).
+        self._is_maru: bool = (
+            config.l1_manager_config.memory_config.maru_config is not None
+        )
+        # Adapter-registry state. Initialized for BOTH backends so the L2
+        # lifecycle/query helpers are safe even in maru mode, where the
+        # registry stays empty. ``_l1_memory_desc`` is assigned in the
+        # default-backend path below (maru's ``get_l1_memory_desc()``
+        # returns ``None`` and is not used while the L2 stack is bypassed).
+        self._next_adapter_id = 0
+        # Serializes add_l2_adapter / delete_l2_adapter against each other.
+        self._lifecycle_lock = threading.Lock()
+        # Guards the _l2_adapters and _adapter_descriptors dicts.
+        self._adapters_lock = threading.Lock()
+        self._registered_l2_listeners: list[L2AdapterListener] = []
+        self._l2_adapters: dict[int, L2AdapterInterface] = {}
+        self._adapter_descriptors: dict[int, AdapterDescriptor] = {}
+        self._eviction_controller: Optional[L1EvictionController] = None
+        self._l2_eviction_controller: Optional[L2EvictionController] = None
+        self._store_controller: Optional[StoreController] = None
+        self._prefetch_controller: Optional[PrefetchController] = None
+        if self._is_maru:
+            return
+
+        # Past this point the backend is the default ``L1Manager`` (the maru
+        # sibling returned above). Narrow the type so the controllers, which
+        # take a concrete ``L1Manager``, type-check without a shared base.
+        assert isinstance(self._l1_manager, L1Manager)
 
         # L1 eviction controller
         self._eviction_controller = L1EvictionController(
@@ -81,14 +135,6 @@ class StorageManager:
         # ``SerdeL2AdapterWrapper`` so controllers see a plain L2 adapter
         # and serde is transparent.
         self._l1_memory_desc = self._l1_manager.get_l1_memory_desc()
-        self._next_adapter_id = 0
-        # Serializes add_l2_adapter / delete_l2_adapter against each other.
-        self._lifecycle_lock = threading.Lock()
-        # Guards the _l2_adapters and _adapter_descriptors dicts.
-        self._adapters_lock = threading.Lock()
-        self._registered_l2_listeners: list[L2AdapterListener] = []
-        self._l2_adapters: dict[int, L2AdapterInterface] = {}
-        self._adapter_descriptors: dict[int, AdapterDescriptor] = {}
         for ac in config.l2_adapter_config.adapters:
             adapter_id, adapter, descriptor = self._build_l2_adapter(ac)
             self._l2_adapters[adapter_id] = adapter
@@ -99,14 +145,9 @@ class StorageManager:
             use_eventfd=HAS_EVENTFD,
         )
 
-        # Per-cache_salt quota registry. Shared across the L2 eviction
-        # controller (reads quotas each cycle) and the HTTP quota
-        # endpoints (CRUD). Present even when no adapter uses
-        # IsolatedLRU so the HTTP layer has a stable ``quota_manager``
-        # reference. No explicit cleanup on close — the registry is
-        # just a dict protected by a lock and has no OS resources.
-        self._quota_manager = QuotaManager()
-
+        # NOTE: ``self._quota_manager`` is initialized earlier (before the maru
+        # early-return) so the HTTP layer always has a stable reference; do not
+        # re-create it here.
         # Unified L2 eviction controller for all adapters with eviction
         # config. Aggregate-usage policies (``LRU``, ``noop``) need
         # ``max_capacity_bytes > 0`` to compute a usage fraction;
@@ -436,6 +477,7 @@ class StorageManager:
             # Warm path: load all keys, pin none. skip_l2 makes it a no-op.
             prefetch_request_id = -1
             if not skip_l2 and keys and self._l2_adapters:
+                assert self._prefetch_controller is not None
                 prefetch_request_id = self._prefetch_controller.submit_prefetch_request(
                     keys,
                     layout_desc,
@@ -489,6 +531,10 @@ class StorageManager:
 
             prefetch_request_id = -1
             if remaining_keys and self._has_l2_adapters():
+                # Non-empty L2 registry implies a non-maru server, where the
+                # controller is always constructed (maru mode skips L2 setup
+                # via the early return in ``__init__``).
+                assert self._prefetch_controller is not None
                 prefetch_request_id = self._prefetch_controller.submit_prefetch_request(
                     remaining_keys,
                     layout_desc,
@@ -555,6 +601,9 @@ class StorageManager:
         prefetch_request_id = -1
         l2_orig_indices: tuple[int, ...] = ()
         if remaining_keys and self._has_l2_adapters():
+            # In maru mode the L2 registry is empty, so we never enter this
+            # branch and the controller stays ``None``.
+            assert self._prefetch_controller is not None
             prefetch_request_id = self._prefetch_controller.submit_prefetch_request(
                 remaining_keys,
                 layout_desc,
@@ -639,6 +688,10 @@ class StorageManager:
             # No L2 request: the L1 prefix hit count is final.
             return l1_hits
 
+        # Have L2 request, need to check the status from prefetch
+        # controller. A non-(-1) request id implies the controller
+        # was constructed (maru mode never submits requests).
+        assert self._prefetch_controller is not None
         l2_r = self._prefetch_controller.query_lookup_result(handle.prefetch_request_id)
         if l2_r is None:
             # Still in progress, or already consumed by query_prefetch_status.
@@ -669,6 +722,9 @@ class StorageManager:
         """
         if handle.prefetch_request_id == -1:
             return True
+        # A non-(-1) request id implies a default-backend server where the
+        # controller is always constructed (maru never submits L2 prefetch).
+        assert self._prefetch_controller is not None
         return self._prefetch_controller.wait_prefetch_result(
             handle.prefetch_request_id, timeout
         )
@@ -690,6 +746,7 @@ class StorageManager:
         """
         l2_r: Bitmap | None = None
         if handle.prefetch_request_id != -1:
+            assert self._prefetch_controller is not None
             l2_r = self._prefetch_controller.query_prefetch_result(
                 handle.prefetch_request_id
             )
@@ -754,6 +811,16 @@ class StorageManager:
         storage manager creates the registry at construction time.
         """
         return self._quota_manager
+
+    @property
+    def is_maru(self) -> bool:
+        """True when the L1 backend is maru.
+
+        Exposed so the engine modules can gate maru-only setup (e.g. the
+        CXL pool bring-up via ``register_kv_layout``) without touching the
+        default-backend path.
+        """
+        return self._is_maru
 
     @property
     def l1_memory_desc(self) -> L1MemoryDesc:
@@ -878,6 +945,11 @@ class StorageManager:
             The stable id assigned to the new adapter.
         """
         with self._lifecycle_lock:
+            # Runtime adapter management is a default-backend-only path; the
+            # controllers are always constructed there (maru skips them).
+            assert self._store_controller is not None
+            assert self._prefetch_controller is not None
+            assert self._l2_eviction_controller is not None
             adapter_id, adapter, descriptor = self._build_l2_adapter(config)
             for listener in self._registered_l2_listeners:
                 adapter.register_listener(listener)
@@ -920,6 +992,11 @@ class StorageManager:
             if adapter_id not in self._l2_adapters:
                 raise ValueError(f"No L2 adapter with id {adapter_id}")
 
+            # Default-backend-only path; controllers are always constructed
+            # there (maru skips them).
+            assert self._store_controller is not None
+            assert self._prefetch_controller is not None
+            assert self._l2_eviction_controller is not None
             deadline = time.monotonic() + timeout
             store_done = self._store_controller.request_remove_adapter(adapter_id)
             prefetch_done = self._prefetch_controller.request_remove_adapter(adapter_id)
@@ -966,14 +1043,62 @@ class StorageManager:
         """
         self._l1_manager.clear(force=force)
 
+    def register_kv_layout(
+        self,
+        shapes: list[torch.Size],
+        dtypes: list[torch.dtype],
+        fmt: MemoryFormat,
+        chunk_size_in_tokens: int,
+        num_object_groups: int,
+    ) -> None:
+        """Bind the KV layout to the underlying allocator.
+
+        Called from the engine once a vLLM worker exposes its KV cache
+        tensors. Only the maru backend acts on the call (its
+        ``CxlMemoryAdapter`` pool is typed at first registration); default
+        backends have no ``register_kv_layout`` and are skipped.
+
+        Args:
+            shapes: KV chunk shapes (per-layer-group).
+            dtypes: KV chunk dtypes aligned with ``shapes``.
+            fmt: Memory format.
+            chunk_size_in_tokens: LMCache chunk size in tokens.
+            num_object_groups: Number of object groups in the model's KV
+                layout. Only ``shapes``/``dtypes`` for object group 0 are
+                forwarded, so the maru backend (single-object-group only)
+                rejects models with more than one.
+
+        Raises:
+            ValueError: If the maru backend is active and
+                ``num_object_groups > 1`` (unsupported layout).
+        """
+        if not self._is_maru:
+            # Default backends are layout-agnostic; nothing to bind.
+            return
+        if num_object_groups > 1:
+            raise ValueError(
+                "maru L1 backend supports a single object group only, got "
+                f"num_object_groups={num_object_groups}"
+            )
+        # ``register_kv_layout`` is maru-only (see ``MaruL1ManagerInterface``);
+        # narrow from the base control-plane interface. Always true in the
+        # maru branch.
+        assert isinstance(self._l1_manager, MaruL1ManagerInterface)
+        self._l1_manager.register_kv_layout(shapes, dtypes, fmt, chunk_size_in_tokens)
+
     def close(self):
         """
         Close the storage manager and release all resources.
         """
-        self._prefetch_controller.stop()
-        self._store_controller.stop()
-        self._eviction_controller.stop()
-        self._l2_eviction_controller.stop()
+        # Maru mode leaves controllers as ``None`` (see __init__).
+        if self._prefetch_controller is not None:
+            self._prefetch_controller.stop()
+        if self._store_controller is not None:
+            self._store_controller.stop()
+        if self._eviction_controller is not None:
+            self._eviction_controller.stop()
+        if self._l2_eviction_controller is not None:
+            self._l2_eviction_controller.stop()
 
         PeriodicEventNotifier.shutdown()
 
@@ -983,8 +1108,25 @@ class StorageManager:
         self._l1_manager.close()
 
     def report_status(self) -> dict:
-        """Return a status dict aggregating all sub-component statuses."""
+        """Return a status dict aggregating all sub-component statuses.
+
+        In maru mode the controller / L2-adapter entries are absent;
+        only ``l1_manager`` and ``num_l2_adapters=0`` are reported.
+        """
         l1 = self._l1_manager.report_status()
+        if self._is_maru:
+            return {
+                "is_healthy": l1["is_healthy"],
+                "l1_manager": l1,
+                "l2_adapters": [],
+                "num_l2_adapters": 0,
+                "backend": "maru",
+            }
+
+        assert self._store_controller is not None
+        assert self._prefetch_controller is not None
+        assert self._eviction_controller is not None
+        assert self._l2_eviction_controller is not None
         store = self._store_controller.report_status()
         prefetch = self._prefetch_controller.report_status()
         l1_eviction = self._eviction_controller.report_status()
@@ -1065,6 +1207,9 @@ class StorageManager:
         self._next_adapter_id += 1
         adapter: L2AdapterInterface = create_l2_adapter(config, self._l1_memory_desc)
         if config.serde_config is not None:
+            # L2 adapters are only built on the default-backend path where
+            # ``_l1_manager`` is a concrete ``L1Manager`` (maru bypasses L2).
+            assert isinstance(self._l1_manager, L1Manager)
             adapter = SerdeL2AdapterWrapper(
                 inner=adapter,
                 serde=create_serde_processor(config.serde_config),
