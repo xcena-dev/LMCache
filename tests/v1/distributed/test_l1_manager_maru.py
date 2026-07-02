@@ -45,6 +45,7 @@ try:
     # First Party
     from lmcache.v1.distributed.maru_l1_dispatch import (
         MaruL1Dispatcher,
+        _PendingRead,
         object_key_to_string,
     )
     from lmcache.v1.distributed.maru_l1_manager import MaruL1Manager
@@ -150,6 +151,21 @@ def _mk_key(idx: int = 0, salt: str = "") -> ObjectKey:
         kv_rank=0xABCD,
         cache_salt=salt,
     )
+
+
+def _seed_read(dispatcher, key, mem_obj=None, refcount=1):
+    """Stage a read entry the way ``reserve_read`` would, with a refcount.
+
+    The read side channel now holds :class:`_PendingRead` tuples rather
+    than bare ``MemoryObj``s, so tests that poke it directly build one
+    through this helper.
+    """
+    if mem_obj is None:
+        mem_obj = mock.MagicMock()
+    dispatcher._pending_read_memobjs[key] = _PendingRead(
+        mem_obj=mem_obj, refcount=refcount
+    )
+    return mem_obj
 
 
 # =========================================================================
@@ -358,7 +374,9 @@ class TestMaruReserveRead:
             err, returned = ret[k]
             assert err is L1Error.SUCCESS
             assert returned is obj
-            assert maru_mgr._dispatcher._pending_read_memobjs[k] is obj
+            entry = maru_mgr._dispatcher._pending_read_memobjs[k]
+            assert entry.mem_obj is obj
+            assert entry.refcount == 1
 
     def test_prefix_miss(self, maru_mgr, maru_handler, maru_adapter):
         """``batch_pin`` reports prefix-stop: only k0, k1 are pinned."""
@@ -463,7 +481,7 @@ class TestMaruUnsafeRead:
         keys = [_mk_key(i) for i in range(2)]
         fake_objs = [mock.MagicMock(name=f"obj-{i}") for i in range(2)]
         for k, obj in zip(keys, fake_objs, strict=False):
-            maru_mgr._dispatcher._pending_read_memobjs[k] = obj
+            _seed_read(maru_mgr._dispatcher, k, mem_obj=obj)
 
         ret = maru_mgr.unsafe_read(keys)
 
@@ -474,7 +492,7 @@ class TestMaruUnsafeRead:
 
     def test_missing_key_returns_not_exist(self, maru_mgr):
         keys = [_mk_key(0), _mk_key(1)]
-        maru_mgr._dispatcher._pending_read_memobjs[keys[0]] = mock.MagicMock()
+        _seed_read(maru_mgr._dispatcher, keys[0])
 
         ret = maru_mgr.unsafe_read(keys)
 
@@ -486,7 +504,7 @@ class TestMaruFinishRead:
     def test_pops_side_channel_and_unpins(self, maru_mgr, maru_handler):
         keys = [_mk_key(i) for i in range(2)]
         for k in keys:
-            maru_mgr._dispatcher._pending_read_memobjs[k] = mock.MagicMock()
+            _seed_read(maru_mgr._dispatcher, k)
 
         ret = maru_mgr.finish_read(keys)
 
@@ -507,7 +525,7 @@ class TestMaruFinishRead:
 
     def test_unpin_exception_does_not_propagate(self, maru_mgr, maru_handler):
         keys = [_mk_key(0)]
-        maru_mgr._dispatcher._pending_read_memobjs[keys[0]] = mock.MagicMock()
+        _seed_read(maru_mgr._dispatcher, keys[0])
         maru_handler.batch_unpin.side_effect = RuntimeError("rpc fail")
 
         # Should not raise; side channel is still cleared.
@@ -547,29 +565,46 @@ class TestMaruDelete:
 
 class TestMaruClear:
     def test_clear_drops_side_channel_only(self, maru_mgr, maru_handler):
-        maru_mgr._dispatcher._pending_read_memobjs[_mk_key(0)] = mock.MagicMock()
-        maru_mgr._dispatcher._pending_read_memobjs[_mk_key(1)] = mock.MagicMock()
+        _seed_read(maru_mgr._dispatcher, _mk_key(0))
+        _seed_read(maru_mgr._dispatcher, _mk_key(1))
 
         maru_mgr.clear()
 
         assert maru_mgr._dispatcher._pending_read_memobjs == {}
-        # Server-side state is untouched.
+        # Stored data is untouched: clear balances pins, never deletes.
         maru_handler.delete.assert_not_called()
 
     def test_force_clear_also_drops_only_side_channel(self, maru_mgr, maru_handler):
-        maru_mgr._dispatcher._pending_read_memobjs[_mk_key(0)] = mock.MagicMock()
+        _seed_read(maru_mgr._dispatcher, _mk_key(0))
 
         maru_mgr.clear(force=True)
 
         assert maru_mgr._dispatcher._pending_read_memobjs == {}
         maru_handler.delete.assert_not_called()
 
+    def test_clear_unpins_once_per_remaining_refcount(self, maru_mgr, maru_handler):
+        # A key staged with refcount=3 (three overlapping reads dropped
+        # without finish_read) must be unpinned three times so MaruServer's
+        # pin_count balances, not once per key.
+        k0 = _mk_key(0)
+        k1 = _mk_key(1)
+        _seed_read(maru_mgr._dispatcher, k0, refcount=3)
+        _seed_read(maru_mgr._dispatcher, k1, refcount=1)
+
+        maru_mgr.clear(force=True)
+
+        assert maru_mgr._dispatcher._pending_read_memobjs == {}
+        maru_handler.batch_unpin.assert_called_once()
+        (unpinned,) = maru_handler.batch_unpin.call_args.args
+        assert unpinned.count(object_key_to_string(k0)) == 3
+        assert unpinned.count(object_key_to_string(k1)) == 1
+        assert len(unpinned) == 4
+
 
 class TestMaruFinishWriteAndReserveRead:
     def test_resolves_from_side_channel(self, maru_mgr):
         k = _mk_key(0)
-        fake_obj = mock.MagicMock()
-        maru_mgr._dispatcher._pending_read_memobjs[k] = fake_obj
+        fake_obj = _seed_read(maru_mgr._dispatcher, k)
         ret = maru_mgr.finish_write_and_reserve_read([k])
         err, returned = ret[k]
         assert err is L1Error.SUCCESS
@@ -607,7 +642,7 @@ class TestMaruParityMethods:
         # consistent answer.
         assert maru_mgr.is_key_evictable(_mk_key(0)) is True
         # Also for a key that happens to be in the side channel.
-        maru_mgr._dispatcher._pending_read_memobjs[_mk_key(1)] = mock.MagicMock()
+        _seed_read(maru_mgr._dispatcher, _mk_key(1))
         assert maru_mgr.is_key_evictable(_mk_key(1)) is True
 
     def test_memcheck_returns_true(self, maru_mgr):
@@ -629,7 +664,7 @@ class TestMaruParityMethods:
 
 class TestMaruReportStatus:
     def test_shape(self, maru_mgr):
-        maru_mgr._dispatcher._pending_read_memobjs[_mk_key(0)] = mock.MagicMock()
+        _seed_read(maru_mgr._dispatcher, _mk_key(0))
         # Memory manager get_memory_usage is exercised elsewhere; here we
         # only verify the maru-mode dict shape.
         maru_mgr._memory_manager = mock.MagicMock()
@@ -649,7 +684,7 @@ class TestMaruReportStatus:
 
 class TestMaruClose:
     def test_close_clears_side_channel(self, maru_mgr):
-        maru_mgr._dispatcher._pending_read_memobjs[_mk_key(0)] = mock.MagicMock()
+        _seed_read(maru_mgr._dispatcher, _mk_key(0))
         maru_mgr._memory_manager = mock.MagicMock()
         maru_mgr._dispatcher._memory_manager = maru_mgr._memory_manager
 
@@ -657,6 +692,147 @@ class TestMaruClose:
 
         assert maru_mgr._dispatcher._pending_read_memobjs == {}
         maru_mgr._memory_manager.close.assert_called_once()
+
+
+# =========================================================================
+# (8) E7 regression: multi-reader refcount on the read side channel
+# =========================================================================
+
+
+class TestMaruMultiReaderRefcount:
+    """Overlapping reads of the SAME key must each pin remotely and each
+    unpin remotely, sharing one staged ``MemoryObj`` (E7 defect).
+
+    Before the fix the read side channel was single-slot per key: two
+    overlapping reserve_reads pinned twice remotely but the second staging
+    overwrote the slot, so the first finish_read popped it and unpinned
+    once while the second found nothing -> only 1 unpin for 2 pins ->
+    remote pin_count stuck > 0 forever.
+    """
+
+    @staticmethod
+    def _configure_single_key_hit(maru_handler, maru_adapter, objs):
+        """Make each ``reserve_read`` of one key hit, handing out ``objs``
+        (one per successive ``get_by_location`` call)."""
+        maru_handler.batch_pin.return_value = [True]
+        maru_handler.batch_retrieve.return_value = [_FakeMemInfo(0, 0, b"x" * 32)]
+        maru_adapter.get_by_location.side_effect = list(objs)
+
+    def test_double_reserve_pins_twice_shares_one_memobj(
+        self, maru_mgr, maru_handler, maru_adapter
+    ):
+        key = _mk_key(0)
+        obj1 = mock.MagicMock(name="obj1")
+        obj2 = mock.MagicMock(name="obj2")
+        self._configure_single_key_hit(maru_handler, maru_adapter, [obj1, obj2])
+
+        r1 = maru_mgr.reserve_read([key])
+        r2 = maru_mgr.reserve_read([key])
+
+        # Each reserve_read issued its own remote pin (N reserves == N pins).
+        assert maru_handler.batch_pin.call_count == 2
+        # Both reserves return the SAME staged MemoryObj (the first one);
+        # the second materialised view (obj2) is discarded.
+        assert r1[key] == (L1Error.SUCCESS, obj1)
+        assert r2[key] == (L1Error.SUCCESS, obj1)
+        entry = maru_mgr._dispatcher._pending_read_memobjs[key]
+        assert entry.mem_obj is obj1
+        assert entry.refcount == 2
+
+    def test_two_finishes_two_unpins_channel_empty_only_after_second(
+        self, maru_mgr, maru_handler, maru_adapter
+    ):
+        key = _mk_key(0)
+        obj1 = mock.MagicMock(name="obj1")
+        obj2 = mock.MagicMock(name="obj2")
+        self._configure_single_key_hit(maru_handler, maru_adapter, [obj1, obj2])
+        maru_mgr.reserve_read([key])
+        maru_mgr.reserve_read([key])
+
+        # First finish: one unpin, still staged (refcount drops 2 -> 1).
+        f1 = maru_mgr.finish_read([key])
+        assert f1[key] is L1Error.SUCCESS
+        assert key in maru_mgr._dispatcher._pending_read_memobjs
+        assert maru_mgr._dispatcher._pending_read_memobjs[key].refcount == 1
+        assert maru_handler.batch_unpin.call_count == 1
+
+        # unsafe_read BETWEEN the two finishes still returns the object.
+        ur = maru_mgr.unsafe_read([key])
+        assert ur[key] == (L1Error.SUCCESS, obj1)
+
+        # Second finish: second unpin, channel now empty.
+        f2 = maru_mgr.finish_read([key])
+        assert f2[key] is L1Error.SUCCESS
+        assert key not in maru_mgr._dispatcher._pending_read_memobjs
+        assert maru_handler.batch_unpin.call_count == 2
+
+    def test_pin_unpin_balance_end_to_end(self, maru_mgr, maru_handler, maru_adapter):
+        # The whole point: total remote pins == total remote unpins.
+        key = _mk_key(0)
+        self._configure_single_key_hit(
+            maru_handler, maru_adapter, [mock.MagicMock(), mock.MagicMock()]
+        )
+        maru_mgr.reserve_read([key])
+        maru_mgr.reserve_read([key])
+        maru_mgr.finish_read([key])
+        maru_mgr.finish_read([key])
+
+        pins = sum(len(c.args[0]) for c in maru_handler.batch_pin.call_args_list)
+        unpins = sum(len(c.args[0]) for c in maru_handler.batch_unpin.call_args_list)
+        assert pins == unpins == 2
+        assert maru_mgr._dispatcher._pending_read_memobjs == {}
+
+
+class TestMaruReadThreadSafety:
+    """Smoke test: concurrent reserve_read/finish_read loops on overlapping
+    keys must leave the side channel empty and pins balanced by unpins.
+
+    The manager lock serialises every side-channel touch, so the mock
+    handler is never called from two threads at once and its call counts
+    are reliable.
+    """
+
+    def test_concurrent_reserve_finish_balances(
+        self, maru_mgr, maru_handler, maru_adapter
+    ):
+        # Standard
+        import threading
+
+        keys = [_mk_key(i) for i in range(3)]
+        maru_handler.batch_pin.side_effect = lambda ks: [True] * len(ks)
+        maru_handler.batch_retrieve.side_effect = lambda ks: [
+            _FakeMemInfo(0, 0, b"x" * 32) for _ in ks
+        ]
+        maru_adapter.get_by_location.side_effect = lambda **kw: mock.MagicMock()
+
+        iterations = 200
+        num_threads = 2
+        errors: list[Exception] = []
+
+        def worker() -> None:
+            try:
+                for _ in range(iterations):
+                    for k in keys:
+                        maru_mgr.reserve_read([k])
+                    for k in keys:
+                        maru_mgr.finish_read([k])
+            except Exception as exc:  # pragma: no cover - failure path
+                errors.append(exc)
+
+        threads = [threading.Thread(target=worker) for _ in range(num_threads)]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join()
+
+        assert not errors
+        # Every staged read was finished: side channel fully drained.
+        assert maru_mgr._dispatcher._pending_read_memobjs == {}
+        # Every remote pin was balanced by exactly one remote unpin.
+        pins = sum(len(c.args[0]) for c in maru_handler.batch_pin.call_args_list)
+        unpins = sum(len(c.args[0]) for c in maru_handler.batch_unpin.call_args_list)
+        assert pins == unpins
+        assert pins == num_threads * iterations * len(keys)
 
 
 # =========================================================================

@@ -15,18 +15,23 @@ The dispatcher owns:
   drive allocation and by :meth:`report_status` to read usage stats.
 - ``_pending_read_memobjs`` side channel — populated in
   :meth:`reserve_read` and drained by :meth:`unsafe_read` /
-  :meth:`finish_read`.
+  :meth:`finish_read`. Each entry is a :class:`_PendingRead` carrying
+  the staged ``MemoryObj`` plus a ``refcount``, so overlapping reads of
+  the SAME key share one staged object (same CXL page) while each still
+  balances its own remote pin with exactly one remote unpin.
 
-Thread safety: the dispatcher assumes the caller holds the
-``L1Manager`` lock (the public methods on L1Manager are wrapped with
-``@l1_mgr_synchronized``). The side-channel dict is therefore not
-guarded by a separate lock here.
+Thread safety: the dispatcher holds no lock of its own. Its owner,
+:class:`~lmcache.v1.distributed.maru_l1_manager.MaruL1Manager`, provides
+a ``threading.Lock`` and serialises every public method that touches
+these side channels (the maru sibling of ``@l1_mgr_synchronized``), so
+all dispatcher state is only ever accessed under that lock.
 """
 
 # Future
 from __future__ import annotations
 
 # Standard
+from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any
 
 # First Party
@@ -42,6 +47,28 @@ if TYPE_CHECKING:
     from lmcache.v1.distributed.memory_manager import L1MemoryManager
 
 logger = init_logger(__name__)
+
+
+@dataclass
+class _PendingRead:
+    """A staged read entry with an outstanding-pin reference count.
+
+    Overlapping ``reserve_read`` calls for the SAME key each perform their
+    own remote pin (correct: N reserves == N remote pins) but share a
+    single staged ``MemoryObj`` (they all resolve to the same CXL page).
+    ``refcount`` tracks how many ``finish_read`` calls are still
+    outstanding; :meth:`MaruL1Dispatcher.finish_read` issues one remote
+    unpin per call and drops the entry only when the count reaches zero,
+    so N finishes == N unpins and the remote ``pin_count`` always
+    balances.
+
+    Attributes:
+        mem_obj: The staged ``MemoryObj`` resolving the CXL page.
+        refcount: Number of outstanding remote pins not yet unpinned.
+    """
+
+    mem_obj: MemoryObj
+    refcount: int
 
 
 def object_key_to_string(key: ObjectKey) -> str:
@@ -85,7 +112,7 @@ class MaruL1Dispatcher:
         self._memory_manager = memory_manager
         self._write_ttl_seconds = write_ttl_seconds
         self._read_ttl_seconds = read_ttl_seconds
-        self._pending_read_memobjs: dict[ObjectKey, MemoryObj] = {}
+        self._pending_read_memobjs: dict[ObjectKey, _PendingRead] = {}
         # Write-side channel: reserve_write stashes reserved MemoryObjs here so
         # the keys-only finish_write drain can recover them (mirrors
         # _pending_read_memobjs). finish_write pops them. See reserve_write for
@@ -119,9 +146,20 @@ class MaruL1Dispatcher:
         ``self._pending_read_memobjs`` so the subsequent
         ``unsafe_read`` can return it.
 
+        Every successful ``reserve_read`` of a key performs its own
+        remote pin (N reserves == N remote pins, matched by N unpins in
+        :meth:`finish_read`). When a key is already staged by an
+        overlapping read, the staged :class:`_PendingRead` has its
+        ``refcount`` incremented and the existing ``MemoryObj`` is kept
+        (same CXL page); the freshly materialised view is discarded
+        (``get_by_location`` allocates no pool slot and ``free`` is a
+        no-op, so there is no local leak).
+
         If a pinned key cannot be resolved (race between pin and
         retrieve), we unpin the unused tail to keep MaruServer's
-        ``pin_count`` accurate.
+        ``pin_count`` accurate. The manager strips ``extra_count`` before
+        delegating here — maru does no TP per-key read-lock counting (a
+        documented delta from :class:`L1Manager`).
         """
         handler = self.handler
         key_strs = [object_key_to_string(k) for k in keys]
@@ -172,8 +210,19 @@ class MaruL1Dispatcher:
             )
             if mem_obj is None:
                 break
-            self._pending_read_memobjs[k] = mem_obj
-            ret[k] = (L1Error.SUCCESS, mem_obj)
+            staged = self._pending_read_memobjs.get(k)
+            if staged is not None:
+                # Already staged by an overlapping reserve_read: this call
+                # issued its own remote pin, so bump the refcount and keep
+                # the existing staged MemoryObj (same CXL page). Discard the
+                # freshly materialised view (no pool slot, free() no-op).
+                staged.refcount += 1
+                ret[k] = (L1Error.SUCCESS, staged.mem_obj)
+            else:
+                self._pending_read_memobjs[k] = _PendingRead(
+                    mem_obj=mem_obj, refcount=1
+                )
+                ret[k] = (L1Error.SUCCESS, mem_obj)
             resolved += 1
 
         if resolved < num_pinned:
@@ -188,25 +237,43 @@ class MaruL1Dispatcher:
         return ret
 
     def unsafe_read(self, keys: list[ObjectKey]) -> dict[ObjectKey, L1OperationResult]:
-        """Look up MemoryObjs staged by :meth:`reserve_read`."""
+        """Look up MemoryObjs staged by :meth:`reserve_read`.
+
+        Returns the staged ``MemoryObj`` regardless of its refcount, so a
+        read issued between two overlapping :meth:`finish_read` calls still
+        resolves as long as at least one pin remains outstanding.
+        """
         ret: dict[ObjectKey, L1OperationResult] = {}
         for k in keys:
-            mem_obj = self._pending_read_memobjs.get(k)
-            if mem_obj is None:
+            entry = self._pending_read_memobjs.get(k)
+            if entry is None:
                 ret[k] = (L1Error.KEY_NOT_EXIST, None)
             else:
-                ret[k] = (L1Error.SUCCESS, mem_obj)
+                ret[k] = (L1Error.SUCCESS, entry.mem_obj)
         return ret
 
     def finish_read(self, keys: list[ObjectKey]) -> dict[ObjectKey, L1Error]:
-        """Drop side-channel entries and ``batch_unpin``."""
+        """Decrement staged refcounts and ``batch_unpin`` once per key.
+
+        Each ``finish_read`` of a staged key issues exactly one remote
+        unpin, balancing the one remote pin its matching ``reserve_read``
+        performed (N reserves -> N pins -> N finishes -> N unpins). The
+        staged :class:`_PendingRead` is dropped only when its refcount
+        reaches zero, so an overlapping reader still sees the object until
+        the last finish. Keys that are not staged report ``KEY_NOT_EXIST``
+        and are not unpinned (preserving the original miss behaviour).
+        """
         handler = self.handler
 
         ret: dict[ObjectKey, L1Error] = {}
         to_unpin: list[str] = []
         for k in keys:
-            if self._pending_read_memobjs.pop(k, None) is not None:
+            entry = self._pending_read_memobjs.get(k)
+            if entry is not None:
+                entry.refcount -= 1
                 to_unpin.append(object_key_to_string(k))
+                if entry.refcount <= 0:
+                    del self._pending_read_memobjs[k]
                 ret[k] = L1Error.SUCCESS
             else:
                 ret[k] = L1Error.KEY_NOT_EXIST
@@ -364,11 +431,11 @@ class MaruL1Dispatcher:
         """
         ret: dict[ObjectKey, L1OperationResult] = {}
         for k in keys:
-            mem_obj = self._pending_read_memobjs.get(k)
-            if mem_obj is None:
+            entry = self._pending_read_memobjs.get(k)
+            if entry is None:
                 ret[k] = (L1Error.KEY_NOT_EXIST, None)
             else:
-                ret[k] = (L1Error.SUCCESS, mem_obj)
+                ret[k] = (L1Error.SUCCESS, entry.mem_obj)
         return ret
 
     # ------------------------------------------------------------------
@@ -398,21 +465,42 @@ class MaruL1Dispatcher:
         return ret
 
     def clear(self, force: bool) -> None:
-        """Drop staged side-channel entries only.
+        """Drop staged side-channel entries, balancing remote pins.
 
-        The CXL pool itself is owned by ``MaruServer`` and is never
-        wiped by the L1 layer — ``force=True`` only affects the
-        in-process read-side bookkeeping. Server-side wipes go
-        through explicit ``MaruHandler.delete`` calls or MaruServer's
-        own lifecycle.
+        Each staged read holds ``refcount`` outstanding remote pins, so
+        before dropping the read side channel we ``batch_unpin`` once per
+        remaining refcount (not once per key) to keep MaruServer's
+        ``pin_count`` balanced when reads are force-dropped rather than
+        completed through :meth:`finish_read`. This releases pins only —
+        the CXL pool and the stored KV data are owned by ``MaruServer``
+        and are never wiped by the L1 layer (data deletion goes through
+        explicit ``MaruHandler.delete``). ``force`` only controls logging;
+        both side channels are always cleared.
         """
+        to_unpin: list[str] = []
+        for k, entry in self._pending_read_memobjs.items():
+            to_unpin.extend([object_key_to_string(k)] * entry.refcount)
+
         if force:
             logger.warning(
-                "L1Manager (maru): force-clear drops %d pending read + %d "
-                "pending write MemoryObjs but does NOT touch MaruServer.",
+                "L1Manager (maru): force-clear drops %d pending read "
+                "(%d outstanding pins) + %d pending write MemoryObjs; the "
+                "pins are released on MaruServer but stored data is NOT "
+                "deleted.",
                 len(self._pending_read_memobjs),
+                len(to_unpin),
                 len(self._pending_write_memobjs),
             )
+
+        if to_unpin:
+            try:
+                self.handler.batch_unpin(to_unpin)
+            except Exception:
+                logger.exception(
+                    "MaruHandler.batch_unpin failed in clear for %d pins",
+                    len(to_unpin),
+                )
+
         self._pending_read_memobjs.clear()
         self._pending_write_memobjs.clear()
 

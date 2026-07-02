@@ -37,6 +37,8 @@ from __future__ import annotations
 
 # Standard
 from typing import Literal
+import functools
+import threading
 
 # Third Party
 import torch
@@ -60,6 +62,25 @@ from lmcache.v1.distributed.maru_memory_allocator import (
 from lmcache.v1.memory_management import MemoryFormat, MemoryObj
 
 logger = init_logger(__name__)
+
+
+def _maru_l1_synchronized(func):
+    """Serialise a :class:`MaruL1Manager` method under its instance lock.
+
+    Once the maru controllers run (store / prefetch / eviction / engine
+    threads), the manager is called concurrently, so every method that
+    touches the dispatcher's side channels or the shared allocator must
+    hold ``self._lock`` for its whole duration. This is the maru sibling
+    of :func:`~lmcache.v1.distributed.l1_manager.l1_mgr_synchronized`;
+    ``functools.wraps`` preserves each method's docstring and signature.
+    """
+
+    @functools.wraps(func)
+    def wrapper(self: "MaruL1Manager", *args, **kwargs):
+        with self._lock:
+            return func(self, *args, **kwargs)
+
+    return wrapper
 
 
 class _MaruAllocatorMemoryManager:
@@ -169,6 +190,13 @@ class MaruL1Manager(MaruL1ManagerInterface):
     In maru mode LMCache does not keep an in-process object dict / TTL
     state machine — MaruServer owns the shared KV index and pin counts —
     so the state-machine query methods return simple parity answers.
+
+    Thread safety: the dispatcher holds no lock of its own, so this
+    manager owns a single ``threading.Lock`` and every method that
+    touches the dispatcher side channels or the shared allocator is
+    wrapped with :func:`_maru_l1_synchronized` (the maru sibling of
+    ``@l1_mgr_synchronized``). Lock acquisition is non-reentrant; no
+    synchronized method calls another synchronized method on ``self``.
     """
 
     def __init__(self, config: L1ManagerConfig) -> None:
@@ -180,6 +208,10 @@ class MaruL1Manager(MaruL1ManagerInterface):
         self._config: MaruL1Config = maru_config
         self._write_ttl_seconds = config.write_ttl_seconds
         self._read_ttl_seconds = config.read_ttl_seconds
+
+        # Serialises every side-channel/allocator-touching method (see
+        # class docstring); the dispatcher relies on this lock entirely.
+        self._lock = threading.Lock()
 
         # MaruL1Manager owns its allocator directly (sibling design):
         # the shared L1MemoryManager is deliberately kept maru-free.
@@ -204,6 +236,7 @@ class MaruL1Manager(MaruL1ManagerInterface):
     # Layout binding (maru-only; forwarded from StorageManager)
     # ------------------------------------------------------------------
 
+    @_maru_l1_synchronized
     def register_kv_layout(
         self,
         shapes: list[torch.Size],
@@ -247,6 +280,7 @@ class MaruL1Manager(MaruL1ManagerInterface):
     # Read path (delegated to the dispatcher)
     # ------------------------------------------------------------------
 
+    @_maru_l1_synchronized
     def reserve_read(
         self,
         keys: list[ObjectKey],
@@ -268,6 +302,7 @@ class MaruL1Manager(MaruL1ManagerInterface):
         del extra_count  # unused in maru mode
         return self._dispatcher.reserve_read(keys)
 
+    @_maru_l1_synchronized
     def unsafe_read(
         self,
         keys: list[ObjectKey],
@@ -282,6 +317,7 @@ class MaruL1Manager(MaruL1ManagerInterface):
         """
         return self._dispatcher.unsafe_read(keys)
 
+    @_maru_l1_synchronized
     def finish_read(
         self,
         keys: list[ObjectKey],
@@ -303,6 +339,7 @@ class MaruL1Manager(MaruL1ManagerInterface):
     # Write path (delegated to the dispatcher)
     # ------------------------------------------------------------------
 
+    @_maru_l1_synchronized
     def reserve_write(
         self,
         keys: list[ObjectKey],
@@ -324,6 +361,7 @@ class MaruL1Manager(MaruL1ManagerInterface):
         """
         return self._dispatcher.reserve_write(keys, is_temporary, layout_desc, mode)
 
+    @_maru_l1_synchronized
     def finish_write(
         self,
         keys: list[ObjectKey],
@@ -338,6 +376,7 @@ class MaruL1Manager(MaruL1ManagerInterface):
         """
         return self._dispatcher.finish_write(keys)
 
+    @_maru_l1_synchronized
     def finish_write_and_reserve_read(
         self,
         keys: list[ObjectKey],
@@ -363,6 +402,7 @@ class MaruL1Manager(MaruL1ManagerInterface):
     # Lifecycle (delegated / parity)
     # ------------------------------------------------------------------
 
+    @_maru_l1_synchronized
     def delete(self, keys: list[ObjectKey]) -> dict[ObjectKey, L1Error]:
         """Delete the given keys from the shared index via MaruServer.
 
@@ -374,14 +414,18 @@ class MaruL1Manager(MaruL1ManagerInterface):
         """
         return self._dispatcher.delete(keys)
 
+    @_maru_l1_synchronized
     def clear(self, force: bool = False) -> None:
-        """Drop staged side-channel entries.
+        """Drop staged side-channel entries, balancing remote pins.
 
-        The CXL pool is owned by MaruServer and is never wiped by the L1
-        layer; ``force`` only affects in-process read/write bookkeeping.
+        Stored KV data is owned by MaruServer and is never wiped by the
+        L1 layer, but any staged reads are unpinned once per remaining
+        refcount (see :meth:`MaruL1Dispatcher.clear`) so the remote
+        ``pin_count`` stays balanced. ``force`` only controls logging.
 
         Args:
-            force: If True, log the count of dropped pending objects.
+            force: If True, log the count of dropped pending objects and
+                released pins.
         """
         self._dispatcher.clear(force)
 
@@ -417,8 +461,14 @@ class MaruL1Manager(MaruL1ManagerInterface):
         del key
         return True
 
+    @_maru_l1_synchronized
     def get_memory_usage(self) -> tuple[int, int]:
         """Best-effort CXL pool usage.
+
+        Held under ``self._lock`` for consistency with the other
+        synchronized methods even though it is a read-only RPC (it issues
+        a single ``MaruHandler.get_stats`` and mutates no side channel);
+        ``report_status`` reads the same stats under the lock.
 
         Returns:
             ``(used_bytes, total_bytes)`` from ``MaruHandler.get_stats``;
@@ -455,6 +505,7 @@ class MaruL1Manager(MaruL1ManagerInterface):
         del key
         return None
 
+    @_maru_l1_synchronized
     def report_status(self) -> dict:
         """Return a maru-flavoured status snapshot.
 
@@ -474,12 +525,15 @@ class MaruL1Manager(MaruL1ManagerInterface):
         """
         return True
 
+    @_maru_l1_synchronized
     def close(self) -> None:
         """Drop pending read/write handles and close the allocator.
 
         The CXL page lifecycle remains owned by MaruServer; closing here
-        only tears down this instance's handler connection and clears the
-        in-process side channels.
+        tears down this instance's handler connection and clears the
+        in-process side channels. Any reads still staged are unpinned once
+        per remaining refcount (see :meth:`MaruL1Dispatcher.clear`) so the
+        remote ``pin_count`` stays balanced on shutdown.
         """
         self._dispatcher.clear(force=False)
         self._memory_manager.close()
