@@ -111,6 +111,23 @@ class MaruL1Dispatcher:
                 self._lookahead_depth,
             )
 
+        # Lookup-time prefetch (issue a Gaia prefetch of the maru/L1 hit prefix
+        # at the admission-stage lookup -- inside :meth:`reserve_read`, right
+        # after ``batch_pin`` establishes the prefix and before the reserved KV
+        # is copied out of its CXL page). The request's admission wait then
+        # doubles as the SSD->CXL fill window, so the later copy-out reads warm
+        # CXL DRAM instead of racing the fill. Independent of lookahead depth;
+        # 0/unset = off (reactive). MP maru-L1 mirror of
+        # MaruBackend._lookup_prefetch (single-process).
+        self._prefetch_on_lookup: bool = (
+            os.environ.get("MARU_GAIA_PREFETCH_ON_LOOKUP", "0") == "1"
+        )
+        if self._prefetch_on_lookup:
+            logger.info(
+                "[Maru] L1 lookup-time prefetch enabled "
+                "(MARU_GAIA_PREFETCH_ON_LOOKUP=1)"
+            )
+
     @property
     def handler(self) -> Any:
         """The connected ``MaruHandler``.
@@ -164,6 +181,33 @@ class MaruL1Dispatcher:
                     "[Maru] L1 lookahead prefetch_batch failed", exc_info=True
                 )
 
+    def _lookup_prefetch(self, key_strs: list[str], num_hit: int) -> None:
+        """Issue a Gaia prefetch for the maru/L1 hit prefix at lookup time.
+
+        Called from :meth:`reserve_read` (the admission-stage lookup that
+        ``StorageManager.submit_prefetch_task`` drives) once ``batch_pin`` has
+        established how many contiguous prefix keys exist in the maru/CXL
+        tier. Firing the prefetch here -- before the reserved KV is copied out
+        of its CXL page -- lets the request's admission wait double as the
+        SSD->CXL fill window, so the later read hits warm CXL DRAM instead of
+        racing the fill. ``key_strs`` are the exact ``object_key_to_string``
+        encodings already used for ``batch_pin`` / ``batch_retrieve``, so the
+        prefetched regions match the eventual read. No-op when lookup-time
+        prefetch is disabled or nothing hit.
+
+        Args:
+            key_strs: The looked-up keys (already string-encoded) in prefix
+                order.
+            num_hit: Number of contiguous prefix keys that exist (from the
+                ``batch_pin`` check); only this prefix is prefetched.
+        """
+        if not self._prefetch_on_lookup or num_hit <= 0:
+            return
+        try:
+            self.handler.prefetch_batch(key_strs[:num_hit])
+        except Exception:
+            logger.warning("[Maru] L1 lookup-time prefetch_batch failed", exc_info=True)
+
     def reserve_read(self, keys: list[ObjectKey]) -> dict[ObjectKey, L1OperationResult]:
         """Pin + retrieve + stage MemoryObjs in the side channel.
 
@@ -193,6 +237,11 @@ class MaruL1Dispatcher:
             if not ok:
                 break
             num_pinned += 1
+
+        # Lookup-time prefetch: warm the CXL DRAM for the hit prefix now (during
+        # the request's admission wait) so the later copy-out reads warm memory.
+        # No-op unless MARU_GAIA_PREFETCH_ON_LOOKUP=1 and the prefix hit.
+        self._lookup_prefetch(key_strs, num_pinned)
 
         ret: dict[ObjectKey, L1OperationResult] = {
             k: (L1Error.KEY_NOT_EXIST, None) for k in keys
