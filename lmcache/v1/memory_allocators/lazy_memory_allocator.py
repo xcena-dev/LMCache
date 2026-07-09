@@ -2,6 +2,7 @@
 # Standard
 from typing import List, Optional, Union
 import ctypes
+import os
 import threading
 
 # Third Party
@@ -83,6 +84,11 @@ class LazyMemoryAllocator(MemoryAllocatorInterface):
             init_size (int): Initial size of the memory allocation in bytes.
             final_size (int): Final size of the memory allocation in bytes.
             align_bytes (int, optional): Alignment in for the underlying allocations
+
+        Note:
+            The pool base address is guaranteed to be page-aligned (both the
+            NUMA and the plain CPU branch), so that O_DIRECT L2 reads into
+            pool buffers satisfy the block-alignment requirement.
         """
         # Whether using NUMA allocation
         self._use_numa = numa_mapping is not None
@@ -109,9 +115,22 @@ class LazyMemoryAllocator(MemoryAllocatorInterface):
             buf = arr_type.from_address(ptr)
             self._buffer = torch.frombuffer(buf, dtype=torch.uint8)
         else:
-            self._buffer = torch.empty(
-                self._final_size, dtype=torch.uint8, device="cpu", pin_memory=False
+            # L2 backends read into this pool with O_DIRECT, which requires the
+            # destination address to be block-aligned. torch.empty only
+            # guarantees 64-byte alignment, and align_bytes only aligns object
+            # offsets *within* the pool, so the pool base itself must be
+            # page-aligned: over-allocate by one page and start the buffer at
+            # the next page boundary. The NUMA branch above is mmap-based and
+            # therefore already page-aligned.
+            page_size = os.sysconf("SC_PAGESIZE")
+            raw_buffer = torch.empty(
+                self._final_size + page_size,
+                dtype=torch.uint8,
+                device="cpu",
+                pin_memory=False,
             )
+            aligned_offset = (-raw_buffer.data_ptr()) % page_size
+            self._buffer = raw_buffer.narrow(0, aligned_offset, self._final_size)
 
         # Pin the first `curr_size` bytes (aligned to the internal chunk size)
         self._pin_memory_chunk(0, self._curr_size)

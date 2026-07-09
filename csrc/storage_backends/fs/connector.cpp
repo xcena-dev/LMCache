@@ -104,6 +104,28 @@ static void write_all(int fd, const void* data, size_t len) {
   }
 }
 
+// Returns true when O_DIRECT may be enabled for this transfer.
+//
+// O_DIRECT requires the file offset (always 0 here), the transfer length,
+// and the user buffer address to all be block-aligned; an unaligned buffer
+// makes read() fail with EINVAL, so the address must be checked too.
+static bool odirect_allowed(WorkerFSConn& conn, const void* buf, size_t len) {
+  if (conn.disk_block_size == 0) {
+    return false;
+  }
+  bool aligned = len % conn.disk_block_size == 0 &&
+                 reinterpret_cast<uintptr_t>(buf) % conn.disk_block_size == 0;
+  if (!aligned && !conn.odirect_fallback_warned) {
+    conn.odirect_fallback_warned = true;
+    fprintf(stderr,
+            "[LMCache FS] use_odirect is enabled but buffer %p / length %zu "
+            "is not aligned to the disk block size %zu; falling back to "
+            "buffered I/O\n",
+            buf, len, conn.disk_block_size);
+  }
+  return aligned;
+}
+
 static size_t read_all(int fd, void* buf, size_t len) {
   size_t total = 0;
   char* ptr = static_cast<char*>(buf);
@@ -172,16 +194,10 @@ void FSConnector::do_single_get(WorkerFSConn& conn, const std::string& key,
   auto file_path = conn.base_path / filename;
 
   int flags = O_RDONLY;
-  bool do_odirect = conn.use_odirect;
-  if (do_odirect) {
-    bool aligned = conn.disk_block_size > 0 && len % conn.disk_block_size == 0;
-    if (aligned) {
+  if (conn.use_odirect && odirect_allowed(conn, buf, len)) {
 #ifdef O_DIRECT
-      flags |= O_DIRECT;
+    flags |= O_DIRECT;
 #endif
-    } else {
-      do_odirect = false;
-    }
   }
 
   int fd = ::open(file_path.c_str(), flags);
@@ -241,16 +257,10 @@ void FSConnector::do_single_set(WorkerFSConn& conn, const std::string& key,
   }
 
   int flags = O_CREAT | O_WRONLY | O_TRUNC;
-  bool do_odirect = conn.use_odirect;
-  if (do_odirect) {
-    bool aligned = conn.disk_block_size > 0 && len % conn.disk_block_size == 0;
-    if (aligned) {
+  if (conn.use_odirect && odirect_allowed(conn, buf, len)) {
 #ifdef O_DIRECT
-      flags |= O_DIRECT;
+    flags |= O_DIRECT;
 #endif
-    } else {
-      do_odirect = false;
-    }
   }
 
   int fd = ::open(tmp_path.c_str(), flags, 0644);

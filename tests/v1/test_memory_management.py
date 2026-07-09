@@ -1,5 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # Standard
+import os
 import threading
 import time
 
@@ -655,6 +656,31 @@ class TestLazyMemoryAllocator:
         assert memory_obj.tensor.shape == shape
         assert memory_obj.tensor.dtype == dtype
 
+        allocator.close()
+
+    def test_pool_base_is_page_aligned(self, lazy_allocator_cls):
+        """The pool base and every allocated object must be page-aligned.
+
+        L2 backends read into this pool with O_DIRECT, which requires
+        block-aligned destination buffers. align_bytes only aligns object
+        offsets within the pool, so the base itself must be page-aligned
+        for any object to be aligned.
+        """
+        allocator = lazy_allocator_cls(
+            init_size=self.INIT_SIZE,
+            final_size=self.FINAL_SIZE,
+        )
+
+        page_size = os.sysconf("SC_PAGESIZE")
+        assert allocator.get_underlying_buffer().data_ptr() % page_size == 0
+
+        memory_obj = allocator.allocate(torch.Size([512, 512]), torch.float32)
+        assert memory_obj is not None
+        # Default align_bytes is 4096, so objects inherit page alignment
+        # from the base.
+        assert memory_obj.data_ptr % 4096 == 0
+
+        allocator.free(memory_obj)
         allocator.close()
 
     def test_allocate_with_format(self, lazy_allocator_cls):

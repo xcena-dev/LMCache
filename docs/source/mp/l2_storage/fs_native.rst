@@ -43,13 +43,17 @@ I/O queue depth on a single Python thread.
       MiB).
 
    2. **Memory-buffer alignment.**  The I/O buffer pointer itself must
-      also be aligned (typically to 4096 bytes on local disks, or to the
-      FS block size on parallel filesystems).  This is controlled by
-      ``--l1-align-bytes`` (default ``4096``) -- raise it to match the
-      FS block size when running on a filesystem with larger blocks.  If
-      the buffer is misaligned, the underlying ``read``/``write`` syscall
-      returns ``EINVAL`` (this is **not** caught by the length-fallback
-      path above and will surface as a runtime error).
+      also be aligned to the filesystem block size.  The connector checks
+      this the same way as the length: a misaligned buffer falls back to a
+      buffered open for that operation and logs a once-per-worker warning
+      (``falling back to buffered I/O``) -- correctness is preserved, but
+      watch the server log for the warning if you rely on true direct I/O.
+      The DRAM L1 pool base is page-aligned and object offsets follow
+      ``--l1-align-bytes`` (default ``4096``), so on typical local
+      filesystems (4096-byte blocks) pool buffers pass this check
+      automatically.  On filesystems with larger blocks (GPFS and similar
+      parallel filesystems often use several MiB) the buffer check may
+      keep falling back to buffered I/O.
 
    If unsure, start with ``use_odirect: false`` and confirm correctness
    before enabling ``O_DIRECT``.

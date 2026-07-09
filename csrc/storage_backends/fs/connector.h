@@ -30,6 +30,9 @@ struct WorkerFSConn {
   // If > 0, trigger filesystem readahead by issuing a small
   // initial read of this many bytes before reading the rest.
   size_t read_ahead_size = 0;
+  // Whether the O_DIRECT misalignment warning was already emitted on this
+  // worker connection (warn once, not once per request).
+  bool odirect_fallback_warned = false;
 };
 
 class FSConnector : public ConnectorBase<WorkerFSConn> {
