@@ -222,6 +222,7 @@ class P2PBackend(StorageBackendInterface):
         device_type = (
             "cpu" if config.nixl_buffer_device is None else config.nixl_buffer_device
         )
+        extra_config = config.extra_config or {}
         self.transfer_channel = CreateTransferChannel(
             channel_type=config.transfer_channel,
             async_mode=True,
@@ -235,6 +236,10 @@ class P2PBackend(StorageBackendInterface):
             backends=config.nixl_backends,
             event_loop=loop,
             device=device_type,
+            backend_params=extra_config.get("nixl_backend_params"),
+            agent_backend_params=extra_config.get("nixl_agent_backend_params"),
+            ucx_devices_by_agent=extra_config.get("nixl_ucx_devices_by_agent"),
+            num_agents=extra_config.get("nixl_num_agents"),
         )
 
         self.running = asyncio.Event()
