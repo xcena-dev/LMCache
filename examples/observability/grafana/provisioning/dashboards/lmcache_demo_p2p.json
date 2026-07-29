@@ -1,0 +1,468 @@
+{
+ "annotations": {
+  "list": []
+ },
+ "editable": true,
+ "graphTooltip": 1,
+ "liveNow": true,
+ "refresh": "",
+ "schemaVersion": 39,
+ "tags": [
+  "lmcache",
+  "demo",
+  "p2p",
+  "in-process"
+ ],
+ "templating": {
+  "list": []
+ },
+ "time": {
+  "from": "1784780450000",
+  "to": "1784782985000"
+ },
+ "timezone": "browser",
+ "title": "LMCache DEMO — in-process/p2p (Maru CXL vs NIXL, concurrency=1)",
+ "uid": "lmcache-demo-p2p",
+ "version": 15,
+ "panels": [
+  {
+   "type": "stat",
+   "title": "w/ CXL (Maru) — TTFT p50 (ms)",
+   "datasource": {
+    "type": "prometheus",
+    "uid": "prometheus"
+   },
+   "gridPos": {
+    "h": 6,
+    "w": 9,
+    "x": 0,
+    "y": 0
+   },
+   "targets": [
+    {
+     "datasource": {
+      "type": "prometheus",
+      "uid": "prometheus"
+     },
+     "expr": "avg(lmcache_mp_ttft_seconds{stat=\"p50\",phase=\"inst2_warmup\",service_instance_id=\"maru-cxl\"})*1000",
+     "legendFormat": "",
+     "refId": "A"
+    }
+   ],
+   "fieldConfig": {
+    "defaults": {
+     "unit": "ms",
+     "decimals": 0,
+     "color": {
+      "mode": "fixed",
+      "fixedColor": "#F2A93B"
+     }
+    },
+    "overrides": []
+   },
+   "options": {
+    "reduceOptions": {
+     "calcs": [
+      "lastNotNull"
+     ],
+     "fields": "",
+     "values": false
+    },
+    "graphMode": "none",
+    "textMode": "value",
+    "colorMode": "value"
+   }
+  },
+  {
+   "type": "stat",
+   "title": "Speedup — w/ vs w/o CXL",
+   "datasource": {
+    "type": "prometheus",
+    "uid": "prometheus"
+   },
+   "gridPos": {
+    "h": 6,
+    "w": 6,
+    "x": 9,
+    "y": 0
+   },
+   "targets": [
+    {
+     "datasource": {
+      "type": "prometheus",
+      "uid": "prometheus"
+     },
+     "expr": "(avg(lmcache_mp_ttft_seconds{stat=\"p50\",phase=\"inst2_warmup\",service_instance_id=\"nixl-dram\"})*1000)/(avg(lmcache_mp_ttft_seconds{stat=\"p50\",phase=\"inst2_warmup\",service_instance_id=\"maru-cxl\"})*1000)",
+     "legendFormat": "",
+     "refId": "A"
+    }
+   ],
+   "fieldConfig": {
+    "defaults": {
+     "unit": "x",
+     "decimals": 1,
+     "color": {
+      "mode": "fixed",
+      "fixedColor": "#F2A93B"
+     }
+    },
+    "overrides": []
+   },
+   "options": {
+    "reduceOptions": {
+     "calcs": [
+      "lastNotNull"
+     ],
+     "fields": "",
+     "values": false
+    },
+    "graphMode": "none",
+    "textMode": "value",
+    "colorMode": "value"
+   }
+  },
+  {
+   "type": "stat",
+   "title": "w/o CXL (NIXL) — TTFT p50 (ms)",
+   "datasource": {
+    "type": "prometheus",
+    "uid": "prometheus"
+   },
+   "gridPos": {
+    "h": 6,
+    "w": 9,
+    "x": 15,
+    "y": 0
+   },
+   "targets": [
+    {
+     "datasource": {
+      "type": "prometheus",
+      "uid": "prometheus"
+     },
+     "expr": "avg(lmcache_mp_ttft_seconds{stat=\"p50\",phase=\"inst2_warmup\",service_instance_id=\"nixl-dram\"})*1000",
+     "legendFormat": "",
+     "refId": "A"
+    }
+   ],
+   "fieldConfig": {
+    "defaults": {
+     "unit": "ms",
+     "decimals": 0,
+     "color": {
+      "mode": "fixed",
+      "fixedColor": "#5B8FF9"
+     }
+    },
+    "overrides": []
+   },
+   "options": {
+    "reduceOptions": {
+     "calcs": [
+      "lastNotNull"
+     ],
+     "fields": "",
+     "values": false
+    },
+    "graphMode": "none",
+    "textMode": "value",
+    "colorMode": "value"
+   }
+  },
+  {
+   "type": "timeseries",
+   "title": "① TTFT (ms) — cross-instance KV fetch, per-request live [concurrency=1, 16k]",
+   "datasource": {
+    "type": "prometheus",
+    "uid": "prometheus"
+   },
+   "gridPos": {
+    "h": 8,
+    "w": 24,
+    "x": 0,
+    "y": 6
+   },
+   "targets": [
+    {
+     "datasource": {
+      "type": "prometheus",
+      "uid": "prometheus"
+     },
+     "expr": "lmcache_mp_request_ttft_ms_warmup{service_instance_id=\"nixl-dram\"}",
+     "legendFormat": "w/o CXL",
+     "refId": "A"
+    },
+    {
+     "datasource": {
+      "type": "prometheus",
+      "uid": "prometheus"
+     },
+     "expr": "lmcache_mp_request_ttft_ms_warmup{service_instance_id=\"maru-cxl\"}",
+     "legendFormat": "w/ CXL",
+     "refId": "B"
+    }
+   ],
+   "fieldConfig": {
+    "defaults": {
+     "unit": "ms",
+     "min": 0,
+     "custom": {
+      "drawStyle": "line",
+      "lineInterpolation": "smooth",
+      "lineWidth": 3,
+      "fillOpacity": 10,
+      "showPoints": "auto",
+      "spanNulls": true,
+      "axisLabel": "KV fetch ms"
+     },
+     "color": {
+      "mode": "palette-classic"
+     }
+    },
+    "overrides": [
+     {
+      "matcher": {
+       "id": "byRegexp",
+       "options": "w/o CXL"
+      },
+      "properties": [
+       {
+        "id": "color",
+        "value": {
+         "mode": "fixed",
+         "fixedColor": "#5B8FF9"
+        }
+       }
+      ]
+     },
+     {
+      "matcher": {
+       "id": "byRegexp",
+       "options": "w/ CXL"
+      },
+      "properties": [
+       {
+        "id": "color",
+        "value": {
+         "mode": "fixed",
+         "fixedColor": "#F2A93B"
+        }
+       }
+      ]
+     }
+    ]
+   },
+   "options": {
+    "legend": {
+     "displayMode": "list",
+     "placement": "right",
+     "showLegend": true,
+     "calcs": [
+      "mean"
+     ]
+    },
+    "tooltip": {
+     "mode": "multi",
+     "sort": "desc"
+    }
+   }
+  },
+  {
+   "type": "timeseries",
+   "title": "② KV footprint — host DRAM (w/o CXL) vs CXL pool (w/ CXL)",
+   "datasource": {
+    "type": "prometheus",
+    "uid": "prometheus"
+   },
+   "gridPos": {
+    "h": 8,
+    "w": 24,
+    "x": 0,
+    "y": 14
+   },
+   "targets": [
+    {
+     "datasource": {
+      "type": "prometheus",
+      "uid": "prometheus"
+     },
+     "expr": "sum(lmcache_mp_host_dram_used_bytes{service_instance_id=\"nixl-dram\"})",
+     "legendFormat": "w/o CXL",
+     "refId": "A"
+    },
+    {
+     "datasource": {
+      "type": "prometheus",
+      "uid": "prometheus"
+     },
+     "expr": "sum(lmcache_mp_cxl_pool_used_bytes{service_instance_id=\"maru-cxl\"})",
+     "legendFormat": "w/ CXL",
+     "refId": "B"
+    }
+   ],
+   "fieldConfig": {
+    "defaults": {
+     "unit": "bytes",
+     "min": 0,
+     "custom": {
+      "drawStyle": "line",
+      "lineInterpolation": "smooth",
+      "lineWidth": 3,
+      "fillOpacity": 10,
+      "showPoints": "auto",
+      "spanNulls": true,
+      "axisLabel": "memory"
+     },
+     "color": {
+      "mode": "palette-classic"
+     }
+    },
+    "overrides": [
+     {
+      "matcher": {
+       "id": "byRegexp",
+       "options": "w/o CXL"
+      },
+      "properties": [
+       {
+        "id": "color",
+        "value": {
+         "mode": "fixed",
+         "fixedColor": "#5B8FF9"
+        }
+       }
+      ]
+     },
+     {
+      "matcher": {
+       "id": "byRegexp",
+       "options": "w/ CXL"
+      },
+      "properties": [
+       {
+        "id": "color",
+        "value": {
+         "mode": "fixed",
+         "fixedColor": "#F2A93B"
+        }
+       }
+      ]
+     }
+    ]
+   },
+   "options": {
+    "legend": {
+     "displayMode": "list",
+     "placement": "right",
+     "showLegend": true,
+     "calcs": [
+      "last",
+      "max"
+     ]
+    },
+    "tooltip": {
+     "mode": "multi",
+     "sort": "desc"
+    }
+   }
+  },
+  {
+   "type": "timeseries",
+   "title": "③ GPU utilization (%)   [w/ CXL vs w/o CXL]",
+   "datasource": {
+    "type": "prometheus",
+    "uid": "prometheus"
+   },
+   "gridPos": {
+    "h": 8,
+    "w": 24,
+    "x": 0,
+    "y": 22
+   },
+   "targets": [
+    {
+     "datasource": {
+      "type": "prometheus",
+      "uid": "prometheus"
+     },
+     "expr": "max(lmcache_mp_gpu_utilization_ratio{service_instance_id=\"nixl-dram\"})*100",
+     "legendFormat": "w/o CXL",
+     "refId": "A"
+    },
+    {
+     "datasource": {
+      "type": "prometheus",
+      "uid": "prometheus"
+     },
+     "expr": "max(lmcache_mp_gpu_utilization_ratio{service_instance_id=\"maru-cxl\"})*100",
+     "legendFormat": "w/ CXL",
+     "refId": "B"
+    }
+   ],
+   "fieldConfig": {
+    "defaults": {
+     "unit": "percent",
+     "min": 0,
+     "custom": {
+      "drawStyle": "line",
+      "lineInterpolation": "smooth",
+      "lineWidth": 3,
+      "fillOpacity": 10,
+      "showPoints": "auto",
+      "spanNulls": true,
+      "axisLabel": "GPU %"
+     },
+     "color": {
+      "mode": "palette-classic"
+     }
+    },
+    "overrides": [
+     {
+      "matcher": {
+       "id": "byRegexp",
+       "options": "w/o CXL"
+      },
+      "properties": [
+       {
+        "id": "color",
+        "value": {
+         "mode": "fixed",
+         "fixedColor": "#5B8FF9"
+        }
+       }
+      ]
+     },
+     {
+      "matcher": {
+       "id": "byRegexp",
+       "options": "w/ CXL"
+      },
+      "properties": [
+       {
+        "id": "color",
+        "value": {
+         "mode": "fixed",
+         "fixedColor": "#F2A93B"
+        }
+       }
+      ]
+     }
+    ]
+   },
+   "options": {
+    "legend": {
+     "displayMode": "list",
+     "placement": "right",
+     "showLegend": true,
+     "calcs": [
+      "mean"
+     ]
+    },
+    "tooltip": {
+     "mode": "multi",
+     "sort": "desc"
+    }
+   }
+  }
+ ]
+}
