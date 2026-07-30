@@ -171,7 +171,7 @@
   },
   {
    "type": "timeseries",
-   "title": "① TTFT (ms) — cross-instance KV fetch, per-request live",
+   "title": "① TTFT (ms) — cross-instance KV fetch (per-request replay, arms overlaid)",
    "datasource": {
     "type": "prometheus",
     "uid": "prometheus"
