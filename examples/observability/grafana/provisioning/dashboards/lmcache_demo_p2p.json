@@ -171,7 +171,7 @@
   },
   {
    "type": "timeseries",
-   "title": "① TTFT (ms) — cross-instance KV fetch, per-request live [concurrency=1, 16k]",
+   "title": "① TTFT (ms) — cross-instance KV fetch, per-request live",
    "datasource": {
     "type": "prometheus",
     "uid": "prometheus"
