@@ -1,0 +1,141 @@
+{
+  "annotations": { "list": [] },
+  "editable": true,
+  "fiscalYearStartMonth": 0,
+  "graphTooltip": 1,
+  "id": null,
+  "links": [],
+  "liveNow": true,
+  "refresh": "5s",
+  "schemaVersion": 39,
+  "tags": ["lmcache", "demo", "cxl"],
+  "templating": { "list": [] },
+  "time": { "from": "now-15m", "to": "now" },
+  "timepicker": {},
+  "timezone": "browser",
+  "title": "LMCache — CXL vs DRAM (DEMO hero)",
+  "uid": "lmcache-demo-hero",
+  "version": 2,
+  "panels": [
+    {
+      "type": "timeseries",
+      "title": "TTFT timeline — per request (ms)",
+      "description": "Time-to-first-token per request. Warmup (miss) is high; on cache hit it collapses.",
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "gridPos": { "h": 11, "w": 16, "x": 0, "y": 0 },
+      "targets": [
+        { "datasource": { "type": "prometheus", "uid": "prometheus" },
+          "expr": "lmcache_mp_request_ttft_ms",
+          "legendFormat": "{{service_instance_id}}", "refId": "A" }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "ms",
+          "custom": {
+            "drawStyle": "line", "lineInterpolation": "smooth", "lineWidth": 4,
+            "fillOpacity": 12, "showPoints": "always", "pointSize": 12,
+            "spanNulls": true, "axisLabel": "TTFT (ms)"
+          },
+          "color": { "mode": "palette-classic" }
+        },
+        "overrides": [
+          { "matcher": { "id": "byName", "options": "mp-cxl" },
+            "properties": [ { "id": "color", "value": { "fixedColor": "#F2A93B", "mode": "fixed" } } ] },
+          { "matcher": { "id": "byName", "options": "mp-dram" },
+            "properties": [ { "id": "color", "value": { "fixedColor": "#5B8FF9", "mode": "fixed" } } ] }
+        ]
+      },
+      "options": {
+        "legend": { "displayMode": "list", "placement": "bottom", "showLegend": true, "calcs": ["mean", "max"] },
+        "tooltip": { "mode": "multi", "sort": "desc" }
+      }
+    },
+    {
+      "type": "stat",
+      "title": "TTFT now (ms)",
+      "description": "Latest TTFT per backend. Lower = cache hit working.",
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "gridPos": { "h": 11, "w": 8, "x": 16, "y": 0 },
+      "targets": [
+        { "datasource": { "type": "prometheus", "uid": "prometheus" },
+          "expr": "max by (service_instance_id) (lmcache_mp_request_ttft_ms)",
+          "legendFormat": "{{service_instance_id}}", "refId": "A" }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "ms",
+          "thresholds": { "mode": "absolute", "steps": [
+            { "color": "green", "value": null }, { "color": "yellow", "value": 2000 }, { "color": "red", "value": 6000 } ] },
+          "color": { "mode": "thresholds" }
+        },
+        "overrides": []
+      },
+      "options": {
+        "reduceOptions": { "calcs": ["lastNotNull"], "fields": "", "values": false },
+        "orientation": "vertical", "colorMode": "background", "graphMode": "area",
+        "justifyMode": "center", "textMode": "value_and_name",
+        "text": { "titleSize": 40, "valueSize": 110 }
+      }
+    },
+    {
+      "type": "timeseries",
+      "title": "KV cache footprint — L1 used (GB)",
+      "description": "Bytes held in the L1 cache tier per backend.",
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "gridPos": { "h": 11, "w": 12, "x": 0, "y": 11 },
+      "targets": [
+        { "datasource": { "type": "prometheus", "uid": "prometheus" },
+          "expr": "lmcache_mp_l1_memory_usage_bytes",
+          "legendFormat": "{{service_instance_id}}", "refId": "A" }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "bytes",
+          "custom": {
+            "drawStyle": "line", "lineInterpolation": "smooth", "lineWidth": 4,
+            "fillOpacity": 25, "gradientMode": "opacity", "showPoints": "never",
+            "spanNulls": true, "axisLabel": "L1 used"
+          },
+          "color": { "mode": "palette-classic" }
+        },
+        "overrides": [
+          { "matcher": { "id": "byName", "options": "mp-cxl" },
+            "properties": [ { "id": "color", "value": { "fixedColor": "#F2A93B", "mode": "fixed" } } ] },
+          { "matcher": { "id": "byName", "options": "mp-dram" },
+            "properties": [ { "id": "color", "value": { "fixedColor": "#5B8FF9", "mode": "fixed" } } ] }
+        ]
+      },
+      "options": {
+        "legend": { "displayMode": "list", "placement": "bottom", "showLegend": true, "calcs": ["last", "max"] },
+        "tooltip": { "mode": "multi", "sort": "desc" }
+      }
+    },
+    {
+      "type": "timeseries",
+      "title": "GPU utilization (%)",
+      "description": "GPU compute utilization per backend.",
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "gridPos": { "h": 11, "w": 12, "x": 12, "y": 11 },
+      "targets": [
+        { "datasource": { "type": "prometheus", "uid": "prometheus" },
+          "expr": "lmcache_mp_gpu_utilization_ratio * 100",
+          "legendFormat": "{{service_instance_id}} gpu{{gpu}}", "refId": "A" }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "percent", "min": 0, "max": 100,
+          "custom": {
+            "drawStyle": "line", "lineInterpolation": "smooth", "lineWidth": 4,
+            "fillOpacity": 18, "showPoints": "never", "spanNulls": true, "axisLabel": "GPU %"
+          },
+          "color": { "mode": "palette-classic" }
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": { "displayMode": "list", "placement": "bottom", "showLegend": true, "calcs": ["mean", "max"] },
+        "tooltip": { "mode": "multi", "sort": "desc" }
+      }
+    }
+  ]
+}
