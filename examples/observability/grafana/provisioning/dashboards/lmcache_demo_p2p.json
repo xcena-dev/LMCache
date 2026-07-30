@@ -269,7 +269,7 @@
   },
   {
    "type": "timeseries",
-   "title": "② KV footprint — host DRAM (w/o CXL) vs CXL pool (w/ CXL)",
+   "title": "② KV footprint (derived: stored tokens×128KB) — same size both arms; win is transport",
    "datasource": {
     "type": "prometheus",
     "uid": "prometheus"
@@ -286,7 +286,7 @@
       "type": "prometheus",
       "uid": "prometheus"
      },
-     "expr": "sum(lmcache_mp_host_dram_used_bytes{service_instance_id=\"nixl-dram\"})",
+     "expr": "lmcache_mp_kv_footprint_bytes{service_instance_id=\"nixl-dram\"}",
      "legendFormat": "w/o CXL",
      "refId": "A"
     },
@@ -295,7 +295,7 @@
       "type": "prometheus",
       "uid": "prometheus"
      },
-     "expr": "sum(lmcache_mp_cxl_pool_used_bytes{service_instance_id=\"maru-cxl\"})",
+     "expr": "lmcache_mp_kv_footprint_bytes{service_instance_id=\"maru-cxl\"}",
      "legendFormat": "w/ CXL",
      "refId": "B"
     }
