@@ -269,7 +269,7 @@
   },
   {
    "type": "timeseries",
-   "title": "② KV footprint — DRAM vs CXL memory",
+   "title": "② KV footprint — DRAM & CXL memory",
    "datasource": {
     "type": "prometheus",
     "uid": "prometheus"
@@ -287,7 +287,7 @@
       "uid": "prometheus"
      },
      "expr": "lmcache_mp_kv_footprint_bytes{service_instance_id=\"nixl-dram\"}",
-     "legendFormat": "w/o CXL",
+     "legendFormat": "DRAM",
      "refId": "A"
     },
     {
@@ -296,7 +296,7 @@
       "uid": "prometheus"
      },
      "expr": "lmcache_mp_kv_footprint_bytes{service_instance_id=\"maru-cxl\"}",
-     "legendFormat": "w/ CXL",
+     "legendFormat": "CXL memory",
      "refId": "B"
     }
    ],
@@ -321,7 +321,7 @@
      {
       "matcher": {
        "id": "byRegexp",
-       "options": "w/o CXL"
+       "options": "DRAM"
       },
       "properties": [
        {
@@ -336,7 +336,7 @@
      {
       "matcher": {
        "id": "byRegexp",
-       "options": "w/ CXL"
+       "options": "CXL memory"
       },
       "properties": [
        {
