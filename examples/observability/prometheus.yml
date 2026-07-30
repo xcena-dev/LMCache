@@ -2,7 +2,25 @@ global:
   scrape_interval: 5s
 
 scrape_configs:
-  # LMCache metrics re-exposed by the OTel Collector
+  # (1) PUSH path — metrics LMCache (MP mode) or the naru exporters send over OTLP
+  # to the collector, which re-exposes them for Prometheus. This carries the
+  # ``lmcache_mp_*`` family the demo dashboards query.
   - job_name: lmcache
     static_configs:
       - targets: ["otel-collector:8889"]
+
+  # (2) PULL path — scrape the NATIVE ``lmcache:*`` Prometheus metrics that embedded
+  # LMCache exposes on each vLLM's /metrics (retrieve_hit_rate, time_to_retrieve,
+  # local_cache_usage, num_stored_tokens, p2p_* ...). Works in BOTH MP and
+  # in-process mode with no exporter code at all.
+  #
+  # Targets below assume vLLM runs on the same host as this stack (the
+  # host.docker.internal alias is wired via extra_hosts in docker-compose.yml).
+  # For vLLM on another machine, replace with "<host>:<port>" and open the port.
+  # Down targets are harmless — Prometheus just marks them unhealthy.
+  - job_name: vllm-lmcache-native
+    metrics_path: /metrics
+    static_configs:
+      - targets:
+          - "host.docker.internal:9010"
+          - "host.docker.internal:9011"
