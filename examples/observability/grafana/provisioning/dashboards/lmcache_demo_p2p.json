@@ -188,7 +188,7 @@
       "type": "prometheus",
       "uid": "prometheus"
      },
-     "expr": "lmcache_mp_request_ttft_ms_warmup{service_instance_id=\"nixl-dram\"}",
+     "expr": "max by(service_instance_id)(lmcache_mp_request_ttft_ms_warmup{service_instance_id=\"nixl-dram\"})",
      "legendFormat": "w/o CXL",
      "refId": "A"
     },
@@ -197,7 +197,7 @@
       "type": "prometheus",
       "uid": "prometheus"
      },
-     "expr": "lmcache_mp_request_ttft_ms_warmup{service_instance_id=\"maru-cxl\"}",
+     "expr": "max by(service_instance_id)(lmcache_mp_request_ttft_ms_warmup{service_instance_id=\"maru-cxl\"})",
      "legendFormat": "w/ CXL",
      "refId": "B"
     }
@@ -286,7 +286,7 @@
       "type": "prometheus",
       "uid": "prometheus"
      },
-     "expr": "lmcache_mp_kv_footprint_bytes{service_instance_id=\"nixl-dram\"}",
+     "expr": "max by(service_instance_id)(lmcache_mp_kv_footprint_bytes{service_instance_id=\"nixl-dram\"})",
      "legendFormat": "DRAM",
      "refId": "A"
     },
@@ -295,7 +295,7 @@
       "type": "prometheus",
       "uid": "prometheus"
      },
-     "expr": "lmcache_mp_kv_footprint_bytes{service_instance_id=\"maru-cxl\"}",
+     "expr": "max by(service_instance_id)(lmcache_mp_kv_footprint_bytes{service_instance_id=\"maru-cxl\"})",
      "legendFormat": "CXL memory",
      "refId": "B"
     }
