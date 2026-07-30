@@ -269,7 +269,7 @@
   },
   {
    "type": "timeseries",
-   "title": "② KV footprint (derived: stored tokens×128KB) — same size both arms; win is transport",
+   "title": "② KV footprint — DRAM vs CXL memory",
    "datasource": {
     "type": "prometheus",
     "uid": "prometheus"
