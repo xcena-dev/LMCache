@@ -59,6 +59,14 @@ class ObservabilityConfig:
     """Fraction of chunks/blocks to track for lifecycle histograms (0, 1.0].
     Counters always count all events regardless of this setting."""
 
+    hardware_metrics_enabled: bool = False
+    """Register host/GPU/CXL hardware observable gauges (DRAM occupancy,
+    GPU utilisation / PCIe DMA / power via NVML, CXL device capacity).
+    Opt-in (default off) because it depends on host tooling (NVML,
+    ``xcena_cli``) and is intended for hardware-correlation dashboards, not
+    general operation.  Best-effort: unavailable sources report no
+    datapoints.  Requires :attr:`metrics_enabled`."""
+
     lookup_hash_log: LookupHashLogConfig = field(default_factory=LookupHashLogConfig)
     """Configuration for lookup hash file logging.  Disabled by default
     (empty ``output_dir``)."""
@@ -126,6 +134,17 @@ def add_observability_args(
         action="store_true",
         default=False,
         help="Enable span subscribers (OTel traces). Disabled by default.",
+    )
+    group.add_argument(
+        "--enable-hardware-metrics",
+        action="store_true",
+        default=False,
+        help=(
+            "Register host/GPU/CXL hardware gauges (DRAM occupancy, GPU "
+            "utilisation/PCIe DMA/power via NVML, CXL capacity). Opt-in; "
+            "best-effort (unavailable sources are skipped). Requires metrics "
+            "enabled."
+        ),
     )
     group.add_argument(
         "--otlp-endpoint",
@@ -239,9 +258,11 @@ def parse_args_to_observability_config(
         enabled=not args.disable_observability,
         max_queue_size=args.event_bus_queue_size,
         metrics_enabled=not args.disable_metrics,
+        hardware_metrics_enabled=args.enable_hardware_metrics,
         logging_enabled=not args.disable_logging,
         tracing_enabled=args.enable_tracing,
         otlp_endpoint=args.otlp_endpoint,
+        service_instance_id=args.service_instance_id,
         prometheus_port=args.prometheus_port,
         metrics_sample_rate=args.metrics_sample_rate,
         lookup_hash_log=LookupHashLogConfig(
@@ -357,6 +378,17 @@ def init_observability(
         bus.register_subscriber(EngineMetricsSubscriber())
         bus.register_subscriber(EventBusSelfMetricsSubscriber(bus))
         bus.register_subscriber(TimeoutMetricsSubscriber())
+
+        # Host/GPU/CXL hardware gauges — correlate the KV workload with the
+        # hardware it runs on. Opt-in (--enable-hardware-metrics). Best-effort:
+        # unavailable sources report no datapoints. Inherits this server's
+        # service.instance.id resource attr.
+        if obs_config.hardware_metrics_enabled:
+            from lmcache.v1.mp_observability.subscribers.metrics.hardware import (
+                register_hardware_gauges,
+            )
+
+            register_hardware_gauges()
 
     if obs_config.logging_enabled:
         # First Party
