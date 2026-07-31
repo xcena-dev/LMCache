@@ -39,7 +39,11 @@ import sys
 import traceback
 
 PYTHON = sys.executable
-MARU_EXAMPLE = Path("/home/shson/maru/examples/basic/single_instance.py")
+# Location of maru's own example. Override with MARU_EXAMPLE when the maru
+# checkout lives elsewhere (default matches the lab container's bind mount).
+MARU_EXAMPLE = Path(
+    os.environ.get("MARU_EXAMPLE", "/opt/maru-src/examples/basic/single_instance.py")
+)
 
 # ANSI colours, disabled when not a TTY so the script can be piped to a file.
 _TTY = sys.stdout.isatty()
