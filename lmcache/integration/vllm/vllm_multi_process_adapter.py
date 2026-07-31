@@ -350,6 +350,57 @@ class ParallelStrategy:
         return self.vllm_worker_id % (self.tp_size // self.n_servers) == 0
 
 
+_ParallelStrategyFields = ParallelStrategy
+
+
+class ParallelStrategy(_ParallelStrategyFields):  # type: ignore[no-redef]
+    """``ParallelStrategy`` that also accepts the pre-``n_servers`` call shape.
+
+    vLLM ships its own ``lmcache_mp_connector``; builds made against the earlier
+    LMCache lineage construct this class with **seven** positional values —
+    ``(use_mla, kv_world_size, kv_worker_id, actual_world_size,
+    actual_worker_id, tp_size, pp_size)`` — while the current dataclass takes
+    six ``(use_mla, vllm_world_size, vllm_worker_id, tp_size, pp_size,
+    n_servers)``. Without this shim such a vLLM aborts engine start with
+    ``TypeError: ParallelStrategy.__init__() takes 7 positional arguments but 8
+    were given``.
+
+    The translation is exact rather than heuristic: ``vllm_world_size`` /
+    ``vllm_worker_id`` are the *actual* values the old form passes separately,
+    and because :attr:`kv_world_size` is defined as
+    ``vllm_world_size // n_servers``, the missing field is recovered as
+    ``n_servers = actual_world_size // kv_world_size``.
+    """
+
+    def __init__(self, *args: object, **kwargs: object) -> None:
+        """Build from either the six-field or the legacy seven-value form."""
+        if len(args) == 7 and not kwargs:
+            (
+                use_mla,
+                kv_world_size,
+                _kv_worker_id,
+                actual_world_size,
+                actual_worker_id,
+                tp_size,
+                pp_size,
+            ) = args
+            n_servers = (
+                int(actual_world_size) // int(kv_world_size)  # type: ignore[call-overload]
+                if int(kv_world_size)  # type: ignore[call-overload]
+                else 1
+            ) or 1
+            super().__init__(
+                use_mla,  # type: ignore[arg-type]
+                actual_world_size,  # type: ignore[arg-type]
+                actual_worker_id,  # type: ignore[arg-type]
+                tp_size,  # type: ignore[arg-type]
+                pp_size,  # type: ignore[arg-type]
+                n_servers,
+            )
+            return
+        super().__init__(*args, **kwargs)  # type: ignore[arg-type]
+
+
 def _normalize_adapter_init_args(
     vllm_block_size: int,
     parallel_strategy: ParallelStrategy | int,
