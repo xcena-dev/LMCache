@@ -136,6 +136,19 @@ class _MaruAllocatorMemoryManager:
         Returns ``(0, 0)`` before ``init_layout`` (handler not yet
         built) and on any handler error rather than crashing callers.
 
+        Two ``get_stats()`` shapes are accepted. Older builds expose the pool
+        totals at the top level (``used_bytes`` / ``pool_size_bytes``); current
+        maru nests them under ``allocator`` as page counts
+        (``allocated_pages`` x ``chunk_size`` out of ``pool_size``). Reading only
+        the flat keys silently yields ``(0, 0)`` on a current server, which shows
+        up as an empty ``lmcache_mp.l1_memory_usage_bytes`` gauge — so try the
+        nested form too.
+
+        ``used`` is *allocated* pool bytes (includes page rounding), matching the
+        "bytes held in L1" gauge semantics used for the eviction watermark. The
+        KV payload actually stored is ``kv_manager.total_size``; the difference
+        between the two is the allocator's rounding overhead.
+
         Returns:
             ``(used_bytes, total_bytes)``.
         """
@@ -146,6 +159,12 @@ class _MaruAllocatorMemoryManager:
             stats = handler.get_stats() if hasattr(handler, "get_stats") else {}
             used = int(stats.get("used_bytes", 0))
             total = int(stats.get("pool_size_bytes", 0) or stats.get("pool_size", 0))
+            if not total:
+                allocator = stats.get("allocator") or {}
+                total = int(allocator.get("pool_size", 0))
+                used = int(
+                    allocator.get("allocated_pages", 0)
+                ) * int(allocator.get("chunk_size", 0))
             return used, total
         except Exception:
             logger.exception("Failed to query Maru handler stats")
