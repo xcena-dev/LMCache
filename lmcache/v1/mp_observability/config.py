@@ -262,7 +262,14 @@ def parse_args_to_observability_config(
         logging_enabled=not args.disable_logging,
         tracing_enabled=args.enable_tracing,
         otlp_endpoint=args.otlp_endpoint,
-        service_instance_id=args.service_instance_id,
+        # The MP server's identity flag is spelled ``--instance-id`` here and
+        # ``--service-instance-id`` on other builds; both are accepted on the
+        # CLI, so read whichever destination argparse populated instead of
+        # assuming one exists (a missing attribute aborts server startup).
+        service_instance_id=(
+            getattr(args, "service_instance_id", None)
+            or getattr(args, "instance_id", None)
+        ),
         prometheus_port=args.prometheus_port,
         metrics_sample_rate=args.metrics_sample_rate,
         lookup_hash_log=LookupHashLogConfig(
