@@ -237,12 +237,18 @@ def add_mp_server_args(
     )
     mp_group.add_argument(
         "--instance-id",
+        # ``--service-instance-id`` is the older spelling still emitted by
+        # external launchers (e.g. naru's MP runner). Accept both so a harness
+        # does not fail with "unrecognized arguments" on one build and work on
+        # another; both land in ``args.instance_id``.
+        "--service-instance-id",
+        dest="instance_id",
         type=str,
         default=None,
         help="Stable identity of this MP server. Used as the coordinator "
         "membership key and as the OTel 'service.instance.id' resource "
         "attribute on every metric and span. Defaults to a random UUID v4 "
-        "minted at startup.",
+        "minted at startup. Alias: --service-instance-id.",
     )
     mp_group.add_argument(
         "--host",
