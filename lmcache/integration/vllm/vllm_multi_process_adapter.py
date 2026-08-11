@@ -7,6 +7,7 @@ from typing import Any, Callable, NoReturn, Protocol
 import enum
 import os
 import threading
+import time
 import uuid
 
 # Third Party
@@ -1642,6 +1643,21 @@ class LMCacheMPWorkerAdapter:
 
             r_result = r_future.result()
             finished_retrieves.add(request_id)
+
+            # Measurement instrumentation. One line per reported retrieve,
+            # splitting the wait between the transport reply (raw_at) and the
+            # device event (evt_at). queries tells whether the worker was
+            # polling at all while the gate stayed shut.
+            logger.info(
+                "REQ-TRACE gate req=%s queries=%s raw_at=%s evt_at=%s "
+                "import_ms=%.3f mono=%.3f",
+                request_id,
+                getattr(r_future, "n_query_", -1),
+                getattr(r_future, "t_raw_ready_", None),
+                getattr(r_future, "t_evt_ready_", None),
+                getattr(r_future, "import_ms_", 0.0),
+                time.monotonic() * 1e3,
+            )
 
             if not r_result:
                 logger.error(

@@ -1282,6 +1282,16 @@ class LMCacheDrivenTransferModule(InstanceLivenessTarget):
             prefetched_keys: list[ObjectKey] = []
             total_bytes = 0
             retrieve_succeeded = True
+            # QoS instrumentation (non-breaking): time the storage->GPU load
+            # hop on the stream via CUDA events. Backend-agnostic — both the
+            # nixl-DRAM L1 and the Maru-CXL pool converge on this H2D transfer.
+            gpu_load_start = gpu_load_end = None
+            try:
+                gpu_load_start = torch_dev.Event(enable_timing=True)
+                gpu_load_end = torch_dev.Event(enable_timing=True)
+                gpu_load_start.record()
+            except Exception:
+                gpu_load_start = gpu_load_end = None
             try:
                 for obj_group_id in range(num_object_groups):
                     obj_keys = obj_keys_per_obj_group[obj_group_id]
@@ -1308,6 +1318,8 @@ class LMCacheDrivenTransferModule(InstanceLivenessTarget):
                         # read_prefetched_results releases this group's locks
                         # itself, and a key must not be released twice.
                         prefetched_keys.extend(obj_keys)
+                if gpu_load_end is not None:
+                    gpu_load_end.record()
             except Exception:
                 logger.exception("Cannot retrieve keys due to exception")
                 retrieve_succeeded = False
@@ -1340,6 +1352,31 @@ class LMCacheDrivenTransferModule(InstanceLivenessTarget):
                         },
                     ),
                 )
+        # QoS: storage->GPU load hop time, measured via CUDA events. Includes
+        # the H2D DMA plus the paged-scatter kernel, and forces one stream sync
+        # (measurement overhead — enable only for measurement runs).
+        # Reported even when the retrieve failed: the copy that did run is still
+        # a valid bandwidth sample, and the sweeps so far were collected this way.
+        if gpu_load_start is not None and gpu_load_end is not None:
+            try:
+                gpu_load_end.synchronize()
+                gpu_load_ms = gpu_load_start.elapsed_time(gpu_load_end)
+                if total_bytes > 0 and gpu_load_ms > 0:
+                    # req= goes LAST on purpose. The report parsers in naru
+                    # match "GPU-LOAD-QOS bytes=(\\d+) dur_ms=([\\d.]+)" with
+                    # the tag and bytes= adjacent, so inserting a field between
+                    # them breaks every existing analysis script. Appending is
+                    # invisible to them.
+                    logger.info(
+                        "GPU-LOAD-QOS bytes=%d dur_ms=%.2f GBps=%.1f req=%s",
+                        total_bytes,
+                        gpu_load_ms,
+                        total_bytes / (gpu_load_ms / 1e3) / 1e9,
+                        key.request_id,
+                    )
+            except Exception:
+                pass
+
         if retrieve_succeeded:
             tokens_retrieved = num_chunks * self._ctx.chunk_size
             ed = time.perf_counter()
@@ -1348,6 +1385,20 @@ class LMCacheDrivenTransferModule(InstanceLivenessTarget):
                 tokens_retrieved,
                 ed - st,
             )
+
+        # Measurement instrumentation. gpu_load_end.synchronize() above already
+        # returned, so the copy is done and this event should read complete. If
+        # it reads False the completion event lags the point QoS measures, which
+        # would by itself explain why the worker learns about the load late.
+        try:
+            logger.info(
+                "REQ-TRACE srv_ret req=%s evt_done=%s mono=%.3f",
+                key.request_id,
+                event_backend.query_event(event),
+                time.monotonic() * 1e3,
+            )
+        except Exception:
+            pass
 
         return (
             event_backend.export_event(event, cache_context.device),
