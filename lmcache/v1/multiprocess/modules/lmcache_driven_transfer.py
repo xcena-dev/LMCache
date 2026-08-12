@@ -693,6 +693,19 @@ class LMCacheDrivenTransferModule(InstanceLivenessTarget):
         # bunched first tokens — the very artifact the QoS line was measuring).
         self._qos_pending: collections.deque = collections.deque()
         self._qos_lock = threading.Lock()
+        # Daemon poller so tail samples are logged even when the server is
+        # killed without a graceful close() (naru tears scenarios down hard):
+        # a 100 ms poll bounds the loss window to well under the ~1.5 s gap
+        # between the last retrieve and process death observed in practice.
+        self._qos_stop = threading.Event()
+        self._qos_poller = threading.Thread(
+            target=self._qos_poll_loop, name="gpu-load-qos-drain", daemon=True
+        )
+        self._qos_poller.start()
+
+    def _qos_poll_loop(self) -> None:
+        while not self._qos_stop.wait(0.1):
+            self._drain_qos_pending()
 
     def _drain_qos_pending(self) -> None:
         """Log every pending GPU-LOAD-QOS sample whose copy has finished.
@@ -707,7 +720,12 @@ class LMCacheDrivenTransferModule(InstanceLivenessTarget):
                     if not end_evt.query():
                         break
                     gpu_load_ms = start_evt.elapsed_time(end_evt)
-                except Exception:
+                except Exception as e:
+                    # Do not drop silently: a dropped sample means a hole in
+                    # the per-request join downstream.
+                    logger.warning(
+                        "GPU-LOAD-QOS sample dropped req=%s: %s", request_id, e
+                    )
                     self._qos_pending.popleft()
                     continue
                 self._qos_pending.popleft()
@@ -768,10 +786,6 @@ class LMCacheDrivenTransferModule(InstanceLivenessTarget):
         Args:
             instance_id: The worker instance ID.
         """
-        # PING-driven: guarantees the tail retrieve's QoS sample (which has
-        # no later retrieve to drain it) is still logged within one ping
-        # interval. Non-blocking, so it does not delay the liveness refresh.
-        self._drain_qos_pending()
         now = time.monotonic()
         with self._lock:
             entry = self._cache_contexts.get(instance_id)
@@ -892,9 +906,6 @@ class LMCacheDrivenTransferModule(InstanceLivenessTarget):
             A dict containing registered GPU instance IDs and
             per-instance KV cache layout metadata.
         """
-        # Piggyback on this periodic call so the tail retrieve's QoS sample
-        # (which has no later retrieve to drain it) still gets logged.
-        self._drain_qos_pending()
         registered_gpu_ids: list[int] = []
         cache_context_meta: dict[str, dict] = {}
 
@@ -914,14 +925,14 @@ class LMCacheDrivenTransferModule(InstanceLivenessTarget):
 
     def close(self) -> None:
         """Release GPU resources owned by this module."""
-        # Flush the tail QoS sample before teardown: on shutdown right after
-        # a round, no later retrieve or PING will drain it. The copy is done
-        # by now (the round completed), so wait briefly for the event.
-        deadline = time.monotonic() + 2.0
-        while self._qos_pending and time.monotonic() < deadline:
-            self._drain_qos_pending()
-            if self._qos_pending:
-                time.sleep(0.05)
+        # Final QoS flush, then stop the poller.
+        self._drain_qos_pending()
+        self._qos_stop.set()
+        if self._qos_pending:
+            logger.warning(
+                "close(): %d GPU-LOAD-QOS samples still pending after flush",
+                len(self._qos_pending),
+            )
 
         # Stop the drain thread before storage_manager.close() so any
         # in-flight completions reach a live storage manager.
