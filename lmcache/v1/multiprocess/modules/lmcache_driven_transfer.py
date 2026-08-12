@@ -768,6 +768,10 @@ class LMCacheDrivenTransferModule(InstanceLivenessTarget):
         Args:
             instance_id: The worker instance ID.
         """
+        # PING-driven: guarantees the tail retrieve's QoS sample (which has
+        # no later retrieve to drain it) is still logged within one ping
+        # interval. Non-blocking, so it does not delay the liveness refresh.
+        self._drain_qos_pending()
         now = time.monotonic()
         with self._lock:
             entry = self._cache_contexts.get(instance_id)
@@ -888,6 +892,9 @@ class LMCacheDrivenTransferModule(InstanceLivenessTarget):
             A dict containing registered GPU instance IDs and
             per-instance KV cache layout metadata.
         """
+        # Piggyback on this periodic call so the tail retrieve's QoS sample
+        # (which has no later retrieve to drain it) still gets logged.
+        self._drain_qos_pending()
         registered_gpu_ids: list[int] = []
         cache_context_meta: dict[str, dict] = {}
 
