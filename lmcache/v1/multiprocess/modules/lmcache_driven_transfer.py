@@ -694,9 +694,7 @@ class LMCacheDrivenTransferModule(InstanceLivenessTarget):
         self._qos_pending: collections.deque = collections.deque()
         self._qos_lock = threading.Lock()
         # Daemon poller so tail samples are logged even when the server is
-        # killed without a graceful close() (naru tears scenarios down hard):
-        # a 100 ms poll bounds the loss window to well under the ~1.5 s gap
-        # between the last retrieve and process death observed in practice.
+        # killed without a graceful close() (naru tears scenarios down hard).
         self._qos_stop = threading.Event()
         self._qos_poller = threading.Thread(
             target=self._qos_poll_loop, name="gpu-load-qos-drain", daemon=True
@@ -704,31 +702,39 @@ class LMCacheDrivenTransferModule(InstanceLivenessTarget):
         self._qos_poller.start()
 
     def _qos_poll_loop(self) -> None:
-        while not self._qos_stop.wait(0.1):
+        # 5 ms poll: the QoS line's log timestamp doubles as the load-end
+        # wall time in the timeline join, so the poll interval is the error
+        # bound on that mark. query() on a handful of events is microseconds.
+        while not self._qos_stop.wait(0.005):
             self._drain_qos_pending()
 
     def _drain_qos_pending(self) -> None:
         """Log every pending GPU-LOAD-QOS sample whose copy has finished.
 
-        Non-blocking: entries whose end event still reads incomplete stay
-        queued (FIFO, so head-of-line order is preserved per stream).
+        Non-blocking. Scans ALL pending entries (not just the head) and logs
+        each the moment its end event reads complete: the log timestamp is
+        the load-end wall-time mark downstream, so completion must not sit
+        behind a slower head-of-line entry.
         """
         with self._qos_lock:
+            done: list[tuple] = []
+            still: collections.deque = collections.deque()
             while self._qos_pending:
-                start_evt, end_evt, total_bytes, request_id = self._qos_pending[0]
+                entry = self._qos_pending.popleft()
+                start_evt, end_evt, total_bytes, request_id = entry
                 try:
-                    if not end_evt.query():
-                        break
-                    gpu_load_ms = start_evt.elapsed_time(end_evt)
+                    if end_evt.query():
+                        done.append((start_evt.elapsed_time(end_evt), entry))
+                    else:
+                        still.append(entry)
                 except Exception as e:
                     # Do not drop silently: a dropped sample means a hole in
                     # the per-request join downstream.
                     logger.warning(
                         "GPU-LOAD-QOS sample dropped req=%s: %s", request_id, e
                     )
-                    self._qos_pending.popleft()
-                    continue
-                self._qos_pending.popleft()
+            self._qos_pending = still
+            for gpu_load_ms, (_s, _e, total_bytes, request_id) in done:
                 if total_bytes > 0 and gpu_load_ms > 0:
                     # req= goes LAST on purpose. The report parsers in naru
                     # match "GPU-LOAD-QOS bytes=(\\d+) dur_ms=([\\d.]+)" with
