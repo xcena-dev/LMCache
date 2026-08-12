@@ -914,6 +914,15 @@ class LMCacheDrivenTransferModule(InstanceLivenessTarget):
 
     def close(self) -> None:
         """Release GPU resources owned by this module."""
+        # Flush the tail QoS sample before teardown: on shutdown right after
+        # a round, no later retrieve or PING will drain it. The copy is done
+        # by now (the round completed), so wait briefly for the event.
+        deadline = time.monotonic() + 2.0
+        while self._qos_pending and time.monotonic() < deadline:
+            self._drain_qos_pending()
+            if self._qos_pending:
+                time.sleep(0.05)
+
         # Stop the drain thread before storage_manager.close() so any
         # in-flight completions reach a live storage manager.
         self._device_host_func_dispatcher.stop()
