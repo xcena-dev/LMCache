@@ -128,14 +128,17 @@ __device__ inline size_t calculate_lmcache_global_offset(
     const int k_or_v,
     const int
         token_offset_in_lmcache_object,  // 0~255 if LMCache chunk size is 256
-    const int layer_idx,
-    const int lmcache_chunk_size,  // e.g., 256
+    const int layer_slot,                // index within the staged layer slice
+    const int staged_layers,             // layers held by the staged buffer
+    const int lmcache_chunk_size,        // e.g., 256
     const PageBufferShapeDesc shape_desc) {
   size_t scalars_per_token = shape_desc.scalars_per_token<ScalarType>();
-  // LMCache is using 2LTD all the times
+  // LMCache is using 2LTD all the times. `staged_layers` is the L of the
+  // *staged* buffer, which equals shape_desc.nl for chunk-major staging and
+  // the slice width for layer-major staging.
   return token_offset_in_lmcache_object * scalars_per_token +
-         layer_idx * lmcache_chunk_size * scalars_per_token +
-         k_or_v * shape_desc.nl * lmcache_chunk_size * scalars_per_token;
+         layer_slot * lmcache_chunk_size * scalars_per_token +
+         k_or_v * staged_layers * lmcache_chunk_size * scalars_per_token;
 }
 
 /**
@@ -195,22 +198,28 @@ __device__ void multi_layer_block_transfer_single_block(
     ScalarType* __restrict__ lmcache_object,
     ScalarType** __restrict__ paged_buffer_ptrs, const int engine_block_idx,
     const int offset_in_lmcache_block, const PageBufferShapeDesc shape_desc,
-    const int lmcache_chunk_size  // e.g., 256, used to calculate global offset
-                                  // in LMCache object
+    const int lmcache_chunk_size,  // e.g., 256, used to calculate global offset
+                                   // in LMCache object
+    const int layer_offset,        // first model layer of the staged slice
+    const int staged_layers        // layers held by the staged buffer
 ) {
   const int head_idx = threadIdx.y;
   const int init_token_offset = threadIdx.z;
   const int token_stride = blockDim.z;
   const int k_or_v = blockIdx.x;
-  const int layer_idx = blockIdx.z;
+  // blockIdx.z walks the *staged* layer slice; the engine side needs the
+  // absolute model layer. The two coincide for chunk-major staging, where
+  // layer_offset is 0 and staged_layers == shape_desc.nl.
+  const int layer_slot = blockIdx.z;
+  const int layer_idx = layer_offset + layer_slot;
 
   const size_t engine_global_offset =
       calculate_engine_global_offset<ScalarType, format>(
           k_or_v, engine_block_idx, layer_idx, shape_desc);
   const size_t lmcache_global_offset =
       calculate_lmcache_global_offset<ScalarType, format>(
-          k_or_v, offset_in_lmcache_block, layer_idx, lmcache_chunk_size,
-          shape_desc);
+          k_or_v, offset_in_lmcache_block, layer_slot, staged_layers,
+          lmcache_chunk_size, shape_desc);
   ScalarType* paged_buffer_layer_ptr;
   if constexpr (format == EngineKVFormat::NB_NL_TWO_BS_NH_HS ||
                 format == EngineKVFormat::NB_NL_TWO_NH_BS_HS) {
@@ -284,7 +293,8 @@ __global__ void multi_layer_block_transfer_kernel(
     const PageBufferShapeDesc shape_desc,
     const int lmcache_chunk_size,  // e.g., 256, used to calculate global offset
                                    // in LMCache object
-    const int skip_prefix_n_blocks) {
+    const int skip_prefix_n_blocks, const int layer_offset,
+    const int staged_layers) {
   // blockIdx.y spans all blocks across all objects (total_blocks).
   // Derive which object and local block index from the flat index.
   const int flat_block_idx = blockIdx.y;
@@ -299,15 +309,15 @@ __global__ void multi_layer_block_transfer_kernel(
                                           format>(
       lmcache_objects.objects[obj_idx], paged_buffer_ptrs, engine_block_idx,
       block_idx_in_object * shape_desc.bs,  // offset in LMCache object
-      shape_desc, lmcache_chunk_size);
+      shape_desc, lmcache_chunk_size, layer_offset, staged_layers);
 }
 
-#define LAUNCH_KERNEL(DIRECTION, FORMAT)                                 \
-  multi_layer_block_transfer_kernel<ScalarType, DIRECTION, FORMAT>       \
-      <<<grid, block, 0, stream>>>(lmcache_obj4, paged_buffer_ptrs,      \
-                                   block_ids_ptr, num_blocks_per_object, \
-                                   shape_desc, lmcache_chunk_size,       \
-                                   skip_prefix_n_blocks);                \
+#define LAUNCH_KERNEL(DIRECTION, FORMAT)                           \
+  multi_layer_block_transfer_kernel<ScalarType, DIRECTION, FORMAT> \
+      <<<grid, block, 0, stream>>>(                                \
+          lmcache_obj4, paged_buffer_ptrs, block_ids_ptr,          \
+          num_blocks_per_object, shape_desc, lmcache_chunk_size,   \
+          skip_prefix_n_blocks, layer_offset, staged);             \
   C10_CUDA_KERNEL_LAUNCH_CHECK();
 
 #define DISPATCH_FORMAT(DIRECTION)                                      \
@@ -368,7 +378,8 @@ void multi_layer_block_kv_transfer_templated(
     std::vector<int64_t> lmcache_objects_ptrs, const torch::Tensor& block_ids,
     const torch::Device& device, TransferDirection direction,
     PageBufferShapeDesc shape_desc, int lmcache_chunk_size,
-    EngineKVFormat engine_kv_format, int skip_prefix_n_blocks) {
+    EngineKVFormat engine_kv_format, int skip_prefix_n_blocks, int layer_offset,
+    int staged_layers) {
   // --- Validation ---
   int num_objects = static_cast<int>(lmcache_objects_ptrs.size());
   TORCH_CHECK(num_objects >= 1 && num_objects <= 4,
@@ -417,8 +428,18 @@ void multi_layer_block_kv_transfer_templated(
       std::min(shape_desc.bs, 1024 / (thread_dim_x * thread_dim_y));
   thread_dim_z = std::min(thread_dim_z, 64);  // max threads per block in z-dim
 
+  // 0 means chunk-major: the staged buffer holds every layer.
+  const int staged = staged_layers > 0 ? staged_layers : shape_desc.nl;
+  TORCH_CHECK(layer_offset >= 0, "layer_offset must be non-negative, got ",
+              layer_offset);
+  TORCH_CHECK(staged <= shape_desc.nl, "staged_layers (", staged,
+              ") exceeds the model's layer count (", shape_desc.nl, ")");
+  TORCH_CHECK(layer_offset + staged <= shape_desc.nl, "layer slice [",
+              layer_offset, ", ", layer_offset + staged,
+              ") exceeds the model's layer count ", shape_desc.nl);
+
   dim3 block(thread_dim_x, thread_dim_y, thread_dim_z);
-  dim3 grid(shape_desc.kv_size, total_blocks, shape_desc.nl);
+  dim3 grid(shape_desc.kv_size, total_blocks, staged);
 
   if (direction == TransferDirection::H2D) {
     DISPATCH_FORMAT(true);
@@ -437,7 +458,7 @@ void multi_layer_block_kv_transfer_templated(
     multi_layer_block_kv_transfer_templated<type>(                         \
         paged_buffer_ptrs_tensor, lmcache_objects_ptrs, block_ids, device, \
         direction, shape_desc, lmcache_chunk_size, engine_kv_format,       \
-        skip_prefix_n_blocks);                                             \
+        skip_prefix_n_blocks, layer_offset, staged_layers);                \
   } while (0)
 
 void multi_layer_block_kv_transfer(
@@ -445,7 +466,8 @@ void multi_layer_block_kv_transfer(
     std::vector<int64_t> lmcache_objects_ptrs, const torch::Tensor& block_ids,
     const torch::Device& device, TransferDirection direction,
     PageBufferShapeDesc shape_desc, int lmcache_chunk_size,
-    EngineKVFormat engine_kv_format, int skip_prefix_n_blocks) {
+    EngineKVFormat engine_kv_format, int skip_prefix_n_blocks, int layer_offset,
+    int staged_layers) {
   int head_bytes = shape_desc.hs * shape_desc.element_size;
   TORCH_CHECK(head_bytes % sizeof(uint16_t) == 0, "head_size * element_size (",
               head_bytes, ") must be divisible by 2 for vectorized access");
@@ -545,7 +567,8 @@ void execute_object_group_transfer(
       multi_layer_block_kv_transfer(
           paged_buffer_ptrs_tensor, std::move(lmcache_objects_ptrs), block_ids,
           device, direction, group.shape_desc, group.lmcache_chunk_size,
-          group.engine_kv_format, launch.skip_prefix_n_blocks);
+          group.engine_kv_format, launch.skip_prefix_n_blocks,
+          launch.layer_offset, launch.staged_layers);
     }
     if (!is_h2d) {
       do_staging(step.staging);
