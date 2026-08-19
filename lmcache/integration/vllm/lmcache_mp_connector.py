@@ -246,7 +246,38 @@ class LMCacheMPConnector(KVConnectorBase_V1, SupportsHMA):
       heartbeat pings.
     - lmcache.mp.eager_prefetch: submit the LMCache lookup when a request
       enters vLLM's waiting queue. Disabled by default.
+    - lmcache.mp.layerwise_overlap: the server stages KV a layer slice at a
+      time and this connector waits per layer. Disabled by default. Must match
+      the server's layer-major setting; see
+      ``requires_piecewise_for_cudagraph`` for why the connector needs its own
+      copy of the flag rather than reading the server's.
     """
+
+    @classmethod
+    def requires_piecewise_for_cudagraph(cls, extra_config: dict[str, Any]) -> bool:
+        """Whether vLLM must keep PIECEWISE CUDA graphs for this connector.
+
+        ``wait_for_layer_load`` only does real work under layer-major staging,
+        and per-layer synchronization cannot be captured in a CUDA graph: under
+        a full-graph replay the wait is skipped and the model reads KV that may
+        still be in flight. vLLM's default ``FULL_AND_PIECEWISE`` runs batches
+        containing prefill piecewise, so the wait does fire there, but
+        ``--cudagraph-mode FULL`` with a backend that supports it would drop the
+        barrier silently -- a correctness loss, not a slowdown. Declaring the
+        requirement makes vLLM keep the mode that preserves it.
+
+        The server is the component that decides layer-major staging, but this
+        is a classmethod called before any server handshake, so it can only read
+        the deployer-supplied config. The flag therefore has to be set on the
+        vLLM side as well as the server side.
+
+        Args:
+            extra_config: ``kv_transfer_config.extra_config``.
+
+        Returns:
+            True when layer-major overlap is enabled for this deployment.
+        """
+        return bool(extra_config.get("lmcache.mp.layerwise_overlap", False))
 
     def __init__(
         self,
