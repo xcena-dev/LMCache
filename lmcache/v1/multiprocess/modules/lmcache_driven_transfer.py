@@ -651,6 +651,42 @@ def _run_object_group_transfer_plan_layer_major(
             on_layer_batch(layer_start, layer_count)
 
 
+_layer_major_fallback_logged = False
+
+
+def _layer_major_unusable_reason(
+    cache_context: BaseCacheContext,
+    memory_objs: Sequence[MemoryObj | None],
+    object_group_id: int,
+    direction: "lmcache_native.TransferDirection",
+) -> str | None:
+    """Return why layer-major staging cannot serve this transfer, or None if it can.
+
+    Args:
+        cache_context: The GPU cache context containing the KV cache information.
+        memory_objs: The MemoryObj instances about to be copied.
+        object_group_id: Index of the object group being copied.
+        direction: H2D (retrieve) or D2H (store).
+
+    Returns:
+        A short reason for the caller to log, or None when layer-major applies.
+    """
+    if direction != lmcache_native.TransferDirection.H2D:
+        return "stores stay chunk-major"
+    if not _HAS_NATIVE_OBJECT_GROUP_TRANSFER:
+        return "the native object-group transfer extension is unavailable"
+    if any(isinstance(mo, GDSMemoryObject) for mo in memory_objs):
+        return "the batch contains GDS-backed objects"
+    object_group = cache_context.kv_layer_groups_manager.object_groups[object_group_id]
+    if len(object_group.kernel_group_indices) != 1:
+        return (
+            "the object group holds "
+            f"{len(object_group.kernel_group_indices)} kernel groups "
+            "(hybrid model)"
+        )
+    return None
+
+
 def transfer_kv_per_object_group(
     cache_context: BaseCacheContext,
     block_ids_gpu: list[torch.Tensor],
@@ -659,6 +695,8 @@ def transfer_kv_per_object_group(
     batch_size: int,
     skip_first_n_tokens: int,
     direction: "lmcache_native.TransferDirection",
+    layers_per_stage: int = 0,
+    on_layer_batch: "Callable[[int, int], None] | None" = None,
 ) -> None:
     """Helper function to transfer memory objects of a single object group
     to/from GPU, with batching support.
@@ -679,6 +717,13 @@ def transfer_kv_per_object_group(
             the retrieve range. This avoids overwriting APC-shared GPU blocks that
             may be read concurrently by other requests.
         direction: The transfer direction, H2D (retrieve) or D2H (store).
+        layers_per_stage: Stage the layer axis in slices of this many layers
+            instead of copying whole chunks. 0 (default) keeps the chunk-major
+            path. Only retrieves can use it, and only when the object group
+            holds a single kernel group and no GDS-backed objects; anything else
+            falls back to chunk-major and logs the reason once.
+        on_layer_batch: Called with ``(layer_start, layer_count)`` after each
+            slice is enqueued, when layer-major staging is in effect.
 
     Raises:
         ValueError: If it founds None entry in memory_objs when direction is H2D.
@@ -686,6 +731,33 @@ def transfer_kv_per_object_group(
         This function expects the caller to stage the block ids (list[list[int]])
         into GPU tensors and pass them in as `block_ids_gpu`.
     """
+    if layers_per_stage > 0:
+        reason = _layer_major_unusable_reason(
+            cache_context, memory_objs, object_group_id, direction
+        )
+        if reason is None:
+            _run_object_group_transfer_plan_layer_major(
+                cache_context,
+                block_ids_gpu,
+                memory_objs,
+                object_group_id,
+                batch_size,
+                skip_first_n_tokens,
+                direction,
+                layers_per_stage,
+                on_layer_batch=on_layer_batch,
+            )
+            return
+        global _layer_major_fallback_logged
+        if not _layer_major_fallback_logged:
+            _layer_major_fallback_logged = True
+            logger.info(
+                "Layer-major retrieve is configured (%d layers per stage) but "
+                "this transfer falls back to chunk-major: %s. Logged once.",
+                layers_per_stage,
+                reason,
+            )
+
     if _HAS_NATIVE_OBJECT_GROUP_TRANSFER and not any(
         isinstance(mo, GDSMemoryObject) for mo in memory_objs
     ):
@@ -1583,6 +1655,7 @@ class LMCacheDrivenTransferModule(InstanceLivenessTarget):
                             batch_size=cache_context.max_batch_size,
                             skip_first_n_tokens=skip_first_n_tokens,
                             direction=lmcache_native.TransferDirection.H2D,
+                            layers_per_stage=self._ctx.retrieve_layers_per_stage,
                         )
                         # Extend only after the copy is enqueued: on exception,
                         # read_prefetched_results releases this group's locks

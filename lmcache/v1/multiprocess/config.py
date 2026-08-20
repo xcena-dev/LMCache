@@ -69,6 +69,24 @@ class MPServerConfig:
     (STORE/RETRIEVE, supports CUDA IPC and CPU SHM), 'engine_driven' for
     engine-driven transfer (PREPARE/COMMIT), or 'auto' to enable both."""
 
+    retrieve_layers_per_stage: int = 0
+    """Retrieve KV a layer slice at a time instead of a chunk at a time, this
+    many layers per slice. 0 (default) keeps the chunk-major path.
+
+    Layer-major staging lets a consumer start on the first layers while the
+    rest are still moving, but it is not a free win: when the per-layer
+    transfer runs well ahead of the per-layer compute, the compute stream
+    stalls at every layer and that wait is shared with the co-scheduled
+    requests in the batch. On an in-process connector with the same structure
+    the sign flipped with prompt length and chunk size -- 50 ms saved at
+    16k/chunk-256, 38 ms lost at 64k/chunk-256. So this stays off unless the
+    deployment has been measured.
+
+    Retrieve only; stores stay chunk-major, where there is no per-layer
+    consumer to overlap with. Falls back to chunk-major for GDS-backed objects
+    and for hybrid models (several kernel groups per object group).
+    """
+
     runtime_plugin_config: "RuntimePluginConfig" = field(
         default_factory=lambda: RuntimePluginConfig()
     )
@@ -333,6 +351,20 @@ def add_mp_server_args(
         "Default is 'lmcache_driven'.",
     )
     mp_group.add_argument(
+        "--retrieve-layers-per-stage",
+        type=int,
+        default=0,
+        help="Retrieve KV a layer slice at a time instead of a chunk at a "
+        "time, this many layers per slice. 0 (default) keeps the chunk-major "
+        "path. Layer-major staging lets the engine start on the first layers "
+        "while the rest are still moving, but it loses when the per-layer "
+        "transfer runs well ahead of the per-layer compute (measured on an "
+        "in-process connector: 50 ms saved at prompt 16k / chunk 256, 38 ms "
+        "lost at prompt 64k / chunk 256). Leave it off unless the deployment "
+        "has been measured. Retrieve only; falls back to chunk-major for "
+        "GDS-backed objects and hybrid models.",
+    )
+    mp_group.add_argument(
         "--runtime-plugin-locations",
         type=str,
         nargs="*",
@@ -441,6 +473,7 @@ def parse_args_to_mp_server_config(
         separate_object_groups=args.separate_object_groups,
         enable_segmented_prefix=args.enable_segmented_prefix,
         supported_transfer_mode=args.supported_transfer_mode,
+        retrieve_layers_per_stage=args.retrieve_layers_per_stage,
         runtime_plugin_config=RuntimePluginConfig(
             locations=(args.runtime_plugin_locations or []),
             extra_config=plugin_extra,

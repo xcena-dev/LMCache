@@ -197,6 +197,8 @@ class MPCacheServerContext:
         separate_object_groups: Whether to split kernel groups into one object
             group per sliding-window size at KV-cache registration. Default
             False.
+        retrieve_layers_per_stage: Layers per slice for layer-major retrieve.
+            0 (default) keeps the chunk-major path.
     """
 
     def __init__(
@@ -206,10 +208,12 @@ class MPCacheServerContext:
         hash_algorithm: str = "blake3",
         separate_object_groups: bool = False,
         full_sw_kv: bool = False,
+        retrieve_layers_per_stage: int = 0,
     ) -> None:
         self._chunk_size = chunk_size
         self._separate_object_groups = separate_object_groups
         self._full_sw_kv = full_sw_kv
+        self._retrieve_layers_per_stage = max(0, retrieve_layers_per_stage)
 
         # Initialize the process-global GDS context.
         # No-op when GDS L1 is disabled (config is None).
@@ -250,6 +254,11 @@ class MPCacheServerContext:
     def full_sw_kv(self) -> bool:
         """Whether sliding-window groups cache full per-chunk KV (no window cutting)."""
         return self._full_sw_kv
+
+    @property
+    def retrieve_layers_per_stage(self) -> int:
+        """Layers per slice for layer-major retrieve; 0 means chunk-major."""
+        return self._retrieve_layers_per_stage
 
     @property
     def storage_manager(self) -> StorageManager:
