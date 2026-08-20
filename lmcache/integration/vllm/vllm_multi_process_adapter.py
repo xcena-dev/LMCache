@@ -6,7 +6,9 @@ from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any, Callable, NoReturn, Protocol
 import enum
 import os
+import re
 import threading
+import time
 import uuid
 
 # Third Party
@@ -27,6 +29,7 @@ from lmcache.v1.multiprocess.group_view import (
     EngineGroupInfo,
     expand_engine_block_ids,
 )
+from lmcache.v1.multiprocess.layer_arrival_pool import LayerArrivalPool
 from lmcache.v1.multiprocess.mq import MessageQueueClient, MessagingFuture
 from lmcache.v1.multiprocess.protocol import RequestType, get_response_class
 from lmcache.v1.multiprocess.transfer_context import (
@@ -41,6 +44,17 @@ if TYPE_CHECKING:
     from lmcache.integration.vllm.experimental import Dispatcher
 
 logger = init_logger(__name__)
+
+#: Concurrent retrieves that can track per-layer arrival. Beyond this a
+#: retrieve runs without progress tracking and waits for the whole transfer.
+_ARRIVAL_SLOTS = 128
+
+#: Give up waiting on a layer after this long and log; a hang here would stall
+#: the model runner thread for the whole batch.
+_ARRIVAL_WAIT_TIMEOUT = 60.0
+
+#: Pulls the integer out of vLLM layer names like "model.layers.5.self_attn".
+_LAYER_INDEX_RE = re.compile(r"model\.layers\.(\d+)")
 
 
 class ExtraConfigDefault(enum.Enum):
@@ -65,6 +79,10 @@ class ExtraConfigDefault(enum.Enum):
     # Mirrors the ``LMCACHE_MP_TRANSFER_MODE`` env var; this extra_config
     # key wins when both are set.
     mp_transfer_mode = "auto"
+    # Track per-layer arrival so a cache-hit request can go back to the engine
+    # on its first layers while later ones are still copying. Must match the
+    # server's --retrieve-layers-per-stage; see LMCacheMPConnector.
+    layerwise_overlap = False
 
 
 # Backward-compatible aliases for the legacy `lmcache_mp_connector_0180`
@@ -1073,8 +1091,10 @@ class LMCacheMPWorkerAdapter:
             legacy_block_size,
             mq_timeout,
         )
+        layerwise_overlap = ExtraConfigDefault.layerwise_overlap.value
         if extra_config is not None:
             cfg = _resolve_extra_config(extra_config)
+            layerwise_overlap = cfg[ExtraConfigDefault.layerwise_overlap.name]
             mq_timeout = cfg[ExtraConfigDefault.mq_timeout.name]
             heartbeat_interval = cfg[ExtraConfigDefault.heartbeat_interval.name]
             # Only treat ``mp_transfer_mode`` as an explicit override when
@@ -1127,6 +1147,16 @@ class LMCacheMPWorkerAdapter:
         # submit_retrieve_request. get_finished must still report each id
         # exactly once, or async loads hang in WAITING_FOR_REMOTE_KVS.
         self._dropped_retrieves: set[str] = set()
+
+        # Layer-major retrieve: slots the server publishes per-layer progress
+        # into. Built on first retrieve, since it needs the registered layer
+        # count and event backend. None when the deployment did not ask for it.
+        self._layerwise_overlap = bool(layerwise_overlap)
+        self._arrival_pool: LayerArrivalPool | None = None
+        self._arrival_pool_failed = False
+        # Requests handed to the engine on their first layers while their
+        # transfer is still running: their future is still owed a completion.
+        self._draining_retrieves: dict[str, tuple[Any, list[int]]] = {}
 
         # The store requests that have finished execution in LMCache
         self.finished_stores: set[str] = set()
@@ -1446,6 +1476,96 @@ class LMCacheMPWorkerAdapter:
         self.store_futures[request_id] = future
         self.store_events[request_id] = event
 
+    def _ensure_arrival_pool(self) -> "LayerArrivalPool | None":
+        """Build this worker's arrival slots on first use.
+
+        Needs the registered KV caches (for the layer count) and the event
+        backend, so it cannot be built in the constructor. A failure here costs
+        the overlap, not correctness: the caller submits an ordinary retrieve.
+
+        Returns:
+            The pool, or None when layer-major overlap is off or unavailable.
+        """
+        if not self._layerwise_overlap or self._arrival_pool_failed:
+            return None
+        if self._arrival_pool is not None:
+            return self._arrival_pool
+        transfer_ctx = self.transfer_ctx
+        event_backend = getattr(transfer_ctx, "event_backend", None)
+        device = getattr(transfer_ctx, "device", None)
+        num_layers = len(self.kv_caches)
+        if event_backend is None or device is None or num_layers < 1:
+            self._arrival_pool_failed = True
+            logger.warning(
+                "Layer-major overlap is enabled but the transfer context "
+                "exposes no event backend or no layers were registered; "
+                "retrieves run without per-layer progress"
+            )
+            return None
+        try:
+            self._arrival_pool = LayerArrivalPool(
+                num_layers=num_layers,
+                num_slots=_ARRIVAL_SLOTS,
+                board_name=f"lmcache_arrival_{os.getpid()}_{self.instance_id}",
+                event_backend=event_backend,
+                device=device,
+            )
+        except Exception:
+            self._arrival_pool_failed = True
+            logger.exception(
+                "Cannot create the layer arrival board; retrieves run without "
+                "per-layer progress"
+            )
+            return None
+        logger.info(
+            "Layer-major overlap enabled: %d layers, %d arrival slots on %s",
+            num_layers,
+            _ARRIVAL_SLOTS,
+            self._arrival_pool.board_name,
+        )
+        return self._arrival_pool
+
+    @_lmcache_nvtx_annotate
+    def wait_for_layer_load(self, layer_name: str) -> None:
+        """Block until every in-flight retrieve has landed ``layer_name``.
+
+        A no-op unless layer-major overlap is on, in which case a request may
+        already be running while its later layers are still copying. Each
+        request's slice is waited on once; layers whose slice was already waited
+        on cost nothing.
+
+        Args:
+            layer_name: vLLM layer name, e.g. ``"model.layers.5.self_attn"``.
+        """
+        pool = self._arrival_pool
+        if pool is None:
+            return
+        match = _LAYER_INDEX_RE.search(layer_name)
+        if match is None:
+            return
+        layer_idx = int(match.group(1))
+        for request_id in pool.active_request_ids():
+            deadline = time.monotonic() + _ARRIVAL_WAIT_TIMEOUT
+            while pool.layers_arrived(request_id) <= layer_idx:
+                if time.monotonic() > deadline:
+                    logger.error(
+                        "Timed out after %.1fs waiting for layer %d of request "
+                        "%s; the model may read KV that has not landed",
+                        _ARRIVAL_WAIT_TIMEOUT,
+                        layer_idx,
+                        request_id,
+                    )
+                    return
+            event = pool.event_for_layer(request_id, layer_idx)
+            if event is None:
+                continue
+            transfer_ctx = self.transfer_ctx
+            event_backend = getattr(transfer_ctx, "event_backend", None)
+            device = getattr(transfer_ctx, "device", None)
+            if event_backend is None or device is None:
+                return
+            event_backend.wait_event(event, torch_dev.current_stream(device))
+
     @_lmcache_nvtx_annotate
     def submit_retrieve_request(
         self,
@@ -1488,6 +1608,17 @@ class LMCacheMPWorkerAdapter:
                 "Transfer context is not initialized. "
                 "Call register_kv_caches() before submitting retrieve requests."
             )
+        # Take an arrival slot so the server can publish this retrieve's
+        # per-layer progress. Without one the retrieve still runs; the request
+        # just waits for the whole transfer as it always did.
+        arrival_board: tuple[str, int, int] | None = None
+        layer_events: list[bytes] | None = None
+        pool = self._ensure_arrival_pool()
+        if pool is not None:
+            acquired = pool.acquire(request_id)
+            if acquired is not None:
+                arrival_board, layer_events = acquired
+
         future = self.transfer_ctx.submit_retrieve(
             request_id,
             key,
@@ -1497,6 +1628,8 @@ class LMCacheMPWorkerAdapter:
             event,
             self.blocks_in_chunk,
             skip_first_n_tokens=op.skip_first_n_tokens,
+            arrival_board=arrival_board,
+            layer_events=layer_events,
         )
         self.retrieve_futures[request_id] = (future, op.flat_block_ids)
         self.retrieve_events[request_id] = event
@@ -1652,7 +1785,47 @@ class LMCacheMPWorkerAdapter:
                     request_id,
                 )
 
+        # Layer-major overlap: hand a request back as soon as its first layers
+        # have landed, so its own attention runs while the rest are still
+        # copying. Correctness is held by wait_for_layer_load, which blocks on
+        # each layer's event before the model reads it. The future is kept in
+        # _draining_retrieves so the transfer's real completion (and any
+        # failure) is still collected below.
+        pool = self._arrival_pool
+        if pool is not None:
+            for request_id in list(self.retrieve_futures):
+                if request_id in self._draining_retrieves:
+                    continue
+                if not pool.release_ready(request_id):
+                    continue
+                r_future, blocks = self.retrieve_futures[request_id]
+                if r_future.query():
+                    # Already finished outright; the normal path below reports
+                    # it and there is nothing to overlap.
+                    continue
+                self._draining_retrieves[request_id] = (r_future, blocks)
+                finished_retrieves.add(request_id)
+
+        for request_id, (r_future, blocks) in list(self._draining_retrieves.items()):
+            if not r_future.query():
+                continue
+            self._draining_retrieves.pop(request_id, None)
+            self.retrieve_futures.pop(request_id, None)
+            self.retrieve_events.pop(request_id, None)
+            if pool is not None:
+                pool.release(request_id)
+            if not r_future.result(timeout=60):
+                logger.error(
+                    "Something went wrong when processing the retrieve "
+                    "request for request_id=%s (reported early on its first "
+                    "layers)",
+                    request_id,
+                )
+                self.error_block_ids.update(blocks)
+
         for request_id, (r_future, _) in self.retrieve_futures.items():
+            if request_id in self._draining_retrieves:
+                continue
             if not r_future.query():
                 continue
 
@@ -1672,6 +1845,11 @@ class LMCacheMPWorkerAdapter:
             self.store_futures.pop(request_id, None)
             self.store_events.pop(request_id, None)
         for request_id in finished_retrieves:
+            # Early-released requests keep their future until the transfer
+            # actually finishes, so the draining pass above can collect the
+            # result and free the arrival slot.
+            if request_id in self._draining_retrieves:
+                continue
             self.retrieve_futures.pop(request_id, None)
             self.retrieve_events.pop(request_id, None)
 

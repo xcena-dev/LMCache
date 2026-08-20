@@ -579,12 +579,15 @@ class LMCacheMPConnector(KVConnectorBase_V1, SupportsHMA):
         paged buffer. This is called from within attention layer to ensure
         async copying from start_load_kv is complete.
 
-        This interface will be useful for layer-by-layer pipelining.
+        Under layer-major retrieval a request may already be running while its
+        later layers are still copying, so this blocks on each layer's arrival
+        before the model reads it. Without that mode there is nothing in flight
+        and the call returns immediately.
 
         Args:
             layer_name: the name of that layer
         """
-        return
+        self.worker_adapter.wait_for_layer_load(layer_name)
 
     def save_kv_layer(
         self,

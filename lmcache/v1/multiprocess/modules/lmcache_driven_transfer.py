@@ -44,6 +44,7 @@ from lmcache.v1.multiprocess.engine_module import (
     ThreadPoolType,
 )
 from lmcache.v1.multiprocess.group_view import EngineGroupInfo
+from lmcache.v1.multiprocess.layer_arrival_board import LayerArrivalBoard
 from lmcache.v1.multiprocess.native_completion import (
     DeviceHostFuncDispatcher,
     submit_callback_to_stream,
@@ -934,6 +935,10 @@ class LMCacheDrivenTransferModule(InstanceLivenessTarget):
 
     def __init__(self, ctx: MPCacheServerContext) -> None:
         self._ctx = ctx
+        # Worker arrival boards, mapped once per segment name and kept for the
+        # life of the server (see _attach_arrival_board).
+        self._arrival_boards: dict[str, LayerArrivalBoard] = {}
+        self._arrival_boards_lock = threading.Lock()
         self._cache_contexts: dict[int, ContextEntry] = {}
         # Guards all reads/writes of _cache_contexts. The reaper mutates it
         # off the MQ main loop, so register/unregister/store/retrieve and
@@ -1147,6 +1152,10 @@ class LMCacheDrivenTransferModule(InstanceLivenessTarget):
             entries = list(self._cache_contexts.values())
             self._cache_contexts.clear()
         self._release_entries(entries)
+        with self._arrival_boards_lock:
+            for board in self._arrival_boards.values():
+                board.close()
+            self._arrival_boards.clear()
 
     def register_kv_cache(
         self,
@@ -1497,6 +1506,82 @@ class LMCacheDrivenTransferModule(InstanceLivenessTarget):
         )
 
     @_lmcache_nvtx_annotate
+    def _attach_arrival_board(self, name: str, num_slots: int) -> LayerArrivalBoard:
+        """Return this process's mapping of a worker's arrival board.
+
+        One mapping per board name is kept for the life of the server; workers
+        create the segment and reuse it across retrieves.
+
+        Args:
+            name: POSIX shared-memory segment name the worker created.
+            num_slots: Slots the segment holds.
+
+        Returns:
+            The attached board.
+
+        Raises:
+            OSError: If the segment cannot be mapped.
+        """
+        with self._arrival_boards_lock:
+            board = self._arrival_boards.get(name)
+            if board is None:
+                board = LayerArrivalBoard.attach(name, num_slots)
+                self._arrival_boards[name] = board
+            return board
+
+    def _build_layer_arrival_publisher(
+        self,
+        cache_context: Any,
+        event_backend: Any,
+        arrival_board: tuple[str, int, int] | None,
+        layer_event_handles: list[bytes] | None,
+    ) -> "Callable[[int, int], None] | None":
+        """Build the per-slice callback that tells the worker a slice has landed.
+
+        Records one event per layer in the slice and then raises the board's
+        count to the slice's end. The order matters: the count is what makes
+        those events safe for the worker to wait on, so it is published last.
+
+        Args:
+            cache_context: The GPU cache context (for stream and device).
+            event_backend: Device event backend for import/record.
+            arrival_board: ``(segment name, slot, slots in segment)`` from the
+                worker, or None when the worker did not ask for per-slice
+                progress.
+            layer_event_handles: One exported event handle per layer, or None.
+
+        Returns:
+            The callback, or None when per-slice progress was not requested or
+            could not be set up (the transfer then runs without it).
+        """
+        if arrival_board is None or not layer_event_handles:
+            return None
+        name, slot, num_slots = arrival_board
+        try:
+            board = self._attach_arrival_board(name, num_slots)
+            layer_events = [
+                event_backend.import_event(handle, cache_context.device)
+                for handle in layer_event_handles
+            ]
+        except Exception:
+            # Losing per-slice progress costs the overlap, not correctness: the
+            # worker still waits for the whole retrieve via its own event.
+            logger.exception(
+                "Cannot set up per-slice layer arrival publishing on board %s "
+                "slot %d; the retrieve proceeds without it",
+                name,
+                slot,
+            )
+            return None
+
+        def publish(layer_start: int, layer_count: int) -> None:
+            end = min(layer_start + layer_count, len(layer_events))
+            for layer in range(layer_start, end):
+                event_backend.record_event(layer_events[layer], cache_context.stream)
+            board.publish(slot, end)
+
+        return publish
+
     def retrieve(
         self,
         key: IPCCacheServerKey,
@@ -1504,6 +1589,8 @@ class LMCacheDrivenTransferModule(InstanceLivenessTarget):
         gpu_block_ids: list[list[int]],
         event_ipc_handle: bytes,
         skip_first_n_tokens: int = 0,
+        arrival_board: tuple[str, int, int] | None = None,
+        layer_event_handles: list[bytes] | None = None,
     ) -> tuple[bytes, bool]:
         """Retrieve the CPU KV cache and put into GPU blocks.
 
@@ -1612,6 +1699,16 @@ class LMCacheDrivenTransferModule(InstanceLivenessTarget):
                 event_ipc_handle, cache_context.device
             )
             event_backend.wait_event(producer_event, cache_context.stream)
+            # Layer-major only: publish each slice as it is enqueued so the
+            # worker can start the model on the layers that have landed. Two
+            # facts have to cross the process boundary and they travel apart --
+            # the per-layer event says "these bytes are on the GPU", the board
+            # says "that event has actually been recorded". Without the second
+            # the worker would wait on an unrecorded event, which reports
+            # complete, and read KV that was never copied.
+            on_layer_batch = self._build_layer_arrival_publisher(
+                cache_context, event_backend, arrival_board, layer_event_handles
+            )
 
             # Per object group, the prefetch only locked the in-window suffix
             # (the last ``num_chunks_in_sw`` chunks; the whole prefix for full
@@ -1656,6 +1753,7 @@ class LMCacheDrivenTransferModule(InstanceLivenessTarget):
                             skip_first_n_tokens=skip_first_n_tokens,
                             direction=lmcache_native.TransferDirection.H2D,
                             layers_per_stage=self._ctx.retrieve_layers_per_stage,
+                            on_layer_batch=on_layer_batch,
                         )
                         # Extend only after the copy is enqueued: on exception,
                         # read_prefetched_results releases this group's locks
