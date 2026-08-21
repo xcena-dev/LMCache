@@ -44,6 +44,43 @@ logger = init_logger(__name__)
 DEFAULT_RELEASE_AFTER_LAYERS = 1
 
 
+def resolve_layers_per_stage(value: object) -> int:
+    """Read the layer-major slice width out of an extra_config value.
+
+    Accepts what a deployer is likely to write: an int for the width, ``True``
+    for one layer per slice, ``False``/absent for off, and a decimal string for
+    either. Anything else is off, with a warning, rather than a startup failure.
+
+    Args:
+        value: Raw ``lmcache.mp.layerwise_overlap`` value.
+
+    Returns:
+        Layers per slice, 0 when layer-major retrieval is off.
+    """
+    if value is None or value is False:
+        return 0
+    if value is True:
+        return 1
+    if isinstance(value, int):
+        return max(0, value)
+    if isinstance(value, str):
+        text = value.strip().lower()
+        if text in ("", "false", "off", "no"):
+            return 0
+        if text in ("true", "on", "yes"):
+            return 1
+        try:
+            return max(0, int(text))
+        except ValueError:
+            pass
+    logger.warning(
+        "Ignoring lmcache.mp.layerwise_overlap=%r: expected a layer count, a "
+        "boolean, or a decimal string",
+        value,
+    )
+    return 0
+
+
 class LayerArrivalGate:
     """Tracks which layer slices of one request have landed on the GPU.
 

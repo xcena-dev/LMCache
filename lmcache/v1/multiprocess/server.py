@@ -411,7 +411,6 @@ def run_cache_server(
         hash_algorithm=mp_config.hash_algorithm,
         separate_object_groups=mp_config.separate_object_groups,
         full_sw_kv=is_blend,
-        retrieve_layers_per_stage=mp_config.retrieve_layers_per_stage,
     )
 
     modules = _build_modules(ctx, mp_config, coordinator_config)

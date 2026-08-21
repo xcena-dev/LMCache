@@ -59,6 +59,7 @@ from lmcache.integration.vllm.utils import (
     vllm_layout_hints,
 )
 from lmcache.utils import init_logger as lmcache_init_logger
+from lmcache.v1.multiprocess.layer_arrival import resolve_layers_per_stage
 
 try:
     # First Party
@@ -246,11 +247,12 @@ class LMCacheMPConnector(KVConnectorBase_V1, SupportsHMA):
       heartbeat pings.
     - lmcache.mp.eager_prefetch: submit the LMCache lookup when a request
       enters vLLM's waiting queue. Disabled by default.
-    - lmcache.mp.layerwise_overlap: the server stages KV a layer slice at a
-      time and this connector waits per layer. Disabled by default. Must match
-      the server's layer-major setting; see
-      ``requires_piecewise_for_cudagraph`` for why the connector needs its own
-      copy of the flag rather than reading the server's.
+    - lmcache.mp.layerwise_overlap: layers per slice for layer-major retrieval,
+      which lets a cache-hit request start computing on its first layers while
+      the rest are still copying. 0 (default) keeps the chunk-major path;
+      ``true`` means one layer per slice. This is the only place the feature is
+      configured -- the worker tells the server the width on every retrieve, so
+      the LMCache server has no setting of its own.
     """
 
     @classmethod
@@ -266,18 +268,21 @@ class LMCacheMPConnector(KVConnectorBase_V1, SupportsHMA):
         barrier silently -- a correctness loss, not a slowdown. Declaring the
         requirement makes vLLM keep the mode that preserves it.
 
-        The server is the component that decides layer-major staging, but this
-        is a classmethod called before any server handshake, so it can only read
-        the deployer-supplied config. The flag therefore has to be set on the
-        vLLM side as well as the server side.
+        This is also why the setting lives on the vLLM side: the method is a
+        classmethod called before any server handshake, so it can only read the
+        deployer-supplied config. Putting the switch here keeps one setting that
+        both the graph mode and the transfer width come from.
 
         Args:
             extra_config: ``kv_transfer_config.extra_config``.
 
         Returns:
-            True when layer-major overlap is enabled for this deployment.
+            True when layer-major retrieval is enabled for this deployment.
         """
-        return bool(extra_config.get("lmcache.mp.layerwise_overlap", False))
+        return (
+            resolve_layers_per_stage(extra_config.get("lmcache.mp.layerwise_overlap"))
+            > 0
+        )
 
     def __init__(
         self,

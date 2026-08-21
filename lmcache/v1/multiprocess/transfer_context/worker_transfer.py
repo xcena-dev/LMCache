@@ -237,6 +237,8 @@ class TransferContext(ABC):
                 or None. Transports that do not support it ignore it.
             layer_events: One event per layer for the server to record as each
                 slice lands, or None.
+            layers_per_stage: Layers the server should stage per slice. 0 keeps
+                the chunk-major path.
             mq_client: Message queue client used to communicate with server.
             mq_timeout: Timeout in seconds for synchronous request wait.
             send_request: Request sender callable used to issue MQ requests.
@@ -373,6 +375,7 @@ class TransferContext(ABC):
         skip_first_n_tokens: int = 0,
         arrival_board: tuple[str, int, int] | None = None,
         layer_events: list[IPCEvent] | None = None,
+        layers_per_stage: int = 0,
     ) -> MessagingFuture:
         """Submit a retrieve request and return a completion future.
 
@@ -600,6 +603,7 @@ class LMCacheDrivenTransferContext(TransferContext):
         skip_first_n_tokens: int = 0,
         arrival_board: tuple[str, int, int] | None = None,
         layer_events: list[IPCEvent] | None = None,
+        layers_per_stage: int = 0,
     ) -> MessagingFuture:
         """Submit a handle-based retrieve ordered by ``event``.
 
@@ -618,6 +622,9 @@ class LMCacheDrivenTransferContext(TransferContext):
                 ask for none.
             layer_events: One event per layer for the server to record as each
                 slice lands, or None. Ignored without ``arrival_board``.
+            layers_per_stage: Layers the server should stage per slice. 0 keeps
+                the chunk-major path. The worker owns this setting; the server
+                has no knob of its own.
 
         Returns:
             A device-event-aware future for the server response.
@@ -644,7 +651,7 @@ class LMCacheDrivenTransferContext(TransferContext):
             event_ipc_handle,
             skip_first_n_tokens,
         ]
-        if arrival_board is not None and layer_events:
+        if arrival_board is not None and layer_events and layers_per_stage > 0:
             # Per-slice progress: the board carries "the server recorded slice
             # i", the per-layer events carry "slice i's bytes are on the GPU".
             payload.append(arrival_board)
@@ -654,6 +661,7 @@ class LMCacheDrivenTransferContext(TransferContext):
                     for layer_event in layer_events
                 ]
             )
+            payload.append(layers_per_stage)
         return self._send_request(
             self._mq_client, RequestType.RETRIEVE, payload
         ).to_device_future(device=self._device)
@@ -841,11 +849,12 @@ class EngineDrivenTransferContext(TransferContext):
         skip_first_n_tokens: int = 0,
         arrival_board: tuple[str, int, int] | None = None,
         layer_events: list[IPCEvent] | None = None,
+        layers_per_stage: int = 0,
     ) -> MessagingFuture:
         # arrival_board / layer_events are lmcache-driven only: this transport
         # copies on the worker side, so there is no cross-process progress to
         # publish.
-        del arrival_board, layer_events
+        del arrival_board, layer_events, layers_per_stage
         if self._engine_driven_context is None:
             raise RuntimeError(
                 "Engine-driven transfer context is not registered. "

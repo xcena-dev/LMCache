@@ -29,6 +29,7 @@ from lmcache.v1.multiprocess.group_view import (
     EngineGroupInfo,
     expand_engine_block_ids,
 )
+from lmcache.v1.multiprocess.layer_arrival import resolve_layers_per_stage
 from lmcache.v1.multiprocess.layer_arrival_pool import LayerArrivalPool
 from lmcache.v1.multiprocess.mq import MessageQueueClient, MessagingFuture
 from lmcache.v1.multiprocess.protocol import RequestType, get_response_class
@@ -79,10 +80,13 @@ class ExtraConfigDefault(enum.Enum):
     # Mirrors the ``LMCACHE_MP_TRANSFER_MODE`` env var; this extra_config
     # key wins when both are set.
     mp_transfer_mode = "auto"
-    # Track per-layer arrival so a cache-hit request can go back to the engine
-    # on its first layers while later ones are still copying. Must match the
-    # server's --retrieve-layers-per-stage; see LMCacheMPConnector.
-    layerwise_overlap = False
+    # Layers per slice for layer-major retrieval, which lets a cache-hit
+    # request go back to the engine on its first layers while the rest are
+    # still copying. 0 (default) keeps the chunk-major path. This is the only
+    # place the feature is configured: the worker tells the server the width on
+    # every retrieve, so the server has no setting of its own. ``True`` is
+    # accepted and means one layer per slice.
+    layerwise_overlap = 0
 
 
 # Backward-compatible aliases for the legacy `lmcache_mp_connector_0180`
@@ -1151,7 +1155,7 @@ class LMCacheMPWorkerAdapter:
         # Layer-major retrieve: slots the server publishes per-layer progress
         # into. Built on first retrieve, since it needs the registered layer
         # count and event backend. None when the deployment did not ask for it.
-        self._layerwise_overlap = bool(layerwise_overlap)
+        self._layers_per_stage = resolve_layers_per_stage(layerwise_overlap)
         self._arrival_pool: LayerArrivalPool | None = None
         self._arrival_pool_failed = False
         # Requests handed to the engine on their first layers while their
@@ -1486,7 +1490,7 @@ class LMCacheMPWorkerAdapter:
         Returns:
             The pool, or None when layer-major overlap is off or unavailable.
         """
-        if not self._layerwise_overlap or self._arrival_pool_failed:
+        if self._layers_per_stage < 1 or self._arrival_pool_failed:
             return None
         if self._arrival_pool is not None:
             return self._arrival_pool
@@ -1518,8 +1522,10 @@ class LMCacheMPWorkerAdapter:
             )
             return None
         logger.info(
-            "Layer-major overlap enabled: %d layers, %d arrival slots on %s",
+            "Layer-major overlap enabled: %d layers, %d per slice, %d arrival "
+            "slots on %s",
             num_layers,
+            self._layers_per_stage,
             _ARRIVAL_SLOTS,
             self._arrival_pool.board_name,
         )
@@ -1630,6 +1636,7 @@ class LMCacheMPWorkerAdapter:
             skip_first_n_tokens=op.skip_first_n_tokens,
             arrival_board=arrival_board,
             layer_events=layer_events,
+            layers_per_stage=self._layers_per_stage if arrival_board else 0,
         )
         self.retrieve_futures[request_id] = (future, op.flat_block_ids)
         self.retrieve_events[request_id] = event

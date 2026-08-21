@@ -1591,6 +1591,7 @@ class LMCacheDrivenTransferModule(InstanceLivenessTarget):
         skip_first_n_tokens: int = 0,
         arrival_board: tuple[str, int, int] | None = None,
         layer_event_handles: list[bytes] | None = None,
+        layers_per_stage: int = 0,
     ) -> tuple[bytes, bool]:
         """Retrieve the CPU KV cache and put into GPU blocks.
 
@@ -1752,7 +1753,7 @@ class LMCacheDrivenTransferModule(InstanceLivenessTarget):
                             batch_size=cache_context.max_batch_size,
                             skip_first_n_tokens=skip_first_n_tokens,
                             direction=lmcache_native.TransferDirection.H2D,
-                            layers_per_stage=self._ctx.retrieve_layers_per_stage,
+                            layers_per_stage=layers_per_stage,
                             on_layer_batch=on_layer_batch,
                         )
                         # Extend only after the copy is enqueued: on exception,

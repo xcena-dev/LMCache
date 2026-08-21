@@ -9,6 +9,7 @@ import pytest
 from lmcache.v1.multiprocess.layer_arrival import (
     DEFAULT_RELEASE_AFTER_LAYERS,
     LayerArrivalGate,
+    resolve_layers_per_stage,
 )
 
 
@@ -125,3 +126,32 @@ def test_transport_and_engine_threads_can_race():
         t.join(timeout=30)
     assert gate.layers_arrived() == 64
     assert gate.all_arrived()
+
+
+@pytest.mark.parametrize(
+    "value,expected",
+    [
+        (None, 0),
+        (False, 0),
+        (0, 0),
+        (True, 1),
+        (1, 1),
+        (4, 4),
+        (-3, 0),
+        ("0", 0),
+        ("4", 4),
+        ("true", 1),
+        ("True", 1),
+        ("on", 1),
+        ("yes", 1),
+        ("false", 0),
+        ("off", 0),
+        ("", 0),
+        ("  8  ", 8),
+        ("banana", 0),
+        (2.5, 0),
+        ([], 0),
+    ],
+)
+def test_the_single_setting_accepts_what_a_deployer_would_write(value, expected):
+    assert resolve_layers_per_stage(value) == expected
