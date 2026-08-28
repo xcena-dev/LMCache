@@ -5,6 +5,7 @@ from collections.abc import Iterable
 from typing import TYPE_CHECKING, Any
 import math
 import sys
+import time
 
 # Third Party
 from vllm.config import VllmConfig
@@ -103,6 +104,32 @@ if TYPE_CHECKING:
     from vllm.v1.request import Request
 
 logger = lmcache_init_logger(__name__)
+
+
+def _req_trace(event: str, request_id: str, **extra: Any) -> None:
+    """Emit one greppable line per request lifecycle event.
+
+    Measurement instrumentation. The point is to place a timestamp on each
+    step a request takes before its first token, so the steps can be joined
+    per request id:
+
+        lookup_defer -> lookup_hit -> retrieve_submit -> (GPU-LOAD-QOS) ->
+        recv_reported -> (first token, from the client CSV)
+
+    A KV load finishes one at a time, ~212 ms apart, yet first tokens come out
+    in bunches ~494 ms apart. These timestamps say which arrow the wait is on.
+
+    ``mono`` is time.monotonic() in ms so lines from the scheduler process and
+    the worker process can be ordered against each other on one host.
+    """
+    parts = " ".join(f"{k}={v}" for k, v in extra.items())
+    logger.info(
+        "REQ-TRACE %s req=%s mono=%.3f%s",
+        event,
+        request_id,
+        time.monotonic() * 1e3,
+        f" {parts}" if parts else "",
+    )
 
 
 # Helper functions
@@ -510,6 +537,12 @@ class LMCacheMPConnector(KVConnectorBase_V1, SupportsHMA):
         event = torch_dev.Event(interprocess=True)
         event.record()
 
+        # The load enters the MP server's queue here. That server serves one
+        # engine's loads on a single worker thread, so this is where queueing
+        # starts.
+        for _rid in request_ids:
+            _req_trace("retrieve_submit", _rid, batch=len(request_ids))
+
         self.worker_adapter.batched_submit_retrieve_requests(
             request_ids, ops, event, cache_salts=cache_salts
         )
@@ -633,6 +666,11 @@ class LMCacheMPConnector(KVConnectorBase_V1, SupportsHMA):
         """
         val = self.worker_adapter.get_finished(finished_req_ids)
         # logger.error("Finished req ids: %s, %s", val[0], val[1])
+        # The moment vLLM learns a load is done. The scheduler can only promote
+        # the request on the NEXT step's schedule() call, so one iteration of
+        # delay after this line is structural.
+        for _rid in val[1] or ():
+            _req_trace("recv_reported", _rid, batch=len(val[1]))
         return val
 
     def get_block_ids_with_load_errors(self) -> set[int]:
@@ -722,9 +760,15 @@ class LMCacheMPConnector(KVConnectorBase_V1, SupportsHMA):
 
         ret = self.scheduler_adapter.check_lookup_result(request.request_id)
         if ret is None:
+            # Prefetch has not resolved yet. vLLM defers this request, so the
+            # request is not admitted and holds no blocks. Logged once per
+            # scheduler step, so the count of these lines is the number of
+            # steps admission was blocked for.
+            _req_trace("lookup_defer", request.request_id)
             return None, True
 
         if ret == 0:
+            _req_trace("lookup_miss", request.request_id)
             return 0, False
 
         assert ret % self.scheduler_adapter.lmcache_tokens_per_chunk == 0
@@ -746,6 +790,11 @@ class LMCacheMPConnector(KVConnectorBase_V1, SupportsHMA):
         need_to_load = max(0, ret - num_computed_tokens)
         logger.debug(
             "vLLM hit is: %d, Need to load is %d", num_computed_tokens, need_to_load
+        )
+        # Admission granted: from here the request takes blocks and a KV load
+        # is issued for it.
+        _req_trace(
+            "lookup_hit", request.request_id, hit=ret, load=need_to_load
         )
         return need_to_load, need_to_load > 0
 

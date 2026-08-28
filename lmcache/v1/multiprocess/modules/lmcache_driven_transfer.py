@@ -5,6 +5,7 @@
 from dataclasses import dataclass
 from itertools import islice
 from typing import Generator, Sequence
+import collections
 import threading
 import time
 
@@ -686,6 +687,68 @@ class LMCacheDrivenTransferModule(InstanceLivenessTarget):
         )
         self._device_host_func_dispatcher.start()
 
+        # GPU-LOAD-QOS samples whose end event may not have fired yet.
+        # Drained opportunistically on later retrieve() calls so the handler
+        # thread never blocks on a stream sync (the sync serialized loads and
+        # bunched first tokens — the very artifact the QoS line was measuring).
+        self._qos_pending: collections.deque = collections.deque()
+        self._qos_lock = threading.Lock()
+        # Daemon poller so tail samples are logged even when the server is
+        # killed without a graceful close() (naru tears scenarios down hard).
+        self._qos_stop = threading.Event()
+        self._qos_poller = threading.Thread(
+            target=self._qos_poll_loop, name="gpu-load-qos-drain", daemon=True
+        )
+        self._qos_poller.start()
+
+    def _qos_poll_loop(self) -> None:
+        # 5 ms poll: the QoS line's log timestamp doubles as the load-end
+        # wall time in the timeline join, so the poll interval is the error
+        # bound on that mark. query() on a handful of events is microseconds.
+        while not self._qos_stop.wait(0.005):
+            self._drain_qos_pending()
+
+    def _drain_qos_pending(self) -> None:
+        """Log every pending GPU-LOAD-QOS sample whose copy has finished.
+
+        Non-blocking. Scans ALL pending entries (not just the head) and logs
+        each the moment its end event reads complete: the log timestamp is
+        the load-end wall-time mark downstream, so completion must not sit
+        behind a slower head-of-line entry.
+        """
+        with self._qos_lock:
+            done: list[tuple] = []
+            still: collections.deque = collections.deque()
+            while self._qos_pending:
+                entry = self._qos_pending.popleft()
+                start_evt, end_evt, total_bytes, request_id = entry
+                try:
+                    if end_evt.query():
+                        done.append((start_evt.elapsed_time(end_evt), entry))
+                    else:
+                        still.append(entry)
+                except Exception as e:
+                    # Do not drop silently: a dropped sample means a hole in
+                    # the per-request join downstream.
+                    logger.warning(
+                        "GPU-LOAD-QOS sample dropped req=%s: %s", request_id, e
+                    )
+            self._qos_pending = still
+            for gpu_load_ms, (_s, _e, total_bytes, request_id) in done:
+                if total_bytes > 0 and gpu_load_ms > 0:
+                    # req= goes LAST on purpose. The report parsers in naru
+                    # match "GPU-LOAD-QOS bytes=(\\d+) dur_ms=([\\d.]+)" with
+                    # the tag and bytes= adjacent, so inserting a field between
+                    # them breaks every existing analysis script. Appending is
+                    # invisible to them.
+                    logger.info(
+                        "GPU-LOAD-QOS bytes=%d dur_ms=%.2f GBps=%.1f req=%s",
+                        total_bytes,
+                        gpu_load_ms,
+                        total_bytes / (gpu_load_ms / 1e3) / 1e9,
+                        request_id,
+                    )
+
     @property
     def context(self) -> MPCacheServerContext:
         """Return the shared engine context. Exposed for testing only."""
@@ -868,6 +931,15 @@ class LMCacheDrivenTransferModule(InstanceLivenessTarget):
 
     def close(self) -> None:
         """Release GPU resources owned by this module."""
+        # Final QoS flush, then stop the poller.
+        self._drain_qos_pending()
+        self._qos_stop.set()
+        if self._qos_pending:
+            logger.warning(
+                "close(): %d GPU-LOAD-QOS samples still pending after flush",
+                len(self._qos_pending),
+            )
+
         # Stop the drain thread before storage_manager.close() so any
         # in-flight completions reach a live storage manager.
         self._device_host_func_dispatcher.stop()
@@ -1373,6 +1445,16 @@ class LMCacheDrivenTransferModule(InstanceLivenessTarget):
             prefetched_keys: list[ObjectKey] = []
             total_bytes = 0
             retrieve_succeeded = True
+            # QoS instrumentation (non-breaking): time the storage->GPU load
+            # hop on the stream via CUDA events. Backend-agnostic — both the
+            # nixl-DRAM L1 and the Maru-CXL pool converge on this H2D transfer.
+            gpu_load_start = gpu_load_end = None
+            try:
+                gpu_load_start = torch_dev.Event(enable_timing=True)
+                gpu_load_end = torch_dev.Event(enable_timing=True)
+                gpu_load_start.record()
+            except Exception:
+                gpu_load_start = gpu_load_end = None
             try:
                 for obj_group_id in range(num_object_groups):
                     skip = group_skips[obj_group_id]
@@ -1407,6 +1489,8 @@ class LMCacheDrivenTransferModule(InstanceLivenessTarget):
                         # read_prefetched_results releases this group's locks
                         # itself, and a key must not be released twice.
                         prefetched_keys.extend(in_window_keys)
+                if gpu_load_end is not None:
+                    gpu_load_end.record()
             except Exception:
                 logger.exception("Cannot retrieve keys due to exception")
                 retrieve_succeeded = False
@@ -1439,6 +1523,19 @@ class LMCacheDrivenTransferModule(InstanceLivenessTarget):
                         },
                     ),
                 )
+        # QoS: storage->GPU load hop time, measured via CUDA events. Includes
+        # the H2D DMA plus the paged-scatter kernel. Queued and logged later
+        # (next retrieve) instead of synchronizing here: a stream sync on this
+        # handler thread serialized the loads it was measuring.
+        # Queued even when the retrieve failed: the copy that did run is still
+        # a valid bandwidth sample, and the sweeps so far were collected this way.
+        if gpu_load_start is not None and gpu_load_end is not None:
+            with self._qos_lock:
+                self._qos_pending.append(
+                    (gpu_load_start, gpu_load_end, total_bytes, key.request_id)
+                )
+        self._drain_qos_pending()
+
         if retrieve_succeeded:
             tokens_retrieved = num_chunks * self._ctx.chunk_size
             ed = time.perf_counter()
@@ -1447,6 +1544,19 @@ class LMCacheDrivenTransferModule(InstanceLivenessTarget):
                 tokens_retrieved,
                 ed - st,
             )
+
+        # Measurement instrumentation. evt_done is a non-blocking query: False
+        # here just means the copy is still in flight when the handler returns
+        # (the normal, pipelined case now that QoS no longer synchronizes).
+        try:
+            logger.info(
+                "REQ-TRACE srv_ret req=%s evt_done=%s mono=%.3f",
+                key.request_id,
+                event_backend.query_event(event),
+                time.monotonic() * 1e3,
+            )
+        except Exception:
+            pass
 
         return (
             event_backend.export_event(event, cache_context.device),

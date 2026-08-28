@@ -2,6 +2,7 @@
 # Standard
 from typing import Any, Generic, Optional, TypeVar
 import threading
+import time
 
 # First Party
 from lmcache import torch_dev
@@ -123,6 +124,14 @@ class DeviceMessagingFuture(MessagingFuture[T]):
         self.device_ = device if device is not None else torch_dev.current_device()
         self._event_backend = get_event_ipc_backend(self.device_)
         self._event_backend.check_event_support(self.device_)
+        # Measurement instrumentation: query() has two gates, the transport
+        # reply and the device event. Record when each first read ready so a
+        # caller can attribute the wait to one of them. Timestamps only, no
+        # logging: query() runs once per pending future per engine iteration.
+        self.n_query_ = 0
+        self.t_raw_ready_: float | None = None
+        self.t_evt_ready_: float | None = None
+        self.import_ms_ = 0.0
 
     def _on_raw_future_complete(self) -> None:
         """
@@ -196,13 +205,24 @@ class DeviceMessagingFuture(MessagingFuture[T]):
         Returns:
             bool: True if the future is done, False otherwise.
         """
+        self.n_query_ += 1
         if self.event_:
-            return self._event_backend.query_event(self.event_)
+            ok = self._event_backend.query_event(self.event_)
+            if ok and self.t_evt_ready_ is None:
+                self.t_evt_ready_ = time.monotonic() * 1e3
+            return ok
 
         if self.raw_future_.query():
+            if self.t_raw_ready_ is None:
+                self.t_raw_ready_ = time.monotonic() * 1e3
+            _t = time.monotonic()
             self._on_raw_future_complete()
+            self.import_ms_ = (time.monotonic() - _t) * 1e3
             assert self.event_ is not None
-            return self._event_backend.query_event(self.event_)
+            ok = self._event_backend.query_event(self.event_)
+            if ok and self.t_evt_ready_ is None:
+                self.t_evt_ready_ = time.monotonic() * 1e3
+            return ok
 
         return False
 
