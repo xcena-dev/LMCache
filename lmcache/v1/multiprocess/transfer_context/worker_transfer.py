@@ -644,24 +644,30 @@ class LMCacheDrivenTransferContext(TransferContext):
                 "Call register() before submit_retrieve()."
             )
         event_ipc_handle = self._event_backend.export_event(event, self._device)
+        # Per-slice progress: the board carries "the server recorded slice i",
+        # the per-layer events carry "slice i's bytes are on the GPU". The
+        # RETRIEVE payload is fixed-length, so a chunk-major retrieve fills the
+        # three fields with (None, None, 0) instead of leaving them out.
+        wants_layer_major = (
+            arrival_board is not None and bool(layer_events) and layers_per_stage > 0
+        )
+        layer_event_handles: list[bytes] | None = None
+        if wants_layer_major:
+            assert layer_events is not None
+            layer_event_handles = [
+                self._event_backend.export_event(layer_event, self._device)
+                for layer_event in layer_events
+            ]
         payload: list[Any] = [
             key,
             instance_id,
             block_ids,
             event_ipc_handle,
             skip_first_n_tokens,
+            arrival_board if wants_layer_major else None,
+            layer_event_handles,
+            layers_per_stage if wants_layer_major else 0,
         ]
-        if arrival_board is not None and layer_events and layers_per_stage > 0:
-            # Per-slice progress: the board carries "the server recorded slice
-            # i", the per-layer events carry "slice i's bytes are on the GPU".
-            payload.append(arrival_board)
-            payload.append(
-                [
-                    self._event_backend.export_event(layer_event, self._device)
-                    for layer_event in layer_events
-                ]
-            )
-            payload.append(layers_per_stage)
         return self._send_request(
             self._mq_client, RequestType.RETRIEVE, payload
         ).to_device_future(device=self._device)

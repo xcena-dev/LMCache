@@ -929,6 +929,9 @@ def _send_retrieve(
             [block_ids] * num_engine_group_infos,
             _make_event_handle(),
             0,  # skip_first_n_tokens
+            None,  # arrival_board: chunk-major retrieve
+            None,  # layer_event_handles
+            0,  # layers_per_stage
         ]
         result = _call(client, RequestType.RETRIEVE, payloads)
         if result is _TIMEOUT:
