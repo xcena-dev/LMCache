@@ -475,6 +475,9 @@ class LMCacheMPConnector:
                 [block_ids],
                 event.ipc_handle(),
                 skip_prefix_n_blocks,
+                None,  # arrival_board: chunk-major retrieve
+                None,  # layer_event_handles
+                0,  # layers_per_stage
             ],
         ).to_device_future(device=self.device)
         # The daemon imports this IPC event after the request crosses the wire.

@@ -232,6 +232,15 @@ class TransferContext(ABC):
             model_name: Model name used by cache keys.
             world_size: KV world size.
             blocks_in_chunk: Number of vLLM blocks per LMCache chunk.
+            arrival_board: ``(segment name, slot, slots in segment)`` where the
+                server publishes per-slice progress under layer-major retrieve,
+                or None. Transports that do not support it ignore it.
+            layer_event_handles: One exported event handle per layer for the
+                server to record as each slice lands, or None. The worker pools
+                its events and exports each handle once, so they arrive already
+                exported.
+            layers_per_stage: Layers the server should stage per slice. 0 keeps
+                the chunk-major path.
             mq_client: Message queue client used to communicate with server.
             mq_timeout: Timeout in seconds for synchronous request wait.
             send_request: Request sender callable used to issue MQ requests.
@@ -342,6 +351,13 @@ class TransferContext(ABC):
             block_ids: vLLM block IDs to store, indexed by LMCache KV group id.
             event: Synchronization event object.
             blocks_in_chunk: Number of vLLM blocks per LMCache chunk.
+            arrival_board: ``(segment name, slot, slots in segment)`` where the
+                server publishes per-slice progress under layer-major retrieve,
+                or None. Transports that do not support it ignore it.
+            layer_event_handles: One exported event handle per layer for the
+                server to record as each slice lands, or None. The worker pools
+                its events and exports each handle once, so they arrive already
+                exported.
 
         Returns:
             A future compatible with adapter-side ``query()``/``result()`` flow.
@@ -361,6 +377,9 @@ class TransferContext(ABC):
         event: IPCEvent,
         blocks_in_chunk: int,
         skip_first_n_tokens: int = 0,
+        arrival_board: tuple[str, int, int] | None = None,
+        layer_event_handles: list[bytes] | None = None,
+        layers_per_stage: int = 0,
     ) -> MessagingFuture:
         """Submit a retrieve request and return a completion future.
 
@@ -373,6 +392,13 @@ class TransferContext(ABC):
                 group id.
             event: Synchronization event object.
             blocks_in_chunk: Number of vLLM blocks per LMCache chunk.
+            arrival_board: ``(segment name, slot, slots in segment)`` where the
+                server publishes per-slice progress under layer-major retrieve,
+                or None. Transports that do not support it ignore it.
+            layer_event_handles: One exported event handle per layer for the
+                server to record as each slice lands, or None. The worker pools
+                its events and exports each handle once, so they arrive already
+                exported.
             skip_first_n_tokens: Number of initial tokens to skip when writing.
 
         Returns:
@@ -467,6 +493,28 @@ class LMCacheDrivenTransferContext(TransferContext):
         future.result(timeout=mq_timeout)
         self._device = device
         self._event_backend = event_backend
+
+    @property
+    def event_backend(self) -> "EventIPCBackend | None":
+        """Backend that creates, exports and waits on this transport's events.
+
+        Layer-major retrieval needs it to build the worker's per-layer events
+        and to make the compute stream wait on each slice. Public because the
+        adapter owns that pooling and cannot reach into the transport.
+
+        Returns:
+            The backend, or None before :meth:`register`.
+        """
+        return self._event_backend
+
+    @property
+    def device(self) -> "torch.device | None":
+        """Device this transport's events and KV cache belong to.
+
+        Returns:
+            The device, or None before :meth:`register`.
+        """
+        return self._device
 
     def register_q(
         self,
@@ -581,6 +629,9 @@ class LMCacheDrivenTransferContext(TransferContext):
         event: IPCEvent,
         _blocks_in_chunk: int,
         skip_first_n_tokens: int = 0,
+        arrival_board: tuple[str, int, int] | None = None,
+        layer_event_handles: list[bytes] | None = None,
+        layers_per_stage: int = 0,
     ) -> MessagingFuture:
         """Submit a handle-based retrieve ordered by ``event``.
 
@@ -594,6 +645,16 @@ class LMCacheDrivenTransferContext(TransferContext):
             event: Producer event that orders writes to the engine KV cache.
             _blocks_in_chunk: Engine blocks per chunk (unused by this transport).
             skip_first_n_tokens: Initial tokens the server must not overwrite.
+            arrival_board: ``(segment name, slot, slots in segment)`` naming
+                where the server should publish per-slice progress, or None to
+                ask for none.
+            layer_event_handles: One exported event handle per layer for the
+                server to record as each slice lands, or None. The worker pools
+                its events and exports each handle once, so they arrive already
+                exported. Ignored without ``arrival_board``.
+            layers_per_stage: Layers the server should stage per slice. 0 keeps
+                the chunk-major path. The worker owns this setting; the server
+                has no knob of its own.
 
         Returns:
             A device-event-aware future for the server response.
@@ -613,10 +674,27 @@ class LMCacheDrivenTransferContext(TransferContext):
                 "Call register() before submit_retrieve()."
             )
         event_ipc_handle = self._event_backend.export_event(event, self._device)
+        # Per-slice progress: the board carries "the server recorded slice i",
+        # the per-layer events carry "slice i's bytes are on the GPU". The
+        # RETRIEVE payload is fixed-length, so a chunk-major retrieve fills the
+        # three fields with (None, None, 0) instead of leaving them out.
+        wants_layer_major = (
+            arrival_board is not None
+            and bool(layer_event_handles)
+            and layers_per_stage > 0
+        )
+        payload: list[Any] = [
+            key,
+            instance_id,
+            block_ids,
+            event_ipc_handle,
+            skip_first_n_tokens,
+            arrival_board if wants_layer_major else None,
+            layer_event_handles if wants_layer_major else None,
+            layers_per_stage if wants_layer_major else 0,
+        ]
         return self._send_request(
-            self._mq_client,
-            RequestType.RETRIEVE,
-            [key, instance_id, block_ids, event_ipc_handle, skip_first_n_tokens],
+            self._mq_client, RequestType.RETRIEVE, payload
         ).to_device_future(device=self._device)
 
     def close(self) -> None:
@@ -800,7 +878,14 @@ class EngineDrivenTransferContext(TransferContext):
         _event: IPCEvent,
         blocks_in_chunk: int,
         skip_first_n_tokens: int = 0,
+        arrival_board: tuple[str, int, int] | None = None,
+        layer_event_handles: list[bytes] | None = None,
+        layers_per_stage: int = 0,
     ) -> MessagingFuture:
+        # arrival_board / layer handles are lmcache-driven only: this transport
+        # copies on the worker side, so there is no cross-process progress to
+        # publish.
+        del arrival_board, layer_event_handles, layers_per_stage
         if self._engine_driven_context is None:
             raise RuntimeError(
                 "Engine-driven transfer context is not registered. "

@@ -15,6 +15,7 @@ This module defines the protocol for:
 
 # Standard
 from dataclasses import dataclass, field
+from typing import Optional
 
 # First Party
 from lmcache.utils import EngineType
@@ -181,9 +182,27 @@ def get_protocol_definitions() -> dict[str, ProtocolDefinition]:
         #   - event_ipc_handle: bytes - CUDA event IPC handle for synchronization
         #   - skip_first_n_tokens: int - Number of tokens to skip writing at the
         #     start of the retrieve range (to avoid overwriting APC-shared blocks)
+        #   - arrival_board: tuple[str, int, int] | None - (shared-memory segment
+        #     name, slot, slots in segment) where the server publishes per-slice
+        #     progress under layer-major retrieve. None asks for none.
+        #   - layer_event_handles: list[bytes] | None - One exported event handle
+        #     per layer for the server to record as each slice lands.
+        #   - layers_per_stage: int - Layers the server stages per slice.
+        #     0 keeps the chunk-major path.
+        # The payload is fixed-length, so a chunk-major retrieve sends
+        # (None, None, 0) for the last three rather than omitting them.
         # Returns: tuple[bytes, bool] - (CUDA event handle, success flag)
         "RETRIEVE": ProtocolDefinition(
-            payload_classes=[KeyType, int, list[list[int]], bytes, int],
+            payload_classes=[
+                KeyType,
+                int,
+                list[list[int]],
+                bytes,
+                int,
+                Optional[tuple[str, int, int]],
+                Optional[list[bytes]],
+                int,
+            ],
             response_class=tuple[bytes, bool],
             handler_type=HandlerType.BLOCKING,
         ),

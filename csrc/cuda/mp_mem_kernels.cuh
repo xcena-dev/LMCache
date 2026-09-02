@@ -94,6 +94,18 @@ struct LaunchVar {
   int total_blocks;          // number of block ids for this launch
   int num_objects;           // chunks in this batch (1-4)
   int skip_prefix_n_blocks;
+  // Layer slice covered by this launch. Chunk-major (the default) transfers
+  // every layer of the staged objects in one launch: layer_offset 0 and
+  // staged_layers 0, the latter meaning "all of shape_desc.nl".
+  //
+  // Layer-major staging slices the layer axis instead: the staged buffer holds
+  // only `staged_layers` layers laid out as [kv, staged_layers, T, D], and
+  // `layer_offset` is the first *model* layer it corresponds to. The engine
+  // side is addressed with layer_offset + slot, the staged side with the slot
+  // alone, so the host object layout is unchanged - only which bytes were
+  // staged differs. See docs/design/v1/multiprocess/layer_major_staging.md.
+  int layer_offset;
+  int staged_layers;
 };
 
 // One batch: its staging copies and kernel launches. For H2D the staging runs
@@ -151,10 +163,15 @@ void execute_object_group_transfer(
  * @param lmcache_chunk_size        Tokens per LMCache memory object
  * @param engine_kv_format             EngineKVFormat identifier
  * @param skip_prefix_n_blocks      Number of blocks to skip at the beginning
+ * @param layer_offset              First model layer covered by the staged
+ *                                  buffer (0 for chunk-major)
+ * @param staged_layers             Layers held by the staged buffer; 0 means
+ *                                  all of shape_desc.nl (chunk-major)
  */
 void multi_layer_block_kv_transfer(
     const torch::Tensor& paged_buffer_ptrs_tensor,
     std::vector<int64_t> lmcache_objects_ptrs, const torch::Tensor& block_ids,
     const torch::Device& device, TransferDirection direction,
     PageBufferShapeDesc shape_desc, int lmcache_chunk_size,
-    EngineKVFormat engine_kv_format, int skip_prefix_n_blocks);
+    EngineKVFormat engine_kv_format, int skip_prefix_n_blocks,
+    int layer_offset = 0, int staged_layers = 0);

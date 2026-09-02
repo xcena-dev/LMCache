@@ -59,6 +59,7 @@ from lmcache.integration.vllm.utils import (
     vllm_layout_hints,
 )
 from lmcache.utils import init_logger as lmcache_init_logger
+from lmcache.v1.multiprocess.layer_arrival import resolve_layers_per_stage
 
 try:
     # First Party
@@ -246,7 +247,42 @@ class LMCacheMPConnector(KVConnectorBase_V1, SupportsHMA):
       heartbeat pings.
     - lmcache.mp.eager_prefetch: submit the LMCache lookup when a request
       enters vLLM's waiting queue. Disabled by default.
+    - lmcache.mp.layerwise_overlap: layers per slice for layer-major retrieval,
+      which lets a cache-hit request start computing on its first layers while
+      the rest are still copying. 0 (default) keeps the chunk-major path;
+      ``true`` means one layer per slice. This is the only place the feature is
+      configured -- the worker tells the server the width on every retrieve, so
+      the LMCache server has no setting of its own.
     """
+
+    @classmethod
+    def requires_piecewise_for_cudagraph(cls, extra_config: dict[str, Any]) -> bool:
+        """Whether vLLM must keep PIECEWISE CUDA graphs for this connector.
+
+        ``wait_for_layer_load`` only does real work under layer-major staging,
+        and per-layer synchronization cannot be captured in a CUDA graph: under
+        a full-graph replay the wait is skipped and the model reads KV that may
+        still be in flight. vLLM's default ``FULL_AND_PIECEWISE`` runs batches
+        containing prefill piecewise, so the wait does fire there, but
+        ``--cudagraph-mode FULL`` with a backend that supports it would drop the
+        barrier silently -- a correctness loss, not a slowdown. Declaring the
+        requirement makes vLLM keep the mode that preserves it.
+
+        This is also why the setting lives on the vLLM side: the method is a
+        classmethod called before any server handshake, so it can only read the
+        deployer-supplied config. Putting the switch here keeps one setting that
+        both the graph mode and the transfer width come from.
+
+        Args:
+            extra_config: ``kv_transfer_config.extra_config``.
+
+        Returns:
+            True when layer-major retrieval is enabled for this deployment.
+        """
+        return (
+            resolve_layers_per_stage(extra_config.get("lmcache.mp.layerwise_overlap"))
+            > 0
+        )
 
     def __init__(
         self,
@@ -548,12 +584,15 @@ class LMCacheMPConnector(KVConnectorBase_V1, SupportsHMA):
         paged buffer. This is called from within attention layer to ensure
         async copying from start_load_kv is complete.
 
-        This interface will be useful for layer-by-layer pipelining.
+        Under layer-major retrieval a request may already be running while its
+        later layers are still copying, so this blocks on each layer's arrival
+        before the model reads it. Without that mode there is nothing in flight
+        and the call returns immediately.
 
         Args:
             layer_name: the name of that layer
         """
-        return
+        self.worker_adapter.wait_for_layer_load(layer_name)
 
     def save_kv_layer(
         self,

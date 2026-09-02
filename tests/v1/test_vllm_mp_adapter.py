@@ -308,7 +308,14 @@ def test_submit_retrieve_request_tracks_returned_future(fake_adapter, monkeypatc
     adapter.submit_retrieve_request("req-1", op, event=MagicMock())
 
     assert transfer_ctx.submit_retrieve.called
-    assert transfer_ctx.submit_retrieve.call_args.kwargs == {"skip_first_n_tokens": 1}
+    # The last three are the layer-major fields; a chunk-major retrieve fills
+    # them in as "no per-slice progress wanted" rather than omitting them.
+    assert transfer_ctx.submit_retrieve.call_args.kwargs == {
+        "skip_first_n_tokens": 1,
+        "arrival_board": None,
+        "layer_event_handles": None,
+        "layers_per_stage": 0,
+    }
     assert transfer_ctx.submit_retrieve.call_args.args[4] == [[0]]
     assert adapter.retrieve_futures["req-1"] == (fake_future, [0])
 

@@ -131,18 +131,20 @@ PYBIND11_MODULE(cuda_ops, m) {
          std::vector<int64_t> lmcache_objects_ptrs,
          const torch::Tensor& block_ids, const torch::Device& device,
          int direction, PageBufferShapeDesc shape_desc, int lmcache_chunk_size,
-         int engine_kv_format, int skip_prefix_n_blocks) {
+         int engine_kv_format, int skip_prefix_n_blocks, int layer_offset,
+         int staged_layers) {
         return multi_layer_block_kv_transfer(
             paged_buffer_ptrs_tensor, std::move(lmcache_objects_ptrs),
             block_ids, device, static_cast<TransferDirection>(direction),
             shape_desc, lmcache_chunk_size,
-            static_cast<EngineKVFormat>(engine_kv_format),
-            skip_prefix_n_blocks);
+            static_cast<EngineKVFormat>(engine_kv_format), skip_prefix_n_blocks,
+            layer_offset, staged_layers);
       },
       py::arg("paged_buffer_ptrs_tensor"), py::arg("lmcache_objects_ptrs"),
       py::arg("block_ids"), py::arg("device"), py::arg("direction"),
       py::arg("shape_desc"), py::arg("lmcache_chunk_size"),
       py::arg("engine_kv_format"), py::arg("skip_prefix_n_blocks"),
+      py::arg("layer_offset") = 0, py::arg("staged_layers") = 0,
       py::call_guard<py::gil_scoped_release>());
   py::class_<PageBufferShapeDesc>(m, "PageBufferShapeDesc")
       .def(py::init<>())
@@ -167,13 +169,16 @@ PYBIND11_MODULE(cuda_ops, m) {
   py::class_<LaunchVar>(m, "LaunchVar")
       .def(
           py::init([](int group_idx, int64_t block_ids_offset, int total_blocks,
-                      int num_objects, int skip_prefix_n_blocks) {
-            return LaunchVar{group_idx, block_ids_offset, total_blocks,
-                             num_objects, skip_prefix_n_blocks};
+                      int num_objects, int skip_prefix_n_blocks,
+                      int layer_offset, int staged_layers) {
+            return LaunchVar{group_idx,    block_ids_offset,     total_blocks,
+                             num_objects,  skip_prefix_n_blocks, layer_offset,
+                             staged_layers};
           }),
           py::arg("group_idx"), py::arg("block_ids_offset"),
           py::arg("total_blocks"), py::arg("num_objects"),
-          py::arg("skip_prefix_n_blocks"));
+          py::arg("skip_prefix_n_blocks"), py::arg("layer_offset") = 0,
+          py::arg("staged_layers") = 0);
   py::class_<BatchStep>(m, "BatchStep")
       .def(py::init([](std::vector<StagingCopy> staging,
                        std::vector<LaunchVar> launches) {

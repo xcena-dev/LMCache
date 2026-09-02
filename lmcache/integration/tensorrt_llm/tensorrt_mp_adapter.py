@@ -415,6 +415,9 @@ class LMCacheMPKvConnectorWorker(KvCacheConnectorWorker):
                         [spec.block_ids],
                         event.ipc_handle(),
                         0,  # skip_first_n_tokens
+                        None,  # arrival_board: chunk-major retrieve
+                        None,  # layer_event_handles
+                        0,  # layers_per_stage
                     ],
                 ).result(timeout=self._mq_timeout)
             except Exception as e:
