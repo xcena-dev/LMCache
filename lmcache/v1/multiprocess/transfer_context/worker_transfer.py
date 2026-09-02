@@ -488,6 +488,28 @@ class LMCacheDrivenTransferContext(TransferContext):
         self._device = device
         self._event_backend = event_backend
 
+    @property
+    def event_backend(self) -> "EventIPCBackend | None":
+        """Backend that creates, exports and waits on this transport's events.
+
+        Layer-major retrieval needs it to build the worker's per-layer events
+        and to make the compute stream wait on each slice. Public because the
+        adapter owns that pooling and cannot reach into the transport.
+
+        Returns:
+            The backend, or None before :meth:`register`.
+        """
+        return self._event_backend
+
+    @property
+    def device(self) -> "torch.device | None":
+        """Device this transport's events and KV cache belong to.
+
+        Returns:
+            The device, or None before :meth:`register`.
+        """
+        return self._device
+
     def register_q(
         self,
         instance_id: int,
