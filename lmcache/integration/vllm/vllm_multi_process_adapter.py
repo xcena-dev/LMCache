@@ -1618,12 +1618,12 @@ class LMCacheMPWorkerAdapter:
         # per-layer progress. Without one the retrieve still runs; the request
         # just waits for the whole transfer as it always did.
         arrival_board: tuple[str, int, int] | None = None
-        layer_events: list[bytes] | None = None
+        layer_event_handles: list[bytes] | None = None
         pool = self._ensure_arrival_pool()
         if pool is not None:
             acquired = pool.acquire(request_id)
             if acquired is not None:
-                arrival_board, layer_events = acquired
+                arrival_board, layer_event_handles = acquired
 
         future = self.transfer_ctx.submit_retrieve(
             request_id,
@@ -1635,7 +1635,7 @@ class LMCacheMPWorkerAdapter:
             self.blocks_in_chunk,
             skip_first_n_tokens=op.skip_first_n_tokens,
             arrival_board=arrival_board,
-            layer_events=layer_events,
+            layer_event_handles=layer_event_handles,
             layers_per_stage=self._layers_per_stage if arrival_board else 0,
         )
         self.retrieve_futures[request_id] = (future, op.flat_block_ids)
