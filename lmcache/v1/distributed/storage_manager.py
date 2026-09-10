@@ -634,6 +634,16 @@ class StorageManager:
             l2_orig_indices = tuple(range(l1_key_boundary, len(keys)))
 
         submit_time = time.monotonic()
+        # Measurement instrumentation: joins the engine request id to the
+        # prefetch id that P2P-READ-QOS / l2_load_start lines carry.
+        logger.info(
+            "REQ-TRACE prefetch_submit req=%s pf=%s l1_keys=%d l2_keys=%d mono=%.3f",
+            external_request_id,
+            prefetch_request_id,
+            l1_key_boundary,
+            len(remaining_keys),
+            submit_time * 1e3,
+        )
         logger.debug(
             "Prefetch request submitted: "
             "%d total keys, %d L1 hit chunks (%d retained keys), "

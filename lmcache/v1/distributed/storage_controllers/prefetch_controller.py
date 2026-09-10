@@ -72,6 +72,8 @@ from lmcache.v1.distributed.error import L1Error
 from lmcache.v1.distributed.l1_protocol import L1ManagerInterface
 from lmcache.v1.distributed.l2_adapters.base import L2AdapterInterface, L2TaskId
 from lmcache.v1.distributed.storage_controller import StorageControllerInterface
+from lmcache.v1.distributed.trace_ctx import current_prefetch_id
+import time as _trace_time
 from lmcache.v1.distributed.storage_controllers.adapter_lifecycle import (
     AddAdapterOp,
     RemoveAdapterOp,
@@ -1148,9 +1150,13 @@ class PrefetchController(StorageControllerInterface):
             per_adapter_objs = [
                 request.write_reserved_objs[key] for key in per_adapter_keys
             ]
-            task_id = self._l2_adapters[adapter_idx].submit_load_task(
-                per_adapter_keys, per_adapter_objs
-            )
+            _tok = current_prefetch_id.set(request.request_id)
+            try:
+                task_id = self._l2_adapters[adapter_idx].submit_load_task(
+                    per_adapter_keys, per_adapter_objs
+                )
+            finally:
+                current_prefetch_id.reset(_tok)
             request.pending_load_tasks[adapter_idx] = task_id
             plan_keys.extend(per_adapter_keys)
             # Per-adapter byte accounting for L2_LOAD_TASK_* throughput
@@ -1172,6 +1178,15 @@ class PrefetchController(StorageControllerInterface):
                 )
             )
 
+        # Measurement instrumentation: R1 start mark (host monotonic ms).
+        logger.info(
+            "REQ-TRACE l2_load_start pf=%s tasks=%d keys=%d bytes=%d mono=%.3f",
+            request.request_id,
+            len(trimmed_plan),
+            len(plan_keys),
+            sum(request.load_bytes_by_adapter.get(i, 0) for i in trimmed_plan),
+            _trace_time.monotonic() * 1e3,
+        )
         self._event_bus.publish(
             Event(
                 event_type=EventType.L2_PREFETCH_LOAD_SUBMITTED,

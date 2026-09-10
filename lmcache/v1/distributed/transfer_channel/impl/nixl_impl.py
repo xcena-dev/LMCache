@@ -16,6 +16,7 @@ import zmq
 # First Party
 from lmcache.logging import init_logger
 from lmcache.v1.distributed.internal_api import L1MemoryDesc
+from lmcache.v1.distributed.trace_ctx import current_prefetch_id
 from lmcache.v1.distributed.transfer_channel.abstract import (
     TransferChannelClient,
     TransferChannelContext,
@@ -163,6 +164,7 @@ class NixlTransferChannelClient(TransferChannelClient):
                 list(remote_addresses),
                 submit_monotonic,
                 nbytes,
+                current_prefetch_id.get(),
             )
         return task_id
 
@@ -180,7 +182,7 @@ class NixlTransferChannelClient(TransferChannelClient):
         with self._lock:
             if task_id not in self._tasks:
                 raise KeyError(f"Unknown read task id: {task_id}")
-            handle, remote_addresses, submit_monotonic, nbytes = self._tasks[task_id]
+            handle, remote_addresses, submit_monotonic, nbytes, pf_id = self._tasks[task_id]
 
         status = self._ctx.agent.check_xfer_state(handle)
         if status == "PROC":
@@ -197,13 +199,17 @@ class NixlTransferChannelClient(TransferChannelClient):
         # it is the effective per-fetch latency, good enough for QoS trends.
         dur_s = time.monotonic() - submit_monotonic
         mbps = (nbytes / dur_s / 1e6) if dur_s > 0 else 0.0
+        # pf= (prefetch request id) and end_mono= are appended LAST so the
+        # existing "task= bytes= dur_us=" parsers keep matching.
         logger.info(
-            "P2P-READ-QOS task=%d bytes=%d dur_us=%.1f MBps=%.1f status=%s",
+            "P2P-READ-QOS task=%d bytes=%d dur_us=%.1f MBps=%.1f status=%s pf=%s end_mono=%.3f",
             task_id,
             nbytes,
             dur_s * 1e6,
             mbps,
             status,
+            pf_id,
+            time.monotonic() * 1e3,
         )
 
         if status == "DONE":

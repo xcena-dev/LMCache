@@ -85,7 +85,18 @@ def _maru_l1_synchronized(
 
     @functools.wraps(func)
     def wrapper(self: "MaruL1Manager", *args: P.args, **kwargs: P.kwargs) -> R:
+        _t0 = time.monotonic()
         with self._lock:
+            _wait_ms = (time.monotonic() - _t0) * 1e3
+            if _wait_ms >= 0.5:
+                # Measurement instrumentation: lock contention on the
+                # directory path (distinguishes it from RPC latency).
+                logger.info(
+                    "MARU-LOCK wait_ms=%.2f fn=%s mono=%.3f",
+                    _wait_ms,
+                    func.__name__,
+                    time.monotonic() * 1e3,
+                )
             return func(self, *args, **kwargs)
 
     return wrapper
@@ -324,6 +335,7 @@ class MaruL1Manager:
         # MARU: one RPC takes `total` pins per key (repeat-encoding); a key
         # is a hit only if all its pins landed.
         pin_list = [ks for ks in key_strs for _ in range(total)]
+        _rpc_t0 = time.monotonic()
         try:
             pin_results = handler.batch_pin(pin_list)
         except Exception:
@@ -351,7 +363,9 @@ class MaruL1Manager:
             elif got:
                 rollback.extend([ks] * got)
 
+        _pin_ms = (time.monotonic() - _rpc_t0) * 1e3
         mem_infos: list["MemoryInfo | None"] = []
+        _rpc_t1 = time.monotonic()
         if hits:
             try:
                 mem_infos = handler.batch_retrieve([key_strs[i] for i in hits])
@@ -366,6 +380,17 @@ class MaruL1Manager:
             # Normalize a malformed reply; missing tails roll back below.
             mem_infos = list(mem_infos[: len(hits)])
             mem_infos += [None] * (len(hits) - len(mem_infos))
+        # Measurement instrumentation: directory RPC round trips on the
+        # read path (LOOKUP stage). No request id is available here; the
+        # timeline joins by order/time against REQ-TRACE prefetch_submit.
+        logger.info(
+            "MARU-RPC pin_ms=%.2f retrieve_ms=%.2f keys=%d hits=%d mono=%.3f",
+            _pin_ms,
+            (time.monotonic() - _rpc_t1) * 1e3,
+            len(keys),
+            len(hits),
+            time.monotonic() * 1e3,
+        )
 
         for i, mi in zip(hits, mem_infos, strict=False):
             mem_obj = (

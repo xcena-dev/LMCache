@@ -705,7 +705,7 @@ class LMCacheDrivenTransferModule(InstanceLivenessTarget):
         # 5 ms poll: the QoS line's log timestamp doubles as the load-end
         # wall time in the timeline join, so the poll interval is the error
         # bound on that mark. query() on a handful of events is microseconds.
-        while not self._qos_stop.wait(0.005):
+        while not self._qos_stop.wait(0.001):
             self._drain_qos_pending()
 
     def _drain_qos_pending(self) -> None:
@@ -741,12 +741,17 @@ class LMCacheDrivenTransferModule(InstanceLivenessTarget):
                     # the tag and bytes= adjacent, so inserting a field between
                     # them breaks every existing analysis script. Appending is
                     # invisible to them.
+                    # end_wall/end_mono appended LAST (parsers match the
+                    # leading fields). They stamp the drain moment, i.e. the
+                    # load-end wall time within one poller interval (1 ms).
                     logger.info(
-                        "GPU-LOAD-QOS bytes=%d dur_ms=%.2f GBps=%.1f req=%s",
+                        "GPU-LOAD-QOS bytes=%d dur_ms=%.2f GBps=%.1f req=%s end_wall=%.6f end_mono=%.3f",
                         total_bytes,
                         gpu_load_ms,
                         total_bytes / (gpu_load_ms / 1e3) / 1e9,
                         request_id,
+                        time.time(),
+                        time.monotonic() * 1e3,
                     )
 
     @property
@@ -1348,6 +1353,17 @@ class LMCacheDrivenTransferModule(InstanceLivenessTarget):
             RuntimeError: If the backend does not support IPC event handles.
         """
         st = time.perf_counter()
+        # Measurement instrumentation: server-side receive mark, so the
+        # submit->srv_recv (ZMQ + affinity queue) and srv_recv->srv_ret
+        # (handler) segments can be told apart.
+        try:
+            logger.info(
+                "REQ-TRACE srv_recv req=%s mono=%.3f",
+                key.request_id,
+                time.monotonic() * 1e3,
+            )
+        except Exception:
+            pass
 
         entry = self.get_and_touch_context_entry(instance_id)
         if entry is None:
