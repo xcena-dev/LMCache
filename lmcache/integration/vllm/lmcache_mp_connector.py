@@ -571,7 +571,7 @@ class LMCacheMPConnector(KVConnectorBase_V1, SupportsHMA):
         # Tell the worker which requests this pass reads, so the per-layer wait
         # blocks on the batch in hand rather than on every retrieve still
         # draining from an earlier step.
-        self.worker_adapter.set_forward_requests(request_ids)
+        self.worker_adapter.set_forward_requests(metadata.forward_request_ids)
 
         if len(request_ids) == 0:
             return
@@ -955,6 +955,7 @@ class LMCacheMPConnector(KVConnectorBase_V1, SupportsHMA):
             scheduler_output (SchedulerOutput): the scheduler output object.
         """
         metadata = LMCacheMPConnectorMetadata()
+        metadata.forward_request_ids = list(scheduler_output.num_scheduled_tokens)
         metadata.need_flush_before_forward = _has_preemption_reqs(scheduler_output)
 
         self._process_retrieve_requests(metadata)

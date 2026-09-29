@@ -1855,7 +1855,14 @@ class LMCacheDrivenTransferModule(InstanceLivenessTarget):
 
         hits = [False] * len(keys)
         prefetched_keys: list[ObjectKey] = []
-        with contextlib.ExitStack() as stack:
+        # Staging copies and native scatters use the ambient device/stream.
+        # They must precede the arrival and completion events recorded on the
+        # registered stream, just as in the single-request retrieve path.
+        with (
+            torch_dev.device(cache_context.device),
+            torch_dev.stream(cache_context.stream),
+            contextlib.ExitStack() as stack,
+        ):
             # Per object group, gather every request's in-window objects before
             # enqueuing anything, so the slice loop can walk the batch.
             per_group: list[
