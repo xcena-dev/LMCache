@@ -697,6 +697,73 @@ class LMCacheDrivenTransferContext(TransferContext):
             self._mq_client, RequestType.RETRIEVE, payload
         ).to_device_future(device=self._device)
 
+    def submit_retrieve_batch(
+        self,
+        keys: list[Any],
+        instance_id: int,
+        block_ids: list[list[list[int]]],
+        event: IPCEvent,
+        skip_first_n_tokens: int = 0,
+        arrival_boards: list[tuple[str, int, int]] | None = None,
+        layer_event_handles: list[list[bytes]] | None = None,
+        layers_per_stage: int = 0,
+    ) -> MessagingFuture:
+        """Submit one retrieve covering a whole batch.
+
+        The server moves a batch slice-outer, request-inner, so the forward pass
+        can start on layer 0 once every request has layer 0 rather than after
+        each request has moved in full. That ordering is only available to the
+        server if the batch arrives as one request.
+
+        Args:
+            keys: One cache key per request in the batch.
+            instance_id: GPU instance id (such as PID).
+            block_ids: Per request, engine block IDs indexed by LMCache KV
+                group id.
+            event: Producer event that orders writes to the engine KV cache.
+            skip_first_n_tokens: Initial tokens the server must not overwrite.
+            arrival_boards: One ``(segment name, slot, slots in segment)``
+                per request, naming where the server should publish that
+                request's per-slice progress, or None to ask for none.
+            layer_event_handles: Per request, one exported event handle per
+                layer, or None. Ignored without ``arrival_boards``.
+            layers_per_stage: Layers the server should move per slice. 0 keeps
+                the chunk-major path.
+
+        Returns:
+            A device-event-aware future for the server response.
+
+        Raises:
+            RuntimeError: If :meth:`register` has not run.
+        """
+        if (
+            self._mq_client is None
+            or self._send_request is None
+            or self._device is None
+            or self._event_backend is None
+        ):
+            raise RuntimeError(
+                "LMCache-driven transfer context is not registered. "
+                "Call register() before submit_retrieve_batch()."
+            )
+        event_ipc_handle = self._event_backend.export_event(event, self._device)
+        wants_layer_major = (
+            bool(arrival_boards) and bool(layer_event_handles) and layers_per_stage > 0
+        )
+        payload: list[Any] = [
+            keys,
+            instance_id,
+            block_ids,
+            event_ipc_handle,
+            skip_first_n_tokens,
+            arrival_boards if wants_layer_major else None,
+            layer_event_handles if wants_layer_major else None,
+            layers_per_stage if wants_layer_major else 0,
+        ]
+        return self._send_request(
+            self._mq_client, RequestType.RETRIEVE_BATCH, payload
+        ).to_device_future(device=self._device)
+
     def close(self) -> None:
         """Release the message queue and cached event-backend state."""
         self._mq_client = None

@@ -568,6 +568,11 @@ class LMCacheMPConnector(KVConnectorBase_V1, SupportsHMA):
             ops.append(meta.op)
             cache_salts.append(meta.cache_salt)
 
+        # Tell the worker which requests this pass reads, so the per-layer wait
+        # blocks on the batch in hand rather than on every retrieve still
+        # draining from an earlier step.
+        self.worker_adapter.set_forward_requests(request_ids)
+
         if len(request_ids) == 0:
             return
 

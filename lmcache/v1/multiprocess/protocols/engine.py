@@ -66,6 +66,7 @@ REQUEST_NAMES = [
     "STORE_Q",
     "STORE",
     "RETRIEVE",
+    "RETRIEVE_BATCH",
     "LOOKUP",
     "QUERY_PREFETCH_STATUS",
     "WAIT_PREFETCH_STATUS",
@@ -204,6 +205,37 @@ def get_protocol_definitions() -> dict[str, ProtocolDefinition]:
                 int,
             ],
             response_class=tuple[bytes, bool],
+            handler_type=HandlerType.BLOCKING,
+        ),
+        # Retrieve a whole batch of requests, a layer slice at a time
+        # Payload:
+        #   - keys: list[KeyType] - one cache key per request in the batch
+        #   - instance_id: int - Unique identifier for the vLLM instance
+        #   - gpu_block_ids: list[list[list[int]]] - per request, the GPU block
+        #     IDs indexed by LMCache KV group index
+        #   - event_ipc_handle: bytes - CUDA event IPC handle for synchronization
+        #   - skip_first_n_tokens: int - tokens to skip writing at the start of
+        #     each request's retrieve range
+        #   - arrival_board: tuple[str, int, int] | None - (segment name, slot,
+        #     slots) where the server publishes per-slice progress for the batch
+        #   - layer_event_handles: list[bytes] | None - one exported event handle
+        #     per layer, recorded once per slice for the whole batch
+        #   - layers_per_stage: int - layers the server moves per slice
+        # A batch's forward pass reads layer L of every request before layer L+1
+        # of any, so the server moves the batch slice-outer, request-inner.
+        # Returns: tuple[bytes, list[bool]] - (CUDA event handle, per-request hit)
+        "RETRIEVE_BATCH": ProtocolDefinition(
+            payload_classes=[
+                list[KeyType],
+                int,
+                list[list[list[int]]],
+                bytes,
+                int,
+                Optional[list[tuple[str, int, int]]],
+                Optional[list[list[bytes]]],
+                int,
+            ],
+            response_class=tuple[bytes, list[bool]],
             handler_type=HandlerType.BLOCKING,
         ),
         # Submit a prefix lookup; job is tracked server-side by request_id

@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 # Standard
-from collections.abc import Sequence
+from collections.abc import Iterable, Sequence
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any, Callable, NoReturn, Protocol
 import enum
@@ -45,6 +45,11 @@ if TYPE_CHECKING:
     from lmcache.integration.vllm.experimental import Dispatcher
 
 logger = init_logger(__name__)
+
+#: Seconds to yield between reads of the arrival board while waiting for a
+#: layer. Short enough not to add latency of its own, long enough to let the
+#: response-receiving thread take the interpreter.
+_ARRIVAL_POLL_SLEEP = 2e-4
 
 #: Concurrent retrieves that can track per-layer arrival. Beyond this a
 #: retrieve runs without progress tracking and waits for the whole transfer.
@@ -1158,6 +1163,10 @@ class LMCacheMPWorkerAdapter:
         self._layers_per_stage = resolve_layers_per_stage(layerwise_overlap)
         self._arrival_pool: LayerArrivalPool | None = None
         self._arrival_pool_failed = False
+        # Requests whose KV the current forward pass reads, set by the
+        # connector each step. None means "not told", and the layer wait then
+        # falls back to every request holding an arrival slot.
+        self._forward_request_ids: set[str] | None = None
         # Requests handed to the engine on their first layers while their
         # transfer is still running: their future is still owed a completion.
         self._draining_retrieves: dict[str, tuple[Any, list[int]]] = {}
@@ -1531,6 +1540,17 @@ class LMCacheMPWorkerAdapter:
         )
         return self._arrival_pool
 
+    def set_forward_requests(self, request_ids: "Iterable[str]") -> None:
+        """Name the requests whose KV the next forward pass will read.
+
+        The per-layer wait uses this to block only on the batch in hand. Called
+        once per step by the connector; passing an empty iterable clears it.
+
+        Args:
+            request_ids: Request ids in the batch about to run.
+        """
+        self._forward_request_ids = set(request_ids)
+
     @_lmcache_nvtx_annotate
     def wait_for_layer_load(self, layer_name: str) -> None:
         """Block until every in-flight retrieve has landed ``layer_name``.
@@ -1550,7 +1570,15 @@ class LMCacheMPWorkerAdapter:
         if match is None:
             return
         layer_idx = int(match.group(1))
-        for request_id in pool.active_request_ids():
+        # Only the requests this forward pass reads. A request released on its
+        # first layers stays in the pool until its transfer drains, which can
+        # outlast the step that released it; waiting on those too would make
+        # every layer of every batch a barrier across all of them.
+        waiting_on = pool.active_request_ids()
+        if self._forward_request_ids is not None:
+            wanted = self._forward_request_ids
+            waiting_on = [r for r in waiting_on if r in wanted]
+        for request_id in waiting_on:
             deadline = time.monotonic() + _ARRIVAL_WAIT_TIMEOUT
             while pool.layers_arrived(request_id) <= layer_idx:
                 if time.monotonic() > deadline:
@@ -1562,6 +1590,11 @@ class LMCacheMPWorkerAdapter:
                         request_id,
                     )
                     return
+                # Yield between reads. This runs on the model-runner thread, so
+                # spinning without releasing the interpreter starves the thread
+                # that receives the server's responses -- the same effect that
+                # makes a tight poll add 10-15 ms to a retrieve.
+                time.sleep(_ARRIVAL_POLL_SLEEP)
             event = pool.event_for_layer(request_id, layer_idx)
             if event is None:
                 continue
@@ -1690,8 +1723,102 @@ class LMCacheMPWorkerAdapter:
         """
         if cache_salts is None:
             cache_salts = [""] * len(request_ids)
+
+        # Under layer-major retrieval the batch goes as one request, so the
+        # server can move layer 0 of every request before layer 1 of any. Sent
+        # one at a time, the server would move each request in full before
+        # touching the next, and the batch would wait on the last request's
+        # first layer -- which is what the forward pass needs first.
+        if self._layers_per_stage >= 1 and len(request_ids) > 1:
+            if self._submit_retrieve_batch(request_ids, ops, event, cache_salts):
+                return
+
         for request_id, op, salt in zip(request_ids, ops, cache_salts, strict=False):
             self.submit_retrieve_request(request_id, op, event, cache_salt=salt)
+
+    def _submit_retrieve_batch(
+        self,
+        request_ids: list[str],
+        ops: list[LoadStoreOp],
+        event: _IpcEvent,
+        cache_salts: list[str],
+    ) -> bool:
+        """Send the batch as one retrieve, one arrival slot per request.
+
+        The batch travels as one request so the server can move a layer slice
+        across every request before moving the next slice. Each request still
+        gets its own slot and its own per-layer events, so the server publishes
+        that request's slice as soon as its bytes are enqueued and the request
+        is handed back to the engine without waiting for the rest of the batch.
+
+        Args:
+            request_ids: Request ids in the batch.
+            ops: Matching load/store operations.
+            event: Producer event ordering writes to the engine KV cache.
+            cache_salts: Per-request isolation salts.
+
+        Returns:
+            True when the batch was submitted, False when the caller should
+            fall back to one retrieve per request.
+        """
+        self._ensure_heartbeat_started()
+        if not self.is_healthy or self.transfer_ctx is None:
+            return False
+        submit = getattr(self.transfer_ctx, "submit_retrieve_batch", None)
+        if submit is None:
+            return False
+        pool = self._ensure_arrival_pool()
+        if pool is None:
+            return False
+        arrival_boards: list[tuple[str, int, int]] = []
+        layer_event_handles: list[list[bytes]] = []
+        for position, request_id in enumerate(request_ids):
+            acquired = pool.acquire(request_id)
+            if acquired is None:
+                # Not enough slots for the whole batch. Give back what this
+                # call took and let the caller fall back to one retrieve per
+                # request, each of which acquires its own slot.
+                for taken in request_ids[:position]:
+                    pool.release(taken)
+                return False
+            board, handles = acquired
+            arrival_boards.append(board)
+            layer_event_handles.append(handles)
+
+        keys = []
+        block_ids = []
+        skip_first = 0
+        for request_id, op, salt in zip(request_ids, ops, cache_salts, strict=True):
+            assert op.token_ids is not None
+            keys.append(
+                self._create_key(
+                    op.token_ids,
+                    op.start,
+                    op.end,
+                    request_id=request_id,
+                    cache_salt=salt,
+                )
+            )
+            block_ids.append(self._block_ids_per_group(op))
+            skip_first = max(skip_first, op.skip_first_n_tokens)
+
+        future = submit(
+            keys,
+            self.instance_id,
+            block_ids,
+            event,
+            skip_first_n_tokens=skip_first,
+            arrival_boards=arrival_boards,
+            layer_event_handles=layer_event_handles,
+            layers_per_stage=self._layers_per_stage,
+        )
+        # One future covers the whole batch, so every request in it is reported
+        # finished together; the per-request slots are what let them be handed
+        # back to the engine at different times before that.
+        for request_id, op in zip(request_ids, ops, strict=True):
+            self.retrieve_futures[request_id] = (future, op.flat_block_ids)
+            self.retrieve_events[request_id] = event
+        return True
 
     def _process_finished_stores(
         self,
@@ -1819,8 +1946,7 @@ class LMCacheMPWorkerAdapter:
             self._draining_retrieves.pop(request_id, None)
             self.retrieve_futures.pop(request_id, None)
             self.retrieve_events.pop(request_id, None)
-            if pool is not None:
-                pool.release(request_id)
+            self._release_arrival_slot(request_id)
             if not r_future.result(timeout=60):
                 logger.error(
                     "Something went wrong when processing the retrieve "
@@ -1859,6 +1985,11 @@ class LMCacheMPWorkerAdapter:
                 continue
             self.retrieve_futures.pop(request_id, None)
             self.retrieve_events.pop(request_id, None)
+            # A retrieve that finished before its first layers were reported
+            # never went through the draining pass, so its slot is returned
+            # here. Without this the pool runs out and every later retrieve
+            # falls back to waiting for the whole transfer.
+            self._release_arrival_slot(request_id)
 
         # Retrieves dropped while unhealthy still must be reported,
         # exactly once, or async loads hang in WAITING_FOR_REMOTE_KVS. No
@@ -2090,6 +2221,17 @@ class LMCacheMPWorkerAdapter:
         self.request_telemetry.close()
 
     # Helper functions
+    def _release_arrival_slot(self, request_id: str) -> None:
+        """Return the arrival slot this request held, if it held one.
+
+        Args:
+            request_id: The retrieve's request id.
+        """
+        pool = self._arrival_pool
+        if pool is None:
+            return
+        pool.release(request_id)
+
     def _update_and_get_finished_store(
         self,
     ) -> set[str]:

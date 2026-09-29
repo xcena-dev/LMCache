@@ -464,3 +464,104 @@ def test_layer_major_and_chunk_major_agree_bit_for_bit(
         assert torch.equal(chunk_major, layer_major), (
             f"layer={layer}: the two paths wrote different bytes"
         )
+
+
+def test_batch_retrieve_moves_every_request_correctly(
+    client: MessageQueueClient,
+    client_context: ClientContext,
+    registered_instance: int,
+):
+    """A batched layer-major retrieve lands the right bytes for every request.
+
+    The batch path walks slices outer and requests inner, so several requests
+    share the staging slots within one slice. Each (slice, request) pair is its
+    own native call and stream order keeps that reuse safe -- but only if the
+    ordering really is what the code intends, which is what this checks: each
+    request's destination range must match the blocks it stored.
+
+    Each request also has its own board slot, and every slot must end up with
+    all the layers published, or a request would be left waiting on progress
+    that went to someone else's slot.
+    """
+    store_keys_ = [create_cache_key(200 + i, "batch") for i in range(NUM_KEYS)]
+    source_blocks = list(range(0, BLOCKS_PER_RANGE))
+
+    event = torch_dev.Event(interprocess=True)
+    event.record()
+    store_keys(client, store_keys_, registered_instance, source_blocks, event)
+    assert wait_until_all_stored(client, store_keys_) == NUM_KEYS
+
+    # Each key was stored from its own slice of the source range, so request i
+    # must come back with slice i -- comparing them all against slice 0 would
+    # pass only if the batch path collapsed the requests together.
+    source = [
+        client_context.gpu_kv_caches[layer][:, :BLOCKS_PER_RANGE].clone()
+        for layer in range(NUM_LAYERS)
+    ]
+
+    # One slot per request, the way the worker's pool hands them out.
+    board = LayerArrivalBoard.create(
+        f"lmcache_test_arrival_batch_{os.getpid()}", NUM_KEYS
+    )
+    layer_events = [
+        [torch_dev.Event(interprocess=True) for _ in range(NUM_LAYERS)]
+        for _ in range(NUM_KEYS)
+    ]
+    for request_events in layer_events:
+        for layer_event in request_events:
+            layer_event.record()
+    try:
+        # One key per request, each retrieving the same stored chunk into its
+        # own destination range, so a request that read another's staging slot
+        # shows up as a mismatch.
+        round_keys = [create_cache_key(200 + i, f"batch_r{i}") for i in range(NUM_KEYS)]
+        assert lookup_all(client, round_keys) == NUM_KEYS
+
+        offsets = [BLOCKS_PER_RANGE * (10 + i) for i in range(NUM_KEYS)]
+        block_ids = [[list(range(off, off + BLOCKS_PER_KEY))] for off in offsets]
+        for slot in range(NUM_KEYS):
+            board.reset(slot)
+        event = torch_dev.Event(interprocess=True)
+        event.record()
+        # to_device_future() consumes the event handle and hands back the second
+        # element of the response, so this is the per-request hit list.
+        hits = (
+            client.submit_request(
+                RequestType.RETRIEVE_BATCH,
+                [
+                    round_keys,
+                    registered_instance,
+                    block_ids,
+                    event.ipc_handle(),
+                    0,
+                    [(board.name, s, board.num_slots) for s in range(NUM_KEYS)],
+                    [
+                        [e.ipc_handle() for e in request_events]
+                        for request_events in layer_events
+                    ],
+                    8,
+                ],
+                get_response_class(RequestType.RETRIEVE_BATCH),
+            )
+            .to_device_future()
+            .result(timeout=DEFAULT_TIMEOUT)
+        )
+        assert all(hits), f"batch retrieve reported misses: {hits}"
+        for slot in range(NUM_KEYS):
+            assert board.read(slot) == NUM_LAYERS, (
+                f"request {slot}: the server published {board.read(slot)} "
+                f"layers instead of {NUM_LAYERS}"
+            )
+        torch_dev.synchronize()
+
+        for i, off in enumerate(offsets):
+            src_start = i * BLOCKS_PER_KEY
+            for layer in range(NUM_LAYERS):
+                got = client_context.gpu_kv_caches[layer][:, off : off + BLOCKS_PER_KEY]
+                want = source[layer][:, src_start : src_start + BLOCKS_PER_KEY]
+                assert torch.equal(want, got), (
+                    f"request {i}, layer {layer}: the batch path wrote the wrong "
+                    "bytes into this request's blocks"
+                )
+    finally:
+        board.close()
