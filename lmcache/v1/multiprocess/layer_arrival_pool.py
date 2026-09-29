@@ -36,8 +36,8 @@ class LayerArrivalPool:
         num_layers: Layers a request's KV covers.
         num_slots: Concurrent retrieves that can track arrival.
         board_name: POSIX shared-memory segment name to create.
-        event_backend: Device event backend providing ``create_event`` and
-            ``export_event``.
+        event_backend: Device event backend providing ``create_event``,
+            ``export_event`` and ``query_event``.
         device: Device the events belong to.
         release_after_layers: Layers that must land before a request may go back
             to the engine.
@@ -158,18 +158,36 @@ class LayerArrivalPool:
     def release_ready(self, request_id: str) -> bool:
         """Whether enough layers have landed to hand the request to the engine.
 
+        Two facts are read, and both must hold. The board says the server has
+        recorded the layer's event, which happens when the copy is enqueued;
+        the event itself says the copy has finished on the GPU. The board alone
+        is raised at enqueue time, which with several retrieves queued on one
+        stream can be long before any byte of this request has moved. The
+        event alone cannot be trusted before the record, because an event that
+        was never recorded reports complete.
+
         Args:
             request_id: The retrieve's request id.
 
         Returns:
-            True once the release threshold is met.
+            True once the release threshold's layers are recorded and the last
+            of them has landed.
         """
         with self._lock:
             entry = self._active.get(request_id)
         if entry is None:
             return False
         self.layers_arrived(request_id)
-        return entry[1].release_ready()
+        gate = entry[1]
+        if not gate.release_ready():
+            return False
+        with self._lock:
+            events = self._slot_events.get(entry[0])
+        if events is None:
+            return False
+        return bool(
+            self._event_backend.query_event(events[gate.release_after_layers - 1])
+        )
 
     def event_for_layer(self, request_id: str, layer_idx: int) -> Any | None:
         """Return the event gating ``layer_idx`` for this request.

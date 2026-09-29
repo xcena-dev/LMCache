@@ -14,11 +14,16 @@ NUM_SLOTS = 2
 
 
 class FakeEventBackend:
-    """Hands out identity-only events and counts driver-ish calls."""
+    """Hands out identity-only events and counts driver-ish calls.
+
+    An event reports complete once the test marks it so with ``complete``;
+    until then it behaves like a recorded event whose copy is still running.
+    """
 
     def __init__(self) -> None:
         self.created = 0
         self.exported = 0
+        self._done: set[int] = set()
 
     def create_event(self, device):
         self.created += 1
@@ -27,6 +32,12 @@ class FakeEventBackend:
     def export_event(self, event, device):
         self.exported += 1
         return f"handle-{id(event)}".encode()
+
+    def query_event(self, event) -> bool:
+        return id(event) in self._done
+
+    def complete(self, event) -> None:
+        self._done.add(id(event))
 
 
 @pytest.fixture
@@ -73,11 +84,52 @@ def test_nothing_has_arrived_before_the_server_publishes(pool):
     assert pool.event_for_layer("r1", 0) is None
 
 
-def test_release_becomes_ready_on_the_first_layer(pool):
+def test_release_waits_for_the_first_layer_to_land_not_just_be_recorded(pool):
+    """The board says the server enqueued the copy; the event says it finished.
+
+    Release must read both: a board count alone is raised at enqueue time,
+    which with several retrieves queued on one stream can be long before the
+    bytes are on the GPU.
+    """
     pool.acquire("r1")
     _server_publishes(pool, "r1", 1)
     assert pool.layers_arrived("r1") == 1
+    assert not pool.release_ready("r1")
+
+    pool.backend.complete(pool.event_for_layer("r1", 0))
     assert pool.release_ready("r1")
+
+
+def test_release_is_gated_on_the_configured_layer_when_more_than_one(pool):
+    """With release_after_layers=N the Nth layer's event is the one queried."""
+    gated = LayerArrivalPool(
+        num_layers=NUM_LAYERS,
+        num_slots=NUM_SLOTS,
+        board_name=f"lmc_test_pool_gated_{os.getpid()}",
+        event_backend=pool.backend,
+        device="cuda:0",
+        release_after_layers=3,
+    )
+    try:
+        gated.acquire("r1")
+        _server_publishes(gated, "r1", 3)
+        first = gated.event_for_layer("r1", 0)
+        pool.backend.complete(first)
+        assert not gated.release_ready("r1")
+
+        pool.backend.complete(gated.event_for_layer("r1", 2))
+        assert gated.release_ready("r1")
+    finally:
+        gated.close()
+
+
+def test_a_completed_event_is_not_enough_without_the_record(pool):
+    """An event that was never recorded reports complete; the board guards it."""
+    pool.acquire("r1")
+    # Reach the slot's first event the way the worker would after a record.
+    slot = pool._active["r1"][0]  # noqa: SLF001 - test reaches in
+    pool.backend.complete(pool._slot_events[slot][0])  # noqa: SLF001
+    assert not pool.release_ready("r1")
 
 
 def test_only_recorded_layers_are_waitable(pool):

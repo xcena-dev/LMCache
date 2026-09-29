@@ -216,13 +216,15 @@ def get_protocol_definitions() -> dict[str, ProtocolDefinition]:
         #   - event_ipc_handle: bytes - CUDA event IPC handle for synchronization
         #   - skip_first_n_tokens: int - tokens to skip writing at the start of
         #     each request's retrieve range
-        #   - arrival_board: tuple[str, int, int] | None - (segment name, slot,
-        #     slots) where the server publishes per-slice progress for the batch
-        #   - layer_event_handles: list[bytes] | None - one exported event handle
-        #     per layer, recorded once per slice for the whole batch
+        #   - arrival_boards: list[tuple[str, int, int]] | None - one (segment
+        #     name, slot, slots) per request, where the server publishes that
+        #     request's per-slice progress
+        #   - layer_event_handles: list[list[bytes]] | None - per request, one
+        #     exported event handle per layer, recorded as each slice is enqueued
         #   - layers_per_stage: int - layers the server moves per slice
-        # A batch's forward pass reads layer L of every request before layer L+1
-        # of any, so the server moves the batch slice-outer, request-inner.
+        # The batch shares one FIFO stream with every retrieve in flight, so the
+        # server moves it request-outer, slice-inner: each request's layers land
+        # back to back and it is handed to the engine on its own first slice.
         # Returns: tuple[bytes, list[bool]] - (CUDA event handle, per-request hit)
         "RETRIEVE_BATCH": ProtocolDefinition(
             payload_classes=[

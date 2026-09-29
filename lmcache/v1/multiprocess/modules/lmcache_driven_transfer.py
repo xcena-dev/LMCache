@@ -706,33 +706,33 @@ def transfer_kv_batch_layer_major(
 ) -> None:
     """Move a whole batch of retrieves, a layer slice at a time.
 
-    The batch's forward pass reads layer L of every request before it reads
-    layer L+1 of any of them, so the order that lets it start earliest is slice
-    outer, request inner: enqueue layer 0 of every request, then layer 1, and so
-    on. Moving one request's layers before touching the next -- which is what
-    separate per-request transfers do -- leaves the batch waiting on the last
-    request's first layer until every earlier request has moved in full.
+    The batch shares one FIFO stream with every other retrieve in flight, so
+    the order is request outer, slice inner: every layer of the first request,
+    then every layer of the next. A request is handed back to the engine once
+    its first slice has landed, and with this order its remaining slices are
+    the very next thing on the stream, so it computes while the requests
+    behind it are still copying. Interleaving the requests slice by slice
+    would instead hold every request's last slice until the whole batch had
+    moved, and every request would start computing at the same, late, time.
 
-    Each (slice, request) pair is its own native call. Within one call the plan
+    Each (request, slice) pair is its own native call. Within one call the plan
     enqueues every staging copy before any kernel, so two requests sharing the
     staging slots inside a single call would overwrite each other; across calls
     stream order keeps the reuse safe.
 
-    Because each pair is its own call, arrival is published per pair rather than
-    per slice: request 0 hears that its slice has landed after one call, not
-    after the whole batch's slice. The two orders are independent and both
-    matter -- slice-outer decides when the batch's layer 0 is complete, and the
-    per-request publish decides when each request can leave the wait for remote
-    KV and rejoin the run queue.
+    Because each pair is its own call, arrival is published per pair: a request
+    hears about each of its slices as it is enqueued, and the worker decides
+    from the first one -- together with that slice's event -- when the request
+    can leave the wait for remote KV and rejoin the run queue.
 
     Args:
         cache_context: The GPU cache context.
         per_request: One ``(block_ids, memory_objs)`` pair per request, in the
             order the batch was submitted. The block ids are the host-side lists
             indexed by LMCache KV group; they are cut and staged to the GPU
-            here, once per request per slice, because the context stages them
-            into one shared buffer and returns views into it -- staging every
-            request up front would leave only the last request's ids behind.
+            here, once per request, because the context stages them into one
+            shared buffer and returns views into it -- nothing else touches
+            that buffer between one request's slices.
         object_group_id: Index of the object group to move.
         batch_size: Chunks per staging batch.
         skip_first_n_tokens: Initial tokens the transfer must not overwrite.
@@ -750,13 +750,13 @@ def transfer_kv_batch_layer_major(
     if not per_request:
         return
     num_layers = _object_group_num_layers(cache_context, object_group_id)
-    for layer_start in range(0, num_layers, layers_per_stage):
-        layer_count = min(layers_per_stage, num_layers - layer_start)
-        for position, (block_ids, memory_objs) in enumerate(per_request):
-            # A fresh copy per call: the cut is done in place.
-            block_ids_gpu = downsample_and_stage_block_ids(
-                cache_context, [list(group) for group in block_ids]
-            )
+    for position, (block_ids, memory_objs) in enumerate(per_request):
+        # A fresh copy per request: the cut is done in place.
+        block_ids_gpu = downsample_and_stage_block_ids(
+            cache_context, [list(group) for group in block_ids]
+        )
+        for layer_start in range(0, num_layers, layers_per_stage):
+            layer_count = min(layers_per_stage, num_layers - layer_start)
             _enqueue_object_group_layer_slice(
                 cache_context,
                 block_ids_gpu,
@@ -1788,13 +1788,12 @@ class LMCacheDrivenTransferModule(InstanceLivenessTarget):
     ) -> tuple[bytes, list[bool]]:
         """Retrieve a whole batch, a layer slice at a time.
 
-        The batch's forward pass reads layer L of every request before layer
-        L+1 of any of them, so this moves the batch slice-outer, request-inner.
-        Handling each request on its own -- which :meth:`retrieve` does --
-        leaves the batch waiting on the last request's first layer until every
-        earlier request has moved in full, which is why per-request
-        layer-major loses what it gains as soon as more than one request is in
-        flight.
+        The step's requests arrive as one command so they take the transfer
+        stream in scheduling order, each with its own arrival slot. The batch
+        is moved request-outer, slice-inner: a request's layers land back to
+        back, so once its first slice is on the GPU and the engine has it
+        back, the rest of its layers are the next thing on the stream and its
+        compute overlaps with the requests queued behind it.
 
         Arrival is published per request, on that request's own board slot, as
         soon as that request's slice has been enqueued. A request therefore

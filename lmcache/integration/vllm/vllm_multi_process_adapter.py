@@ -1732,11 +1732,10 @@ class LMCacheMPWorkerAdapter:
         if cache_salts is None:
             cache_salts = [""] * len(request_ids)
 
-        # Under layer-major retrieval the batch goes as one request, so the
-        # server can move layer 0 of every request before layer 1 of any. Sent
-        # one at a time, the server would move each request in full before
-        # touching the next, and the batch would wait on the last request's
-        # first layer -- which is what the forward pass needs first.
+        # Under layer-major retrieval the step's requests go as one command,
+        # so they take the transfer stream in the order they were scheduled
+        # and each gets its own arrival slot. The server moves them one
+        # request at a time, and each is handed back on its own first layers.
         if self._layers_per_stage >= 1 and len(request_ids) > 1:
             if self._submit_retrieve_batch(request_ids, ops, event, cache_salts):
                 return

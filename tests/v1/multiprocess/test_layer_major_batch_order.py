@@ -1,19 +1,23 @@
 # SPDX-License-Identifier: Apache-2.0
-"""The order a batch's slices are enqueued in, and when arrival is published.
+"""The order a batch's requests and slices are enqueued in, and when arrival is
+published.
 
-Two orderings have to hold together for a batched layer-major retrieve to pay
-off with several requests in flight:
+A batched layer-major retrieve shares one FIFO stream with every other
+retrieve the worker has in flight. Two orderings have to hold together for
+several requests to pay off:
 
-* slices outer, requests inner -- the forward pass reads layer L of every
-  request before layer L+1 of any, so the batch's layer 0 must be complete
-  before layer 1 starts;
-* arrival published per request, right after that request's slice -- so a
-  request leaves the wait for remote KV on its own bytes instead of the whole
-  batch's.
+* requests outer, slices inner -- every layer of request A is moved before
+  any layer of request B, so A's data is complete, and A can be computing,
+  while B's is still on its way. Moving layer 0 of every request first would
+  leave every request waiting on the batch's last slice;
 
-The second is what an earlier version got wrong: it published once per slice
-for the whole batch, so no request was released until every request's slice had
-landed. Both are checked here by recording the calls, with no GPU involved.
+* arrival published per request, right after each of that request's slices --
+  so a request leaves the wait for remote KV on its own bytes instead of the
+  whole batch's.
+
+Both are checked here by recording the calls, with no GPU involved. The block
+ids are staged once per request: nothing else touches the shared staging
+buffer between one request's slices.
 """
 
 # Third Party
@@ -29,10 +33,11 @@ NUM_REQUESTS = 3
 
 @pytest.fixture
 def call_log(monkeypatch: pytest.MonkeyPatch) -> list[tuple]:
-    """Record enqueue and publish calls in the order they are made."""
+    """Record stage, enqueue and publish calls in the order they are made."""
     log: list[tuple] = []
 
     def fake_stage(cache_context: object, block_ids: list[list[int]]) -> object:
+        log.append(("stage", block_ids[0][0]))
         return block_ids
 
     def fake_enqueue(
@@ -56,13 +61,15 @@ def call_log(monkeypatch: pytest.MonkeyPatch) -> list[tuple]:
     return log
 
 
-def test_slice_outer_with_arrival_published_per_request(call_log: list[tuple]) -> None:
-    """Each request hears about its slice before the next request is enqueued."""
-    per_request = [([[0]], [f"req{i}"]) for i in range(NUM_REQUESTS)]
+def _per_request() -> list[tuple[list[list[int]], list[str]]]:
+    return [([[i]], [f"req{i}"]) for i in range(NUM_REQUESTS)]
 
+
+def test_request_outer_with_arrival_published_per_slice(call_log: list[tuple]) -> None:
+    """A request's slices are enqueued back to back, each published as it goes."""
     transfer.transfer_kv_batch_layer_major(
         cache_context=object(),
-        per_request=per_request,
+        per_request=_per_request(),
         object_group_id=0,
         batch_size=1,
         skip_first_n_tokens=0,
@@ -74,20 +81,60 @@ def test_slice_outer_with_arrival_published_per_request(call_log: list[tuple]) -
     )
 
     expected: list[tuple] = []
-    for layer_start in range(0, NUM_LAYERS, LAYERS_PER_STAGE):
-        for position in range(NUM_REQUESTS):
+    for position in range(NUM_REQUESTS):
+        expected.append(("stage", position))
+        for layer_start in range(0, NUM_LAYERS, LAYERS_PER_STAGE):
             expected.append(("enqueue", f"req{position}", layer_start))
             expected.append(("publish", position, layer_start, LAYERS_PER_STAGE))
     assert call_log == expected
 
 
-def test_no_publisher_still_moves_every_slice(call_log: list[tuple]) -> None:
-    """Without a publisher the transfer runs, just with no progress reported."""
-    per_request = [([[0]], [f"req{i}"]) for i in range(NUM_REQUESTS)]
-
+def test_block_ids_are_staged_once_per_request(call_log: list[tuple]) -> None:
+    """The shared staging buffer is filled once per request, not once per slice."""
     transfer.transfer_kv_batch_layer_major(
         cache_context=object(),
-        per_request=per_request,
+        per_request=_per_request(),
+        object_group_id=0,
+        batch_size=1,
+        skip_first_n_tokens=0,
+        direction=None,
+        layers_per_stage=LAYERS_PER_STAGE,
+    )
+
+    stages = [entry for entry in call_log if entry[0] == "stage"]
+    assert stages == [("stage", i) for i in range(NUM_REQUESTS)]
+
+
+def test_a_partial_last_slice_is_published_with_its_real_width(
+    call_log: list[tuple],
+) -> None:
+    """A layer count that does not divide evenly ends with a narrower slice."""
+    transfer.transfer_kv_batch_layer_major(
+        cache_context=object(),
+        per_request=_per_request()[:1],
+        object_group_id=0,
+        batch_size=1,
+        skip_first_n_tokens=0,
+        direction=None,
+        layers_per_stage=3,
+        on_request_slice=lambda position, layer_start, layer_count: call_log.append(
+            ("publish", position, layer_start, layer_count)
+        ),
+    )
+
+    publishes = [entry for entry in call_log if entry[0] == "publish"]
+    assert publishes == [
+        ("publish", 0, 0, 3),
+        ("publish", 0, 3, 3),
+        ("publish", 0, 6, 2),
+    ]
+
+
+def test_no_publisher_still_moves_every_slice(call_log: list[tuple]) -> None:
+    """Without a publisher the transfer runs, just with no progress reported."""
+    transfer.transfer_kv_batch_layer_major(
+        cache_context=object(),
+        per_request=_per_request(),
         object_group_id=0,
         batch_size=1,
         skip_first_n_tokens=0,
@@ -96,8 +143,8 @@ def test_no_publisher_still_moves_every_slice(call_log: list[tuple]) -> None:
     )
 
     slices = NUM_LAYERS // LAYERS_PER_STAGE
-    assert len(call_log) == slices * NUM_REQUESTS
-    assert all(entry[0] == "enqueue" for entry in call_log)
+    enqueues = [entry for entry in call_log if entry[0] == "enqueue"]
+    assert len(enqueues) == slices * NUM_REQUESTS
 
 
 def test_a_slice_width_below_one_is_rejected(call_log: list[tuple]) -> None:
