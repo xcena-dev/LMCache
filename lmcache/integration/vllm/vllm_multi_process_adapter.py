@@ -62,6 +62,10 @@ _ARRIVAL_WAIT_TIMEOUT = 60.0
 #: Pulls the integer out of vLLM layer names like "model.layers.5.self_attn".
 _LAYER_INDEX_RE = re.compile(r"model\.layers\.(\d+)")
 
+#: Log one line per retrieve with wall-clock submit / release / complete
+#: times, so a serving run can be replayed as a per-request timeline.
+_RETRIEVE_TIMELINE_LOG = os.environ.get("LMCACHE_MP_RETRIEVE_TIMELINE", "0") == "1"
+
 
 class ExtraConfigDefault(enum.Enum):
     """Centralized default values for extra_config keys.
@@ -1170,6 +1174,9 @@ class LMCacheMPWorkerAdapter:
         # Requests handed to the engine on their first layers while their
         # transfer is still running: their future is still owed a completion.
         self._draining_retrieves: dict[str, tuple[Any, list[int]]] = {}
+        # Wall-clock stamps for the optional per-retrieve timeline log.
+        self._retrieve_submitted_at: dict[str, float] = {}
+        self._retrieve_released_at: dict[str, float] = {}
 
         # The store requests that have finished execution in LMCache
         self.finished_stores: set[str] = set()
@@ -1673,6 +1680,7 @@ class LMCacheMPWorkerAdapter:
         )
         self.retrieve_futures[request_id] = (future, op.flat_block_ids)
         self.retrieve_events[request_id] = event
+        self._note_retrieve_submitted(request_id)
 
     @_lmcache_nvtx_annotate
     def batched_submit_store_requests(
@@ -1818,6 +1826,7 @@ class LMCacheMPWorkerAdapter:
         for request_id, op in zip(request_ids, ops, strict=True):
             self.retrieve_futures[request_id] = (future, op.flat_block_ids)
             self.retrieve_events[request_id] = event
+            self._note_retrieve_submitted(request_id)
         return True
 
     def _process_finished_stores(
@@ -1939,6 +1948,8 @@ class LMCacheMPWorkerAdapter:
                     continue
                 self._draining_retrieves[request_id] = (r_future, blocks)
                 finished_retrieves.add(request_id)
+                if _RETRIEVE_TIMELINE_LOG:
+                    self._retrieve_released_at[request_id] = time.time()
 
         for request_id, (r_future, blocks) in list(self._draining_retrieves.items()):
             if not r_future.query():
@@ -1947,6 +1958,7 @@ class LMCacheMPWorkerAdapter:
             self.retrieve_futures.pop(request_id, None)
             self.retrieve_events.pop(request_id, None)
             self._release_arrival_slot(request_id)
+            self._log_retrieve_timeline(request_id, "layer-major")
             if not r_future.result(timeout=60):
                 logger.error(
                     "Something went wrong when processing the retrieve "
@@ -1964,6 +1976,7 @@ class LMCacheMPWorkerAdapter:
 
             r_result = r_future.result(timeout=60)
             finished_retrieves.add(request_id)
+            self._log_retrieve_timeline(request_id, "whole")
 
             if not r_result:
                 logger.error(
@@ -2231,6 +2244,44 @@ class LMCacheMPWorkerAdapter:
         if pool is None:
             return
         pool.release(request_id)
+
+    def _note_retrieve_submitted(self, request_id: str) -> None:
+        """Stamp the submit time of a retrieve for the timeline log.
+
+        Args:
+            request_id: The retrieve's request id.
+        """
+        if _RETRIEVE_TIMELINE_LOG:
+            self._retrieve_submitted_at[request_id] = time.time()
+
+    def _log_retrieve_timeline(self, request_id: str, mode: str) -> None:
+        """Log submit / release / complete wall-clock times of one retrieve.
+
+        A retrieve that was not handed back early has its release time equal
+        to its completion time. The line is emitted only when the
+        ``LMCACHE_MP_RETRIEVE_TIMELINE`` environment variable is ``1``.
+
+        Args:
+            request_id: The retrieve's request id.
+            mode: ``"layer-major"`` for a retrieve released on its first
+                layers, ``"whole"`` for one released on completion.
+        """
+        if not _RETRIEVE_TIMELINE_LOG:
+            return
+        submitted = self._retrieve_submitted_at.pop(request_id, None)
+        if submitted is None:
+            return
+        completed = time.time()
+        released = self._retrieve_released_at.pop(request_id, completed)
+        logger.info(
+            "Retrieve timeline: request_id=%s mode=%s submit=%.6f "
+            "release=%.6f complete=%.6f",
+            request_id,
+            mode,
+            submitted,
+            released,
+            completed,
+        )
 
     def _update_and_get_finished_store(
         self,
