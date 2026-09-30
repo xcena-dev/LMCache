@@ -6,6 +6,7 @@ from typing import TYPE_CHECKING, Optional, Union
 import importlib
 import math
 import threading
+import time
 import uuid
 
 # Third Party
@@ -15,6 +16,7 @@ import zmq
 # First Party
 from lmcache.logging import init_logger
 from lmcache.v1.distributed.internal_api import L1MemoryDesc
+from lmcache.v1.distributed.trace_ctx import current_prefetch_id
 from lmcache.v1.distributed.transfer_channel.abstract import (
     TransferChannelClient,
     TransferChannelContext,
@@ -112,7 +114,7 @@ class NixlTransferChannelClient(TransferChannelClient):
         self._remote_handle = remote_dlist_handle
 
         self._task_counter = 0
-        # task_id -> (xfer_handle, remote_addresses)
+        # task_id -> (xfer_handle, remote_addresses, submit_monotonic, nbytes)
         self._tasks: dict[int, tuple] = {}
         self._lock = threading.Lock()
 
@@ -149,10 +151,21 @@ class NixlTransferChannelClient(TransferChannelClient):
         )
         agent.transfer(handle)
 
+        # QoS instrumentation: record submit time + payload size so
+        # query_read_status can report per-read transfer speed on completion.
+        submit_monotonic = time.monotonic()
+        nbytes = sum(a.size for a in remote_addresses)
+
         with self._lock:
             task_id = self._task_counter
             self._task_counter += 1
-            self._tasks[task_id] = (handle, list(remote_addresses))
+            self._tasks[task_id] = (
+                handle,
+                list(remote_addresses),
+                submit_monotonic,
+                nbytes,
+                current_prefetch_id.get(),
+            )
         return task_id
 
     def query_read_status(self, task_id: int) -> TransferChannelReadResult:
@@ -169,7 +182,7 @@ class NixlTransferChannelClient(TransferChannelClient):
         with self._lock:
             if task_id not in self._tasks:
                 raise KeyError(f"Unknown read task id: {task_id}")
-            handle, remote_addresses = self._tasks[task_id]
+            handle, remote_addresses, submit_monotonic, nbytes, pf_id = self._tasks[task_id]
 
         status = self._ctx.agent.check_xfer_state(handle)
         if status == "PROC":
@@ -179,6 +192,25 @@ class NixlTransferChannelClient(TransferChannelClient):
         with self._lock:
             self._tasks.pop(task_id, None)
         self._ctx.agent.release_xfer_handle(handle)
+
+        # QoS instrumentation: log per-read transfer speed. Note the duration
+        # is submit -> first observation of the terminal state, so it can
+        # overestimate the pure RDMA time by up to one prefetch poll interval;
+        # it is the effective per-fetch latency, good enough for QoS trends.
+        dur_s = time.monotonic() - submit_monotonic
+        mbps = (nbytes / dur_s / 1e6) if dur_s > 0 else 0.0
+        # pf= (prefetch request id) and end_mono= are appended LAST so the
+        # existing "task= bytes= dur_us=" parsers keep matching.
+        logger.info(
+            "P2P-READ-QOS task=%d bytes=%d dur_us=%.1f MBps=%.1f status=%s pf=%s end_mono=%.3f",
+            task_id,
+            nbytes,
+            dur_s * 1e6,
+            mbps,
+            status,
+            pf_id,
+            time.monotonic() * 1e3,
+        )
 
         if status == "DONE":
             return TransferChannelReadResult(
@@ -201,7 +233,7 @@ class NixlTransferChannelClient(TransferChannelClient):
         with self._lock:
             tasks = list(self._tasks.values())
             self._tasks.clear()
-        for handle, _ in tasks:
+        for handle, *_ in tasks:
             try:
                 self._ctx.agent.release_xfer_handle(handle)
             except Exception:  # noqa: BLE001 - best-effort cleanup
@@ -268,6 +300,11 @@ class NixlTransferChannelServer(TransferChannelServer):
     def _handle_msg(self, req: HandshakeMsg) -> HandshakeMsg:
         agent = self._ctx.agent
         if isinstance(req, InitReq):
+            logger.info(
+                "Inbound InitReq from agent %s; loading its metadata "
+                "(add_remote_agent)",
+                req.agent_name,
+            )
             # Learn the connecting peer's agent (idempotent on repeat).
             agent.add_remote_agent(req.agent_meta)
             return InitResp(
@@ -275,6 +312,11 @@ class NixlTransferChannelServer(TransferChannelServer):
                 agent_meta=agent.get_agent_metadata(),
             )
         elif isinstance(req, MemRegReq):
+            logger.info(
+                "Inbound MemRegReq from %s (agent %s); creating reactive client",
+                req.sender_advertise_url,
+                req.sender_agent_name,
+            )
             remote_xfer_dlist = agent.deserialize_descs(req.xfer_descs)
             remote_handle = agent.prep_xfer_dlist(
                 req.sender_agent_name, remote_xfer_dlist
@@ -460,7 +502,11 @@ class NixlTransferChannelContext(TransferChannelContext):
             if existing is client:
                 return client
 
-        logger.debug("Reusing existing transfer channel client for %s", key)
+        logger.info(
+            "Duplicate transfer channel client for %s (active connect raced "
+            "with the peer's inbound connection); closing the new one",
+            key,
+        )
         try:
             client.close()
         except Exception:  # noqa: BLE001
@@ -545,6 +591,7 @@ class NixlTransferChannelContext(TransferChannelContext):
             ) from err
 
     def _connect(self, server_url: str) -> NixlTransferChannelClient:
+        logger.info("Actively dialing peer %s (agent %s)", server_url, self.agent_name)
         socket = self.zmq_context.socket(zmq.REQ)
         socket.setsockopt(zmq.LINGER, 0)
         socket.setsockopt(zmq.RCVTIMEO, _HANDSHAKE_TIMEOUT_MS)
@@ -565,6 +612,12 @@ class NixlTransferChannelContext(TransferChannelContext):
             )
             assert isinstance(init_resp, InitResp)
             server_agent_name = self.agent.add_remote_agent(init_resp.agent_meta)
+            logger.info(
+                "Loaded metadata of peer agent %s via active connect to %s "
+                "(add_remote_agent)",
+                server_agent_name,
+                server_url,
+            )
 
             # Stage 2: exchange transfer-descriptor lists.
             socket.send(
