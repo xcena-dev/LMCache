@@ -398,6 +398,10 @@ class LMCacheMPConnectorMetadata(KVConnectorMetadata):
     def __init__(self):
         super().__init__()
         self.requests: list[LMCacheMPRequestMetadata] = []
+        # Async RETRIEVE commands can be issued while a request is parked.
+        # Its later forward pass still needs layer waits even without a new
+        # command, so carry the scheduled consumers independently of RPCs.
+        self.forward_request_ids: list[str] = []
         self.need_flush_before_forward: bool = False
 
     def add_request_metadata(self, request_metadata: LMCacheMPRequestMetadata):

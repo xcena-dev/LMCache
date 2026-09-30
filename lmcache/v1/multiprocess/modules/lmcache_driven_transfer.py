@@ -3,7 +3,8 @@
 
 # Standard
 from dataclasses import dataclass
-from typing import Any, Sequence
+from typing import Any, Callable, Sequence
+import contextlib
 import threading
 import time
 
@@ -29,6 +30,7 @@ from lmcache.v1.multiprocess.custom_types import (
 from lmcache.v1.multiprocess.engine_context import MPCacheServerContext
 from lmcache.v1.multiprocess.engine_module import InstanceLivenessTarget
 from lmcache.v1.multiprocess.group_view import EngineGroupInfo
+from lmcache.v1.multiprocess.layer_arrival_board import LayerArrivalBoard
 from lmcache.v1.multiprocess.modules.lookup import resolve_prefetched_obj_keys
 from lmcache.v1.multiprocess.native_completion import (
     DeviceHostFuncDispatcher,
@@ -36,6 +38,8 @@ from lmcache.v1.multiprocess.native_completion import (
 )
 from lmcache.v1.multiprocess.object_group_transfer import (
     downsample_and_stage_block_ids,
+    slice_publisher_for,
+    transfer_kv_batch_layer_major,
     transfer_kv_per_object_group,
 )
 from lmcache.v1.multiprocess.request_handler import HandlerType, request_handler
@@ -171,6 +175,10 @@ class LMCacheDrivenTransferModule(InstanceLivenessTarget):
 
     def __init__(self, ctx: MPCacheServerContext) -> None:
         self._ctx = ctx
+        # Worker arrival boards, mapped once per segment name and kept for the
+        # life of the server (see _attach_arrival_board).
+        self._arrival_boards: dict[str, LayerArrivalBoard] = {}
+        self._arrival_boards_lock = threading.Lock()
         self._cache_contexts: dict[int, ContextEntry] = {}
         # Guards all reads/writes of _cache_contexts. The reaper mutates it
         # off the MQ main loop, so register/unregister/store/retrieve and
@@ -405,6 +413,10 @@ class LMCacheDrivenTransferModule(InstanceLivenessTarget):
             entries = list(self._cache_contexts.values())
             self._cache_contexts.clear()
         self._release_entries(entries)
+        with self._arrival_boards_lock:
+            for board in self._arrival_boards.values():
+                board.close()
+            self._arrival_boards.clear()
 
     @request_handler()
     def register_kv_cache(
@@ -776,6 +788,439 @@ class LMCacheDrivenTransferModule(InstanceLivenessTarget):
             store_succeeded,
         )
 
+    def _attach_arrival_board(self, name: str, num_slots: int) -> LayerArrivalBoard:
+        """Return this process's mapping of a worker's arrival board.
+
+        One mapping per board name is kept for the life of the server; workers
+        create the segment and reuse it across retrieves.
+
+        Args:
+            name: POSIX shared-memory segment name the worker created.
+            num_slots: Slots the segment holds.
+
+        Returns:
+            The attached board.
+
+        Raises:
+            OSError: If the segment cannot be mapped.
+        """
+        with self._arrival_boards_lock:
+            board = self._arrival_boards.get(name)
+            if board is None:
+                board = LayerArrivalBoard.attach(name, num_slots)
+                self._arrival_boards[name] = board
+            return board
+
+    def _build_layer_arrival_publisher(
+        self,
+        cache_context: Any,
+        event_backend: Any,
+        arrival_board: tuple[str, int, int] | None,
+        layer_event_handles: list[bytes] | None,
+    ) -> "Callable[[int, int], None] | None":
+        """Build the per-slice callback that tells the worker a slice has landed.
+
+        Records one event per layer in the slice and then raises the board's
+        count to the slice's end. The order matters: the count is what makes
+        those events safe for the worker to wait on, so it is published last.
+
+        Args:
+            cache_context: The GPU cache context (for stream and device).
+            event_backend: Device event backend for import/record.
+            arrival_board: ``(segment name, slot, slots in segment)`` from the
+                worker, or None when the worker did not ask for per-slice
+                progress.
+            layer_event_handles: One exported event handle per layer, or None.
+
+        Returns:
+            The callback, or None when per-slice progress was not requested or
+            could not be set up (the transfer then runs without it).
+        """
+        if arrival_board is None or not layer_event_handles:
+            return None
+        name, slot, num_slots = arrival_board
+        try:
+            board = self._attach_arrival_board(name, num_slots)
+            layer_events = [
+                event_backend.import_event(handle, cache_context.device)
+                for handle in layer_event_handles
+            ]
+        except Exception:
+            # Losing per-slice progress costs the overlap, not correctness: the
+            # worker still waits for the whole retrieve via its own event.
+            logger.exception(
+                "Cannot set up per-slice layer arrival publishing on board %s "
+                "slot %d; the retrieve proceeds without it",
+                name,
+                slot,
+            )
+            return None
+
+        def publish(layer_start: int, layer_count: int) -> None:
+            end = min(layer_start + layer_count, len(layer_events))
+            for layer in range(layer_start, end):
+                event_backend.record_event(layer_events[layer], cache_context.stream)
+            board.publish(slot, end)
+
+        return publish
+
+    def _build_batch_arrival_publishers(
+        self,
+        cache_context: Any,
+        event_backend: Any,
+        arrival_boards: list[tuple[str, int, int]] | None,
+        layer_event_handles: list[list[bytes]] | None,
+        num_requests: int,
+        num_object_groups: int,
+    ) -> "list[Callable[[int, int], None]] | None":
+        """Build one per-slice callback per request in a batch.
+
+        Each request has its own board slot and its own per-layer events, so
+        the server can say that *this* request's slice has landed without
+        waiting for the rest of the batch. That is what lets the worker hand a
+        request back to the engine while later requests are still copying.
+
+        Args:
+            cache_context: The GPU cache context (for stream and device).
+            event_backend: Device event backend for import/record.
+            arrival_boards: One ``(segment name, slot, slots in segment)`` per
+                request, or None when the worker asked for no progress.
+            layer_event_handles: Per request, one exported event handle per
+                layer.
+            num_requests: Requests in the batch.
+            num_object_groups: Object groups this model splits its KV into.
+
+        Returns:
+            One callback per request, or None when per-slice progress was not
+            requested or cannot be published safely.
+        """
+        if not arrival_boards or not layer_event_handles:
+            return None
+        if len(arrival_boards) != num_requests or (
+            len(layer_event_handles) != num_requests
+        ):
+            logger.error(
+                "Batch retrieve got %d boards and %d event sets for %d "
+                "requests; it runs without per-slice progress",
+                len(arrival_boards),
+                len(layer_event_handles),
+                num_requests,
+            )
+            return None
+        if num_object_groups > 1:
+            # A slice is enqueued once per object group, so publishing after
+            # the first group would say a layer had landed while the other
+            # groups' bytes for that layer were still queued behind it.
+            logger.debug(
+                "Per-slice arrival is not published for a model with %d "
+                "object groups; the retrieve waits for the whole transfer",
+                num_object_groups,
+            )
+            return None
+        publishers: list[Callable[[int, int], None]] = []
+        for board, handles in zip(arrival_boards, layer_event_handles, strict=True):
+            publisher = self._build_layer_arrival_publisher(
+                cache_context, event_backend, board, handles
+            )
+            if publisher is None:
+                return None
+            publishers.append(publisher)
+        return publishers
+
+    @request_handler(
+        HandlerType.BLOCKING,
+        requires_client_affinity=True,
+    )
+    @_lmcache_nvtx_annotate
+    def retrieve_batch(
+        self,
+        keys: list[IPCCacheServerKey],
+        instance_id: int,
+        gpu_block_ids: list[list[list[int]]],
+        event_ipc_handle: bytes,
+        skip_first_n_tokens: int = 0,
+        arrival_boards: list[tuple[str, int, int]] | None = None,
+        layer_event_handles: list[list[bytes]] | None = None,
+        layers_per_stage: int = 0,
+    ) -> tuple[bytes, list[bool]]:
+        """Retrieve a whole batch, a layer slice at a time.
+
+        The step's requests arrive as one command so they take the transfer
+        stream in scheduling order, each with its own arrival slot. The batch
+        is moved request-outer, slice-inner: a request's layers land back to
+        back, so once its first slice is on the GPU and the engine has it
+        back, the rest of its layers are the next thing on the stream and its
+        compute overlaps with the requests queued behind it.
+
+        Arrival is published per request, on that request's own board slot, as
+        soon as that request's slice has been enqueued. A request therefore
+        leaves the wait for remote KV after its own first slice rather than
+        after the whole batch's.
+
+        Falls back to per-request chunk-major transfers when layer-major does
+        not apply, so the caller does not have to test for it.
+
+        Args:
+            keys: One cache key per request. Each must have worker_id != None.
+            instance_id: The GPU instance ID (such as PID).
+            gpu_block_ids: Per request, the GPU block IDs to retrieve into,
+                indexed by LMCache KV group index.
+            event_ipc_handle: IPC handle of the event that orders writes to the
+                engine KV cache.
+            skip_first_n_tokens: Initial tokens the transfer must not overwrite.
+            arrival_boards: One ``(segment name, slot, slots in segment)``
+                per request, naming where the server publishes that request's
+                per-slice progress, or None to ask for none.
+            layer_event_handles: Per request, one exported event handle per
+                layer. Ignored without ``arrival_boards``.
+            layers_per_stage: Layers the server moves per slice. 0 keeps the
+                chunk-major path.
+
+        Returns:
+            ``(completion event handle, one hit flag per request)``. The handle
+            is empty when no device work was submitted.
+
+        Raises:
+            RuntimeError: If the backend does not support IPC event handles.
+        """
+        st = time.perf_counter()
+
+        entry = self.get_and_touch_context_entry(instance_id)
+        if entry is None:
+            # See retrieve(): no device work, so no completion event; the
+            # False results let the caller recover or recompute.
+            logger.warning(
+                "Rejecting RETRIEVE_BATCH for unregistered GPU instance ID %d",
+                instance_id,
+            )
+            for key in keys:
+                try:
+                    self._release_failed_retrieve_locks(key, instance_id)
+                except Exception:
+                    logger.exception(
+                        "Failed to release RETRIEVE_BATCH locks for unregistered "
+                        "GPU instance ID %d",
+                        instance_id,
+                    )
+            return b"", [False] * len(keys)
+        cache_context = entry.cache_context
+        model_name = entry.model_name
+        event_backend = entry.event_backend
+        if event_backend is None:
+            raise RuntimeError("Registered cache context has no event backend")
+
+        kv_groups_manager = cache_context.kv_layer_groups_manager
+        num_object_groups = kv_groups_manager.num_object_groups
+        attn_desc = kv_groups_manager.get_attn_desc()
+        # Aux (connector-private) groups are never served by the std retrieve;
+        # see retrieve() for why.
+        skipped_groups = {
+            g for g, kind in enumerate(attn_desc.group_kinds) if kind == "aux"
+        }
+        group_skips = [
+            0 if window < 0 else window for window in attn_desc.num_chunks_in_sw
+        ]
+        blocks_per_chunk = [
+            cache_context.calculate_num_blocks(self._ctx.chunk_size, group_idx)
+            for group_idx in range(kv_groups_manager.num_kernel_groups)
+        ]
+
+        for key in keys:
+            self._ctx.event_bus.publish(
+                Event(
+                    event_type=EventType.MP_RETRIEVE_SUBMITTED,
+                    session_id=key.request_id,
+                    metadata={"device": str(cache_context.device)},
+                )
+            )
+        transfer_keys = [next_transfer_key(key.request_id) for key in keys]
+
+        hits = [False] * len(keys)
+        with (
+            torch_dev.device(cache_context.device),
+            torch_dev.stream(cache_context.stream),
+            contextlib.ExitStack() as stack,
+        ):
+            event = event_backend.create_event(cache_context.device)
+            for key, transfer_key in zip(keys, transfer_keys, strict=True):
+                self._ctx.event_bus.publish_on_stream(
+                    cache_context.cupy_stream,
+                    Event(
+                        event_type=EventType.MP_RETRIEVE_START,
+                        session_id=key.request_id,
+                        metadata={
+                            "device": str(cache_context.device),
+                            "engine_id": instance_id,
+                            "model_name": model_name,
+                            "transfer_key": transfer_key,
+                        },
+                    ),
+                )
+
+            producer_event = event_backend.import_event(
+                event_ipc_handle, cache_context.device
+            )
+            event_backend.wait_event(producer_event, cache_context.stream)
+            publishers = self._build_batch_arrival_publishers(
+                cache_context,
+                event_backend,
+                arrival_boards,
+                layer_event_handles,
+                len(keys),
+                num_object_groups - len(skipped_groups),
+            )
+            use_layer_major = publishers is not None and layers_per_stage > 0
+
+            prefetched_keys: list[ObjectKey] = []
+            # Per object group, gather every request's in-window objects before
+            # enqueuing anything, so the slice loop can walk the batch.
+            per_group: list[
+                list[tuple[int, list[list[int]], list[MemoryObj | None]]]
+            ] = [[] for _ in range(num_object_groups)]
+            ready = [True] * len(keys)
+            num_chunks_per_request = [0] * len(keys)
+            bytes_per_request = [0] * len(keys)
+            for req_idx, (key, block_ids) in enumerate(
+                zip(keys, gpu_block_ids, strict=True)
+            ):
+                obj_keys_per_obj_group = self._ctx.resolve_obj_keys(
+                    key, list(range(num_object_groups))
+                )
+                num_chunks = len(obj_keys_per_obj_group[0])
+                num_chunks_per_request[req_idx] = num_chunks
+                # Fail closed on a short block-id list, as retrieve() does.
+                if any(
+                    len(group_block_ids) < num_chunks * bpc
+                    for group_block_ids, bpc in zip(
+                        block_ids, blocks_per_chunk, strict=True
+                    )
+                ):
+                    logger.error(
+                        "RETRIEVE_BATCH block ID underflow for request_id=%s: "
+                        "each group needs num_chunks * blocks_per_chunk block "
+                        "IDs for %d chunks (per-group blocks_per_chunk=%s); "
+                        "skipping this request.",
+                        key.request_id,
+                        num_chunks,
+                        blocks_per_chunk,
+                    )
+                    ready[req_idx] = False
+                    continue
+                for obj_group_id in range(num_object_groups):
+                    if obj_group_id in skipped_groups:
+                        continue
+                    skip = max(0, num_chunks - group_skips[obj_group_id])
+                    if attn_desc.num_chunks_in_sw[obj_group_id] < 0:
+                        skip = 0
+                    in_window_keys = obj_keys_per_obj_group[obj_group_id][skip:]
+                    window_objs = stack.enter_context(
+                        self._ctx.storage_manager.read_prefetched_results(
+                            in_window_keys
+                        )
+                    )
+                    if not window_objs or len(window_objs) != len(in_window_keys):
+                        logger.error(
+                            "Some keys not found during batch retrieve of request %s",
+                            key.request_id,
+                        )
+                        ready[req_idx] = False
+                        continue
+                    prefetched_keys.extend(in_window_keys)
+                    bytes_per_request[req_idx] += sum(
+                        mo.get_size() for mo in window_objs
+                    )
+                    memory_objs: list[MemoryObj | None] = [None] * skip + list(
+                        window_objs
+                    )
+                    per_group[obj_group_id].append((req_idx, block_ids, memory_objs))
+
+            try:
+                for obj_group_id in range(num_object_groups):
+                    if obj_group_id in skipped_groups:
+                        continue
+                    entries = [
+                        entry for entry in per_group[obj_group_id] if ready[entry[0]]
+                    ]
+                    if not entries:
+                        continue
+                    if use_layer_major and publishers is not None:
+                        transfer_kv_batch_layer_major(
+                            cache_context,
+                            [(blocks, objs) for _, blocks, objs in entries],
+                            object_group_id=obj_group_id,
+                            batch_size=cache_context.max_batch_size,
+                            skip_first_n_tokens=skip_first_n_tokens,
+                            direction=lmcache_native.TransferDirection.H2D,
+                            layers_per_stage=layers_per_stage,
+                            on_request_slice=slice_publisher_for(
+                                publishers, [idx for idx, _, _ in entries]
+                            ),
+                        )
+                    else:
+                        for req_idx, block_ids, memory_objs in entries:
+                            # The cut is done in place; the same lists then
+                            # serve as the host block ids of the direct path.
+                            block_ids_host = [list(group) for group in block_ids]
+                            transfer_kv_per_object_group(
+                                cache_context,
+                                downsample_and_stage_block_ids(
+                                    cache_context, block_ids_host
+                                ),
+                                memory_objs,
+                                object_group_id=obj_group_id,
+                                batch_size=cache_context.max_batch_size,
+                                skip_first_n_tokens=skip_first_n_tokens,
+                                direction=lmcache_native.TransferDirection.H2D,
+                                transfer_key=transfer_keys[req_idx],
+                                block_ids_host=block_ids_host,
+                            )
+                hits = list(ready)
+            except Exception:
+                logger.exception("Cannot retrieve the batch due to exception")
+                hits = [False] * len(keys)
+            finally:
+                event_backend.record_event(event, cache_context.stream)
+                if prefetched_keys:
+                    submit_callback_to_stream(
+                        cache_context.cupy_stream,
+                        "finish_read_prefetched",
+                        prefetched_keys,
+                    )
+                for req_idx, (key, transfer_key) in enumerate(
+                    zip(keys, transfer_keys, strict=True)
+                ):
+                    num_chunks = num_chunks_per_request[req_idx]
+                    self._ctx.event_bus.publish_on_stream(
+                        cache_context.cupy_stream,
+                        Event(
+                            event_type=EventType.MP_RETRIEVE_END,
+                            session_id=key.request_id,
+                            metadata={
+                                "retrieved_count": num_chunks if hits[req_idx] else 0,
+                                "device": str(cache_context.device),
+                                "engine_id": instance_id,
+                                "model_name": model_name,
+                                "cache_salt": key.cache_salt,
+                                "total_bytes": bytes_per_request[req_idx],
+                                "num_tokens": (
+                                    num_chunks * self._ctx.chunk_size
+                                    if hits[req_idx]
+                                    else 0
+                                ),
+                                "transfer_key": transfer_key,
+                            },
+                        ),
+                    )
+
+        if all(hits):
+            logger.info(
+                "Retrieved a batch of %d requests (%d tokens) in %.3f seconds",
+                len(keys),
+                sum(num_chunks_per_request) * self._ctx.chunk_size,
+                time.perf_counter() - st,
+            )
+        return event_backend.export_event(event, cache_context.device), hits
+
     @request_handler(
         HandlerType.BLOCKING,
         requires_client_affinity=True,
@@ -788,6 +1233,9 @@ class LMCacheDrivenTransferModule(InstanceLivenessTarget):
         gpu_block_ids: list[list[int]],
         event_ipc_handle: bytes,
         skip_first_n_tokens: int = 0,
+        arrival_board: tuple[str, int, int] | None = None,
+        layer_event_handles: list[bytes] | None = None,
+        layers_per_stage: int = 0,
     ) -> tuple[bytes, bool]:
         """Retrieve the CPU KV cache and put into GPU blocks.
 
@@ -916,6 +1364,21 @@ class LMCacheDrivenTransferModule(InstanceLivenessTarget):
                 event_ipc_handle, cache_context.device
             )
             event_backend.wait_event(producer_event, cache_context.stream)
+            # Layer-major only: publish each slice as it is enqueued so the
+            # worker can start the model on the layers that have landed. Two
+            # facts have to cross the process boundary and they travel apart --
+            # the per-layer event says "these bytes are on the GPU", the board
+            # says "that event has actually been recorded". Without the second
+            # the worker would wait on an unrecorded event, which reports
+            # complete, and read KV that was never copied.
+            on_layer_batch = self._build_layer_arrival_publisher(
+                cache_context, event_backend, arrival_board, layer_event_handles
+            )
+            layer_major_kwargs: dict[str, Any] = (
+                {"layers_per_stage": layers_per_stage, "on_layer_batch": on_layer_batch}
+                if on_layer_batch is not None
+                else {}
+            )
 
             # Per object group, the prefetch only locked the in-window suffix
             # (the last ``num_chunks_in_sw`` chunks; the whole prefix for full
@@ -974,6 +1437,7 @@ class LMCacheDrivenTransferModule(InstanceLivenessTarget):
                             direction=lmcache_native.TransferDirection.H2D,
                             transfer_key=transfer_key,
                             block_ids_host=gpu_block_ids,
+                            **layer_major_kwargs,
                         )
                         # Extend only after the copy is enqueued: on exception,
                         # read_prefetched_results releases this group's locks

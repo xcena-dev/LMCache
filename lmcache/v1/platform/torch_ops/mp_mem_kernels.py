@@ -317,12 +317,16 @@ def multi_layer_block_kv_transfer(
     lmcache_chunk_size: int,
     engine_kv_format: EngineKVFormat,
     skip_prefix_n_blocks: int,
+    layer_offset: int = 0,
+    staged_layers: int = 0,
 ) -> None:
     """Python fallback implementation of block-based multi-layer KV transfer.
 
     Signature intentionally mirrors the C++ binding so callers can invoke
     ``lmcache.device_ops.multi_layer_block_kv_transfer`` uniformly on native and
-    fallback backends.
+    fallback backends. The layer-slice arguments are accepted for parity only:
+    layer-major staging is served by the native kernel, and the server never
+    selects it on a build without one.
 
     Args:
         paged_buffer_ptrs_tensor: Paged buffer pointers or tensors.
@@ -334,6 +338,10 @@ def multi_layer_block_kv_transfer(
         lmcache_chunk_size: Chunk size of LMCache objects.
         engine_kv_format: GPU KV cache format.
         skip_prefix_n_blocks: Number of leading blocks to skip.
+        layer_offset: First model layer covered by the staged buffer. Only 0
+            (chunk-major) is supported here.
+        staged_layers: Layers held by the staged buffer; 0 means all of
+            ``shape_desc.nl`` (chunk-major). Only that is supported here.
 
     Returns:
         None
@@ -341,7 +349,14 @@ def multi_layer_block_kv_transfer(
     Raises:
         ValueError: If chunk size is invalid, or transfer direction is unsupported.
         TypeError: If input types do not match expected types.
+        NotImplementedError: If a layer slice is requested; the fallback only
+            moves whole chunks.
     """
+    if layer_offset != 0 or staged_layers not in (0, int(shape_desc.nl)):
+        raise NotImplementedError(
+            "layer-major staging (layer_offset/staged_layers) requires the "
+            "native cuda_ops kernel; the torch fallback moves whole chunks"
+        )
     if lmcache_chunk_size <= 0:
         raise ValueError("lmcache_chunk_size must be positive")
     if int(shape_desc.bs) <= 0 or lmcache_chunk_size % int(shape_desc.bs) != 0:

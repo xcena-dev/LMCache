@@ -96,7 +96,23 @@ class RequestClient(Protocol):
         block_ids: list[list[int]],
         event_ipc_handle: bytes,
         skip_first_n_tokens: int,
+        arrival_board: tuple[str, int, int] | None = None,
+        layer_event_handles: list[bytes] | None = None,
+        layers_per_stage: int = 0,
     ) -> MessagingFuture[tuple[bytes, bool]]: ...
+
+    @rpc_method
+    def retrieve_batch(
+        self,
+        keys: list[IPCCacheServerKey],
+        instance_id: int,
+        block_ids: list[list[list[int]]],
+        event_ipc_handle: bytes,
+        skip_first_n_tokens: int = 0,
+        arrival_boards: list[tuple[str, int, int]] | None = None,
+        layer_event_handles: list[list[bytes]] | None = None,
+        layers_per_stage: int = 0,
+    ) -> MessagingFuture[tuple[bytes, list[bool]]]: ...
 
     @rpc_method
     def lookup(self, key: IPCCacheServerKey, tp_size: int) -> MessagingFuture[None]: ...

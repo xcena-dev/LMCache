@@ -86,6 +86,8 @@ class RblnDeviceOps(DeviceOps):
         lmcache_chunk_size: int,
         engine_kv_format: lmcache_native.EngineKVFormat,
         skip_prefix_n_blocks: int,
+        layer_offset: int = 0,
+        staged_layers: int = 0,
     ) -> None:
         """Move whole paged blocks between RBLN KV and token-major chunks.
 
@@ -103,6 +105,10 @@ class RblnDeviceOps(DeviceOps):
             lmcache_chunk_size: Tokens per staging chunk.
             engine_kv_format: Engine KV layout; must be the HND or MLA format.
             skip_prefix_n_blocks: Leading blocks neither read nor written.
+            layer_offset: First model layer of a staged layer slice; only 0
+                (whole chunks) is supported here.
+            staged_layers: Layers held by the staged buffer; only 0 (all
+                of ``shape_desc.nl``) is supported here.
 
         Raises:
             ValueError: If the operands are not tensor lists, the format is
@@ -110,6 +116,11 @@ class RblnDeviceOps(DeviceOps):
                 does not match its format's native shape, or the direction is
                 unknown.
         """
+        if layer_offset != 0 or staged_layers not in (0, int(shape_desc.nl)):
+            raise NotImplementedError(
+                "layer-major staging (layer_offset/staged_layers) is only "
+                "implemented by the CUDA kernel"
+            )
         del device  # taken from the operands
         if isinstance(paged_buffer_ptrs_tensor, torch.Tensor) or not all(
             isinstance(obj, torch.Tensor) for obj in lmcache_objects_ptrs

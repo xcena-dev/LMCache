@@ -124,10 +124,15 @@ void execute_direct_copy_transfer(
  * @param lmcache_chunk_size        Tokens per LMCache memory object
  * @param engine_kv_format             EngineKVFormat identifier
  * @param skip_prefix_n_blocks      Number of blocks to skip at the beginning
+ * @param layer_offset              First model layer covered by the staged
+ *                                  buffer (0 for chunk-major)
+ * @param staged_layers             Layers held by the staged buffer; 0 means
+ *                                  all of shape_desc.nl (chunk-major)
  */
 void multi_layer_block_kv_transfer(
     const torch::Tensor& paged_buffer_ptrs_tensor,
     std::vector<int64_t> lmcache_objects_ptrs, const torch::Tensor& block_ids,
     const torch::Device& device, TransferDirection direction,
     PageBufferShapeDesc shape_desc, int lmcache_chunk_size,
-    EngineKVFormat engine_kv_format, int skip_prefix_n_blocks);
+    EngineKVFormat engine_kv_format, int skip_prefix_n_blocks,
+    int layer_offset = 0, int staged_layers = 0);

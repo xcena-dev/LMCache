@@ -626,6 +626,8 @@ class MusaDeviceOps(DeviceOps):
         lmcache_chunk_size: int,
         engine_kv_format: EngineKVFormat,
         skip_prefix_n_blocks: int,
+        layer_offset: int = 0,
+        staged_layers: int = 0,
     ) -> None:
         """Transfer MUSA blocks through native code or the torch baseline.
 
@@ -641,6 +643,10 @@ class MusaDeviceOps(DeviceOps):
             lmcache_chunk_size: Number of slots in each staging object.
             engine_kv_format: Engine KV layout.
             skip_prefix_n_blocks: Leading blocks to skip.
+            layer_offset: First model layer of a staged layer slice; only 0
+                (whole chunks) is supported here.
+            staged_layers: Layers held by the staged buffer; only 0 (all
+                of ``shape_desc.nl``) is supported here.
 
         Returns:
             None.
@@ -649,6 +655,11 @@ class MusaDeviceOps(DeviceOps):
             ValueError: If ``engine_kv_format`` is not supported by the MUSA
                 handle path.
         """
+        if layer_offset != 0 or staged_layers not in (0, int(shape_desc.nl)):
+            raise NotImplementedError(
+                "layer-major staging (layer_offset/staged_layers) is only "
+                "implemented by the CUDA kernel"
+            )
         _musa_multi_layer_block_kv_transfer(
             paged_buffer_ptrs_tensor,
             lmcache_objects_ptrs,

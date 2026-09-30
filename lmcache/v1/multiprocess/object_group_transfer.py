@@ -17,7 +17,7 @@ through a GPU temp buffer and scatters it with the block transfer kernel. See
 
 # Standard
 from itertools import islice
-from typing import Any, Generator, Sequence
+from typing import Any, Callable, Generator, Sequence
 
 # Third Party
 import torch
@@ -26,6 +26,7 @@ import torch
 from lmcache import device_ops
 from lmcache.logging import init_logger
 from lmcache.v1.gpu_connector.gpu_ops import (
+    build_layer_staging_copies,
     build_staging_copies,
     lmcache_memcpy_async_d2h,
     lmcache_memcpy_async_h2d,
@@ -583,6 +584,354 @@ def run_direct_transfer(
     )
 
 
+def _enqueue_object_group_layer_slice(
+    cache_context: BaseCacheContext,
+    block_ids_gpu: list[torch.Tensor],
+    memory_objs: Sequence[MemoryObj | None],
+    object_group_id: int,
+    batch_size: int,
+    skip_first_n_tokens: int,
+    direction: "lmcache_native.TransferDirection",
+    layer_start: int,
+    layer_count: int,
+) -> None:
+    """Enqueue one layer slice of one object group.
+
+    Layer-major sibling of :func:`_run_object_group_transfer_plan`. That function
+    stages whole chunks and scatters every layer in one burst, so the earliest
+    layer is only usable once the last one has landed. This one stages a slice
+    of the layer axis, issuing one native plan for it, so a caller can record a
+    completion event after each slice and let the consumer start on layer 0
+    while later slices are still moving.
+
+    The host object layout is untouched: a layer slice is ``kv_size`` contiguous
+    byte ranges inside the chunk (see :func:`build_layer_staging_copies`), and
+    the scatter kernel is told ``layer_offset``/``staged_layers`` so it addresses
+    the engine side absolutely and the staged side relatively.
+
+    Deliberately narrower than the chunk-major path, which stays the default:
+
+    * one kernel group per object group (the full-attention case). Hybrid models
+      put several kernel groups in one object, whose layer ranges would have to
+      be sliced independently.
+    * no GDS-backed objects, same as the chunk-major staged path.
+
+    Callers must check those before dispatching here.
+
+    Args:
+        cache_context: The GPU cache context containing the KV cache information.
+        block_ids_gpu: GPU block IDs, indexed by LMCache KV group index.
+        memory_objs: The MemoryObj instances to copy. None entries are only
+            valid for D2H (the batch is skipped); H2D raises.
+        object_group_id: Index of the object group being copied.
+        batch_size: Number of memory objects per batched copy.
+        skip_first_n_tokens: Tokens to skip writing at the start of the range.
+        direction: H2D (retrieve) or D2H (store).
+        layer_start: First model layer of the slice.
+        layer_count: Layers in the slice.
+
+    Raises:
+        ValueError: If a None entry is found in memory_objs when direction is
+            H2D, if the object group does not hold exactly one kernel group, or
+            if the slice lies outside the object group's layers.
+    """
+    lmcache_chunk_size = cache_context.lmcache_tokens_per_chunk
+    kv_groups_manager = cache_context.kv_layer_groups_manager
+    object_group = kv_groups_manager.object_groups[object_group_id]
+    kernel_group_ids = object_group.kernel_group_indices
+    if len(kernel_group_ids) != 1:
+        raise ValueError(
+            "layer-major transfer needs exactly one kernel group per object "
+            f"group, got {len(kernel_group_ids)} for object group "
+            f"{object_group_id}"
+        )
+    kernel_group_id = kernel_group_ids[0]
+    is_h2d = direction == lmcache_native.TransferDirection.H2D
+    max_batch_size = cache_context.max_batch_size
+
+    shape_desc = cache_context.get_shape_desc(kernel_group_id)
+    kv_size = shape_desc.kv_size
+    num_layers = shape_desc.nl
+
+    blocks_per_chunk = cache_context.calculate_num_blocks(
+        lmcache_chunk_size, kernel_group_id
+    )
+    tokens_per_window = min(
+        lmcache_chunk_size,
+        kv_groups_manager.get_subchunk_sw_size_tokens(kernel_group_id),
+    )
+    blocks_per_window = cache_context.calculate_num_blocks(
+        tokens_per_window, kernel_group_id
+    )
+
+    paged_ptrs = cache_context.get_kernel_group_kv_pointers(kernel_group_id)
+    block_ids_tensor = block_ids_gpu[kernel_group_id]
+    temp_buffers = [
+        cache_context.get_temp_kernel_group_buffer(slot, kernel_group_id)
+        for slot in range(max_batch_size)
+    ]
+    kernel_group_specs = [
+        device_ops.KernelGroupSpec(
+            paged_ptrs.data_ptr(),
+            [buffer.data_ptr() for buffer in temp_buffers],
+            shape_desc,
+            cache_context.get_slots_per_chunk_in_sw(kernel_group_id),
+            cache_context.get_engine_kv_format(kernel_group_id),
+            block_ids_tensor.data_ptr(),
+            block_ids_tensor.numel(),
+        )
+    ]
+
+    object_group_buffers = [
+        cache_context.get_temp_object_group_buffer(slot, object_group_id)
+        for slot in range(max_batch_size)
+    ]
+
+    attn_desc = kv_groups_manager.get_attn_desc()
+    num_objects_to_skip = 0
+    if not attn_desc.is_full_attention(object_group_id) and is_h2d:
+        sw_size_chunks = attn_desc.num_chunks_in_sw[object_group_id]
+        num_objects_to_skip = max(0, len(memory_objs) - sw_size_chunks)
+
+    if layer_start < 0 or layer_count < 1 or layer_start + layer_count > num_layers:
+        raise ValueError(
+            f"layer slice [{layer_start}, {layer_start + layer_count}) is outside "
+            f"the object group's {num_layers} layers"
+        )
+
+    batch_steps: list[Any] = []
+    for start_object_idx, memory_object_batch in batched_iteration_with_skip(
+        memory_objs, batch_size, skip_count=num_objects_to_skip
+    ):
+        if any(mo is None for mo in memory_object_batch):
+            if is_h2d:
+                raise ValueError(
+                    "MemoryObj is None for some objects in the batch, "
+                    "cannot perform H2D copy. memory_object_batch: "
+                    f"{memory_object_batch}"
+                )
+            else:
+                continue
+
+        batch_len = len(memory_object_batch)
+        batch_start_token = start_object_idx * lmcache_chunk_size
+        batch_end_token = batch_start_token + batch_len * lmcache_chunk_size
+
+        effective_start = max(batch_start_token, skip_first_n_tokens)
+        if effective_start >= batch_end_token:
+            continue
+
+        skip_tokens_in_chunk = effective_start - batch_start_token
+
+        # The chunk-major buffer is sized for every layer, so a slice fits
+        # in its prefix. Sizing it down to the slice is a separate change.
+        slice_nbytes = memory_object_batch[0].get_size() // num_layers * layer_count
+        sliced_buffers = [
+            buffer[:slice_nbytes] for buffer in object_group_buffers[:batch_len]
+        ]
+        staging = build_layer_staging_copies(
+            memory_object_batch,
+            sliced_buffers,
+            is_h2d,
+            kv_size=kv_size,
+            num_layers=num_layers,
+            layer_start=layer_start,
+            layer_count=layer_count,
+        )
+
+        start_block_pos = start_object_idx * blocks_per_window
+        end_block_pos = (start_object_idx + batch_len) * blocks_per_window
+
+        orig_skip_blocks = cache_context.calculate_num_blocks(
+            skip_tokens_in_chunk, kernel_group_id
+        )
+        recalculated_skip_blocks = recalculate_blocks_to_skip(
+            blocks_per_chunk,
+            blocks_per_window,
+            orig_skip_blocks,
+        )
+
+        launches = [
+            device_ops.LaunchVar(
+                0,
+                start_block_pos,
+                end_block_pos - start_block_pos,
+                batch_len,
+                recalculated_skip_blocks,
+                layer_start,
+                layer_count,
+            )
+        ]
+        batch_steps.append(device_ops.BatchStep(staging, launches))
+
+    if not batch_steps:
+        return
+
+    device_ops.execute_object_group_transfer(
+        direction,
+        cache_context.device,
+        LazyMemoryAllocator.PIN_CHUNK_SIZE,
+        kernel_group_specs,
+        batch_steps,
+    )
+
+
+def _object_group_num_layers(
+    cache_context: BaseCacheContext, object_group_id: int
+) -> int:
+    """Layers the object group's single kernel group covers.
+
+    Args:
+        cache_context: The GPU cache context.
+        object_group_id: Index of the object group.
+
+    Returns:
+        The layer count.
+    """
+    kv_groups_manager = cache_context.kv_layer_groups_manager
+    object_group = kv_groups_manager.object_groups[object_group_id]
+    kernel_group_id = list(object_group.kernel_group_indices)[0]
+    return cache_context.get_shape_desc(kernel_group_id).nl
+
+
+def slice_publisher_for(
+    publishers: "Sequence[Callable[[int, int], None]]",
+    request_indices: "Sequence[int]",
+) -> "Callable[[int, int, int], None]":
+    """Route a publish from a position in the batch to that request's board.
+
+    Args:
+        publishers: One publisher per request in the batch, indexed by the
+            request's position in the submitted batch.
+        request_indices: For each position in the transfer's ``per_request``,
+            that request's position in the submitted batch. The two differ when
+            a request's objects were not all found and it was dropped.
+
+    Returns:
+        A callback taking ``(position in per_request, layer_start,
+        layer_count)``.
+    """
+
+    def publish(position: int, layer_start: int, layer_count: int) -> None:
+        publishers[request_indices[position]](layer_start, layer_count)
+
+    return publish
+
+
+def transfer_kv_batch_layer_major(
+    cache_context: BaseCacheContext,
+    per_request: "Sequence[tuple[list[list[int]], Sequence[MemoryObj | None]]]",
+    object_group_id: int,
+    batch_size: int,
+    skip_first_n_tokens: int,
+    direction: "lmcache_native.TransferDirection",
+    layers_per_stage: int,
+    on_request_slice: "Callable[[int, int, int], None] | None" = None,
+) -> None:
+    """Move a whole batch of retrieves, a layer slice at a time.
+
+    The batch shares one FIFO stream with every other retrieve in flight, so
+    the order is request outer, slice inner: every layer of the first request,
+    then every layer of the next. A request is handed back to the engine once
+    its first slice has landed, and with this order its remaining slices are
+    the very next thing on the stream, so it computes while the requests
+    behind it are still copying. Interleaving the requests slice by slice
+    would instead hold every request's last slice until the whole batch had
+    moved, and every request would start computing at the same, late, time.
+
+    Each (request, slice) pair is its own native call. Within one call the plan
+    enqueues every staging copy before any kernel, so two requests sharing the
+    staging slots inside a single call would overwrite each other; across calls
+    stream order keeps the reuse safe.
+
+    Because each pair is its own call, arrival is published per pair: a request
+    hears about each of its slices as it is enqueued, and the worker decides
+    from the first one -- together with that slice's event -- when the request
+    can leave the wait for remote KV and rejoin the run queue.
+
+    Args:
+        cache_context: The GPU cache context.
+        per_request: One ``(block_ids, memory_objs)`` pair per request, in the
+            order the batch was submitted. The block ids are the host-side lists
+            indexed by LMCache KV group; they are cut and staged to the GPU
+            here, once per request, because the context stages them into one
+            shared buffer and returns views into it -- nothing else touches
+            that buffer between one request's slices.
+        object_group_id: Index of the object group to move.
+        batch_size: Chunks per staging batch.
+        skip_first_n_tokens: Initial tokens the transfer must not overwrite.
+        direction: H2D or D2H.
+        layers_per_stage: Layers per slice. Must be >= 1.
+        on_request_slice: Called with ``(position in per_request,
+            layer_start, layer_count)`` right after that one request's slice
+            has been enqueued.
+
+    Raises:
+        ValueError: If ``layers_per_stage`` is below 1.
+    """
+    if layers_per_stage < 1:
+        raise ValueError(f"layers_per_stage must be >= 1, got {layers_per_stage}")
+    if not per_request:
+        return
+    num_layers = _object_group_num_layers(cache_context, object_group_id)
+    for position, (block_ids, memory_objs) in enumerate(per_request):
+        # A fresh copy per request: the cut is done in place.
+        block_ids_gpu = downsample_and_stage_block_ids(
+            cache_context, [list(group) for group in block_ids]
+        )
+        for layer_start in range(0, num_layers, layers_per_stage):
+            layer_count = min(layers_per_stage, num_layers - layer_start)
+            _enqueue_object_group_layer_slice(
+                cache_context,
+                block_ids_gpu,
+                memory_objs,
+                object_group_id,
+                batch_size,
+                skip_first_n_tokens,
+                direction,
+                layer_start,
+                layer_count,
+            )
+            if on_request_slice is not None:
+                on_request_slice(position, layer_start, layer_count)
+
+
+_layer_major_fallback_logged = False
+
+
+def _layer_major_unusable_reason(
+    cache_context: BaseCacheContext,
+    memory_objs: Sequence[MemoryObj | None],
+    object_group_id: int,
+    direction: "lmcache_native.TransferDirection",
+) -> str | None:
+    """Return why layer-major staging cannot serve this transfer, or None if it can.
+
+    Args:
+        cache_context: The GPU cache context containing the KV cache information.
+        memory_objs: The MemoryObj instances about to be copied.
+        object_group_id: Index of the object group being copied.
+        direction: H2D (retrieve) or D2H (store).
+
+    Returns:
+        A short reason for the caller to log, or None when layer-major applies.
+    """
+    if direction != lmcache_native.TransferDirection.H2D:
+        return "stores stay chunk-major"
+    if not _HAS_NATIVE_OBJECT_GROUP_TRANSFER:
+        return "the native object-group transfer extension is unavailable"
+    if any(isinstance(mo, GDSMemoryObject) for mo in memory_objs):
+        return "the batch contains GDS-backed objects"
+    object_group = cache_context.kv_layer_groups_manager.object_groups[object_group_id]
+    if len(object_group.kernel_group_indices) != 1:
+        return (
+            "the object group holds "
+            f"{len(object_group.kernel_group_indices)} kernel groups "
+            "(hybrid model)"
+        )
+    return None
+
+
 def transfer_kv_per_object_group(
     cache_context: BaseCacheContext,
     block_ids_gpu: list[torch.Tensor],
@@ -594,6 +943,8 @@ def transfer_kv_per_object_group(
     *,
     transfer_key: str,
     block_ids_host: Sequence[Sequence[int]] = (),
+    layers_per_stage: int = 0,
+    on_layer_batch: "Callable[[int, int], None] | None" = None,
 ) -> None:
     """Helper function to transfer memory objects of a single object group
     to/from GPU, with batching support.
@@ -620,6 +971,13 @@ def transfer_kv_per_object_group(
             as host lists indexed by kernel group. Required for the direct
             copy path (see :func:`run_direct_transfer`); leave empty to force
             the kernel path.
+        layers_per_stage: Stage the layer axis in slices of this many layers
+            instead of copying whole chunks. 0 (default) keeps the chunk-major
+            paths. Only retrieves can use it, and only when the object group
+            holds a single kernel group and no GDS-backed objects; anything else
+            falls back to chunk-major and logs the reason once.
+        on_layer_batch: Called with ``(layer_start, layer_count)`` after each
+            slice is enqueued, when layer-major staging is in effect.
 
     Raises:
         ValueError: If it founds None entry in memory_objs when direction is H2D.
@@ -627,6 +985,38 @@ def transfer_kv_per_object_group(
         This function expects the caller to stage the block ids (list[list[int]])
         into GPU tensors and pass them in as `block_ids_gpu`.
     """
+    if layers_per_stage > 0:
+        reason = _layer_major_unusable_reason(
+            cache_context, memory_objs, object_group_id, direction
+        )
+        if reason is None:
+            num_layers = _object_group_num_layers(cache_context, object_group_id)
+            for layer_start in range(0, num_layers, layers_per_stage):
+                layer_count = min(layers_per_stage, num_layers - layer_start)
+                _enqueue_object_group_layer_slice(
+                    cache_context,
+                    block_ids_gpu,
+                    memory_objs,
+                    object_group_id,
+                    batch_size,
+                    skip_first_n_tokens,
+                    direction,
+                    layer_start,
+                    layer_count,
+                )
+                if on_layer_batch is not None:
+                    on_layer_batch(layer_start, layer_count)
+            return
+        global _layer_major_fallback_logged
+        if not _layer_major_fallback_logged:
+            _layer_major_fallback_logged = True
+            logger.info(
+                "Layer-major retrieve is configured (%d layers per stage) but "
+                "this transfer falls back to chunk-major: %s. Logged once.",
+                layers_per_stage,
+                reason,
+            )
+
     if _HAS_BATCH_MEMCPY_ASYNC and direct_transfer_supported(
         cache_context, object_group_id, memory_objs, block_ids_host
     ):

@@ -29,6 +29,18 @@ struct LaunchVar {
   int total_blocks;          // number of block ids for this launch
   int num_objects;           // chunks in this batch (1-4)
   int skip_prefix_n_blocks;
+  // Layer slice covered by this launch. Chunk-major (the default) transfers
+  // every layer of the staged objects in one launch: layer_offset 0 and
+  // staged_layers 0, the latter meaning "all of shape_desc.nl".
+  //
+  // Layer-major staging slices the layer axis instead: the staged buffer holds
+  // only `staged_layers` layers laid out as [kv, staged_layers, T, D], and
+  // `layer_offset` is the first *model* layer it corresponds to. The engine
+  // side is addressed with layer_offset + slot, the staged side with the slot
+  // alone, so the host object layout is unchanged - only which bytes were
+  // staged differs.
+  int layer_offset;
+  int staged_layers;
 };
 
 // One batch: its staging copies and kernel launches. For H2D the staging runs

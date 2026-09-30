@@ -171,6 +171,8 @@ class DeviceOps:
         lmcache_chunk_size: int,
         engine_kv_format: lmcache_native.EngineKVFormat,
         skip_prefix_n_blocks: int,
+        layer_offset: int = 0,
+        staged_layers: int = 0,
     ) -> None:
         return torch_ops.multi_layer_block_kv_transfer(
             paged_buffer_ptrs_tensor,
@@ -182,6 +184,8 @@ class DeviceOps:
             lmcache_chunk_size,
             engine_kv_format,
             skip_prefix_n_blocks,
+            layer_offset,
+            staged_layers,
         )
 
     def multi_layer_kv_transfer(self, *args, **kwargs):
