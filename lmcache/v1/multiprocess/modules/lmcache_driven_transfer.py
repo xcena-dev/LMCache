@@ -3,17 +3,13 @@
 
 # Standard
 from dataclasses import dataclass
-from itertools import islice
-from typing import Any, Callable, Generator, Sequence
+from typing import Any, Callable, Sequence
 import contextlib
 import threading
 import time
 
-# Third Party
-import torch
-
 # First Party
-from lmcache import device_ops, torch_dev
+from lmcache import torch_dev
 from lmcache.logging import init_logger
 from lmcache.utils import (
     EngineType,
@@ -23,34 +19,30 @@ from lmcache.v1.distributed.api import (
     MemoryLayoutDesc,
     ObjectKey,
 )
-from lmcache.v1.gpu_connector.gpu_ops import (
-    build_layer_staging_copies,
-    build_staging_copies,
-    lmcache_memcpy_async_d2h,
-    lmcache_memcpy_async_h2d,
-)
 from lmcache.v1.gpu_connector.utils import LayoutHints
 from lmcache.v1.kv_layer_groups import ObjectGroupInfo
-from lmcache.v1.memory_allocators.lazy_memory_allocator import LazyMemoryAllocator
-from lmcache.v1.memory_management import GDSMemoryObject, MemoryObj
-from lmcache.v1.mp_observability.event import Event, EventType
+from lmcache.v1.memory_management import MemoryObj
+from lmcache.v1.mp_observability.event import Event, EventType, next_transfer_key
 from lmcache.v1.multiprocess.custom_types import (
     IPCCacheServerKey,
     KVCache,
 )
 from lmcache.v1.multiprocess.engine_context import MPCacheServerContext
-from lmcache.v1.multiprocess.engine_module import (
-    HandlerSpec,
-    InstanceLivenessTarget,
-    ThreadPoolType,
-)
+from lmcache.v1.multiprocess.engine_module import InstanceLivenessTarget
 from lmcache.v1.multiprocess.group_view import EngineGroupInfo
 from lmcache.v1.multiprocess.layer_arrival_board import LayerArrivalBoard
+from lmcache.v1.multiprocess.modules.lookup import resolve_prefetched_obj_keys
 from lmcache.v1.multiprocess.native_completion import (
     DeviceHostFuncDispatcher,
     submit_callback_to_stream,
 )
-from lmcache.v1.multiprocess.protocols.base import RequestType
+from lmcache.v1.multiprocess.object_group_transfer import (
+    downsample_and_stage_block_ids,
+    slice_publisher_for,
+    transfer_kv_batch_layer_major,
+    transfer_kv_per_object_group,
+)
+from lmcache.v1.multiprocess.request_handler import HandlerType, request_handler
 from lmcache.v1.platform.base.cache_context import BaseCacheContext
 from lmcache.v1.platform.base.event_ipc import (
     EventIPCBackend,
@@ -60,9 +52,6 @@ from lmcache.v1.platform.cache_context import create_cache_context
 import lmcache.lmcache_native as lmcache_native
 
 logger = init_logger(__name__)
-_HAS_NATIVE_OBJECT_GROUP_TRANSFER: bool = hasattr(
-    device_ops, "execute_object_group_transfer"
-)
 
 
 def get_layout_desc(
@@ -95,56 +84,17 @@ def get_layout_desc(
     return MemoryLayoutDesc(shapes=list(shapes), dtypes=list(dtypes))
 
 
-def batched_iteration_with_skip(
-    lst: Sequence,
-    batch_size: int,
-    skip_count: int,
-) -> Generator[tuple[int, tuple], None, None]:
-    """Utility function to iterate over a list in batches with an initial skip.
-
-    Args:
-        lst: The list to iterate over.
-        batch_size: The size of each batch.
-        skip_count: The number of items to skip at the start of the list.
-
-    Yields:
-        Tuples of (batch_start_idx, batch) where batch is a tuple of items
-        from the list, and batch_start_idx is the "original" index of the first
-        item in the batch.
-
-    Raises:
-        ValueError: If batch_size is less than 1 or skip_count is negative.
-
-    Note:
-        Batch_idx is the index of the batch in the original list, accounting
-        for the skipped items. For example, if skip_count is 10 and batch_size
-        is 5, the first yielded batch will have batch_start_idx=10.
-    """
-    if batch_size < 1:
-        raise ValueError("batch size must be at least one")
-    if skip_count < 0:
-        raise ValueError("skip_count must be non-negative")
-
-    it = iter(lst)
-    # Skip the initial items
-    for _ in range(skip_count):
-        next(it, None)
-    batch_start_idx = skip_count
-    while batch := tuple(islice(it, batch_size)):
-        yield batch_start_idx, batch
-        batch_start_idx += len(batch)
-
-
 def all_null_chunk_masks(
     block_ids: Sequence[Sequence[int]],
     object_groups: Sequence[ObjectGroupInfo],
     blocks_per_chunk: Sequence[int],
     num_chunks: int,
+    null_block_id: int = 0,
 ) -> list[list[bool]]:
     """Mark, per object group, the chunks whose engine block ids are all null.
 
-    A chunk is null for an object group when every block id of every kernel
-    group in that group is 0 (the vLLM null block). Align-mode Mamba/linear
+    A chunk is null for an object group when every block ID of every kernel
+    group equals the server's null marker. Align-mode Mamba/linear
     layers produce such chunks: only the block holding the last recurrent state
     is real, so every earlier chunk is null. These chunks must not be stored --
     the null block carries no valid KV, and object keys are content hashes, so
@@ -157,6 +107,8 @@ def all_null_chunk_masks(
         blocks_per_chunk: Blocks in one chunk per kernel group, indexed by
             kernel-group index.
         num_chunks: Number of chunks in the request.
+        null_block_id: Server-wide block ID denoting absent data. Defaults to
+            the historical vLLM null block zero.
 
     Returns:
         ``mask[g][i]`` is True iff chunk ``i`` is all-null for object group ``g``.
@@ -168,852 +120,15 @@ def all_null_chunk_masks(
             is_null = True
             for kg in group.kernel_group_indices:
                 bpc = blocks_per_chunk[kg]
-                if any(block_ids[kg][i * bpc : (i + 1) * bpc]):
+                if any(
+                    block != null_block_id
+                    for block in block_ids[kg][i * bpc : (i + 1) * bpc]
+                ):
                     is_null = False
                     break
             chunk_null.append(is_null)
         masks.append(chunk_null)
     return masks
-
-
-def downsample_and_stage_block_ids(
-    cache_context: BaseCacheContext,
-    block_ids: list[list[int]],
-) -> list[torch.Tensor]:
-    """Cut the block id lists to skip the unneeded blocks in a chunk and
-    stage it into GPU tensors for later use.
-
-    This mainly targets the case where a portion of the blocks are not
-    needed for every chunk, such as deepseek v4's swa cache.
-
-    Note that the we do NOT do any object-level skipping here.
-
-    Args:
-        cache_context: The cache context containing the KV cache information.
-        block_ids: The original block id lists, indexed by LMCache KV group index.
-
-    Returns:
-        The cut block id lists, indexed by LMCache KV group index.
-
-    Note:
-        This function has some coupled logic with transfer_kv_per_object_group below.
-        The caller need to make sure that the block ids seen by
-        transfer_kv_per_object_group are produced by this function.
-
-    Example:
-        If a model have 2 kernel groups, one is full attention with block size 32,
-        one is swa attention with block size 32 and sliding window size 64, and
-        LMCache has a chunk size of 128. And there are 2 chunks in total (256 tokens).
-
-        The input will be:
-        [
-          [1, 2, 3, 4, 5, 6, 7, 8],  # block ids for the full attention group
-          [11, 12, 13, 14, 15, 16, 17, 18], # block ids for the swa attention group
-        ]
-
-        The output will be
-        [
-          [1, 2, 3, 4, 5, 6, 7, 8],  # full attention group still needs all block ids
-          [13, 14, 17, 18], # swa attention group only needs the last 2 block per chunk
-        ]
-    """
-    num_kernel_groups = cache_context.kv_layer_groups_manager.num_kernel_groups
-    for kernel_group_id in range(num_kernel_groups):
-        subchunk_sw_size_tokens = (
-            cache_context.kv_layer_groups_manager.get_subchunk_sw_size_tokens(
-                kernel_group_id
-            )
-        )
-        tokens_per_chunk = min(
-            cache_context.lmcache_tokens_per_chunk, subchunk_sw_size_tokens
-        )
-        keep_blocks_per_chunk = cache_context.calculate_num_blocks(
-            tokens_per_chunk, kernel_group_id
-        )
-        total_blocks_per_chunk = cache_context.calculate_num_blocks(
-            cache_context.lmcache_tokens_per_chunk, kernel_group_id
-        )
-
-        new_block_ids = []
-        old_block_ids = block_ids[kernel_group_id]
-        assert len(old_block_ids) % total_blocks_per_chunk == 0, (
-            f"len(block_ids[{kernel_group_id}]) should be a multiple "
-            f"of total_blocks_per_chunk ({total_blocks_per_chunk}), but got "
-            f"{len(old_block_ids)}"
-        )
-
-        for i in range(0, len(old_block_ids), total_blocks_per_chunk):
-            chunk_block_ids = old_block_ids[i : i + total_blocks_per_chunk]
-            new_block_ids.extend(chunk_block_ids[-keep_blocks_per_chunk:])
-
-        block_ids[kernel_group_id] = new_block_ids
-
-    # Stage the cut block ids into GPU tensors
-    block_ids_gpu = cache_context.stage_block_ids(block_ids)
-    return block_ids_gpu
-
-
-def _recalculate_blocks_to_skip(
-    blocks_per_chunk: int,
-    blocks_per_window: int,
-    blocks_to_skip: int,
-) -> int:
-    """Re-calculate the number of blocks to skip for a batch of chunks based
-    on the blocks per chunk and blocks per sliding window WHEN the window
-    size is smaller than the lmcache chunk size.
-
-    Args:
-        blocks_per_chunk: The total number of blocks in one chunk for the
-            current group.
-        blocks_per_window: The number of blocks in the sliding window
-            for the current group. Should be less than or equal to
-            blocks_per_chunk.
-        blocks_to_skip: The number of blocks to skip.
-
-    Returns:
-        The re-calculated number of blocks to skip for the current batch of
-        chunks.
-    """
-    if blocks_per_chunk == blocks_per_window:
-        return blocks_to_skip
-
-    full_windows_to_skip = blocks_to_skip // blocks_per_chunk
-    tail_blocks = blocks_to_skip % blocks_per_chunk
-    tail_blocks_to_skip = tail_blocks - (blocks_per_chunk - blocks_per_window)
-    return full_windows_to_skip * blocks_per_window + max(0, tail_blocks_to_skip)
-
-
-def _run_object_group_transfer_plan(
-    cache_context: BaseCacheContext,
-    block_ids_gpu: list[torch.Tensor],
-    memory_objs: Sequence[MemoryObj | None],
-    object_group_id: int,
-    batch_size: int,
-    skip_first_n_tokens: int,
-    direction: "lmcache_native.TransferDirection",
-) -> None:
-    """Plan and execute one object group's transfer in a single native call.
-
-    This is the fast path of :func:`transfer_kv_per_object_group`: it runs the
-    same batched-iteration / skip logic, but instead of issuing each staging
-    copy and kernel launch immediately (each a GIL release/re-acquire), it
-    resolves every argument to plain pointers/scalars (the "planner", GIL held
-    throughout) and hands the whole plan to ``execute_object_group_transfer``,
-    which issues all of it on the stream within a single GIL release.
-
-    Requires every object to be non-GDS (staged through the lazy-allocator
-    path); the caller skips groups that contain any GDS-backed object.
-
-    Args:
-        cache_context: The GPU cache context containing the KV cache information.
-        block_ids_gpu: GPU block IDs, indexed by LMCache KV group index.
-        memory_objs: The MemoryObj instances to copy. None entries are only
-            valid for D2H (the batch is skipped); H2D raises.
-        object_group_id: Index of the object group being copied.
-        batch_size: Number of memory objects per batched copy.
-        skip_first_n_tokens: Tokens to skip writing at the start of the range.
-        direction: H2D (retrieve) or D2H (store).
-
-    Raises:
-        ValueError: If a None entry is found in memory_objs when direction is
-            H2D, or if an object's size does not match its GPU staging buffer.
-    """
-    lmcache_chunk_size = cache_context.lmcache_tokens_per_chunk
-    kv_groups_manager = cache_context.kv_layer_groups_manager
-    object_group = kv_groups_manager.object_groups[object_group_id]
-    kernel_group_ids = object_group.kernel_group_indices
-    is_h2d = direction == lmcache_native.TransferDirection.H2D
-    max_batch_size = cache_context.max_batch_size
-
-    # --- Per-kernel-group invariants, resolved once (vs. every batch before) ---
-    kernel_group_specs: list[Any] = []
-    spec_index_by_kg: dict[int, int] = {}
-    blocks_per_chunk_by_kg: dict[int, int] = {}
-    blocks_per_window_by_kg: dict[int, int] = {}
-    for kernel_group_id in kernel_group_ids:
-        blocks_per_chunk = cache_context.calculate_num_blocks(
-            lmcache_chunk_size, kernel_group_id
-        )
-        tokens_per_window = min(
-            lmcache_chunk_size,
-            kv_groups_manager.get_subchunk_sw_size_tokens(kernel_group_id),
-        )
-        blocks_per_window = cache_context.calculate_num_blocks(
-            tokens_per_window, kernel_group_id
-        )
-        blocks_per_chunk_by_kg[kernel_group_id] = blocks_per_chunk
-        blocks_per_window_by_kg[kernel_group_id] = blocks_per_window
-
-        paged_ptrs = cache_context.get_kernel_group_kv_pointers(kernel_group_id)
-        block_ids_tensor = block_ids_gpu[kernel_group_id]
-        temp_buffers = [
-            cache_context.get_temp_kernel_group_buffer(slot, kernel_group_id)
-            for slot in range(max_batch_size)
-        ]
-
-        spec_index_by_kg[kernel_group_id] = len(kernel_group_specs)
-        kernel_group_specs.append(
-            device_ops.KernelGroupSpec(
-                paged_ptrs.data_ptr(),
-                [buffer.data_ptr() for buffer in temp_buffers],
-                cache_context.get_shape_desc(kernel_group_id),
-                cache_context.get_slots_per_chunk_in_sw(kernel_group_id),
-                cache_context.get_engine_kv_format(kernel_group_id),
-                block_ids_tensor.data_ptr(),
-                block_ids_tensor.numel(),
-            )
-        )
-
-    # Temp object-group staging buffers (reused per batch slot, like above).
-    object_group_buffers = [
-        cache_context.get_temp_object_group_buffer(slot, object_group_id)
-        for slot in range(max_batch_size)
-    ]
-
-    attn_desc = kv_groups_manager.get_attn_desc()
-    num_objects_to_skip = 0
-    if not attn_desc.is_full_attention(object_group_id) and is_h2d:
-        sw_size_chunks = attn_desc.num_chunks_in_sw[object_group_id]
-        num_objects_to_skip = max(0, len(memory_objs) - sw_size_chunks)
-        logger.debug(
-            "Detected sliding window for object group %d: "
-            "skipping the first %d objects in the batch",
-            object_group_id,
-            num_objects_to_skip,
-        )
-
-    # --- Walk the batches in order, emitting staging + launch work per step ---
-    batch_steps: list[Any] = []
-    for start_object_idx, memory_object_batch in batched_iteration_with_skip(
-        memory_objs, batch_size, skip_count=num_objects_to_skip
-    ):
-        if any(mo is None for mo in memory_object_batch):
-            if is_h2d:
-                raise ValueError(
-                    "MemoryObj is None for some objects in the batch, cannot "
-                    "perform H2D copy. memory_object_batch: "
-                    f"{memory_object_batch}"
-                )
-            else:
-                continue
-
-        batch_len = len(memory_object_batch)
-        batch_start_token = start_object_idx * lmcache_chunk_size
-        batch_end_token = batch_start_token + batch_len * lmcache_chunk_size
-
-        effective_start = max(batch_start_token, skip_first_n_tokens)
-        if effective_start >= batch_end_token:
-            continue
-
-        skip_tokens_in_chunk = effective_start - batch_start_token
-
-        staging = build_staging_copies(
-            memory_object_batch,
-            object_group_buffers[:batch_len],
-            is_h2d,
-        )
-
-        launches: list[Any] = []
-        for kernel_group_id in kernel_group_ids:
-            blocks_per_chunk = blocks_per_chunk_by_kg[kernel_group_id]
-            blocks_per_window = blocks_per_window_by_kg[kernel_group_id]
-
-            start_block_pos = start_object_idx * blocks_per_window
-            end_block_pos = (start_object_idx + batch_len) * blocks_per_window
-
-            orig_skip_blocks = cache_context.calculate_num_blocks(
-                skip_tokens_in_chunk, kernel_group_id
-            )
-            recalculated_skip_blocks = _recalculate_blocks_to_skip(
-                blocks_per_chunk,
-                blocks_per_window,
-                orig_skip_blocks,
-            )
-
-            launches.append(
-                device_ops.LaunchVar(
-                    spec_index_by_kg[kernel_group_id],
-                    start_block_pos,
-                    end_block_pos - start_block_pos,
-                    batch_len,
-                    recalculated_skip_blocks,
-                )
-            )
-
-        batch_steps.append(device_ops.BatchStep(staging, launches))
-
-    if not batch_steps:
-        return
-
-    execute_object_group_transfer = device_ops.execute_object_group_transfer
-    execute_object_group_transfer(
-        direction,
-        cache_context.device,
-        LazyMemoryAllocator.PIN_CHUNK_SIZE,
-        kernel_group_specs,
-        batch_steps,
-    )
-
-
-def _enqueue_object_group_layer_slice(
-    cache_context: BaseCacheContext,
-    block_ids_gpu: list[torch.Tensor],
-    memory_objs: Sequence[MemoryObj | None],
-    object_group_id: int,
-    batch_size: int,
-    skip_first_n_tokens: int,
-    direction: "lmcache_native.TransferDirection",
-    layer_start: int,
-    layer_count: int,
-) -> None:
-    """Enqueue one layer slice of one object group.
-
-    Layer-major sibling of :func:`_run_object_group_transfer_plan`. That function
-    stages whole chunks and scatters every layer in one burst, so the earliest
-    layer is only usable once the last one has landed. This one walks the layer
-    axis in slices of ``layers_per_stage``, issuing one native plan per slice, so
-    a caller can record a completion event after each and let the consumer start
-    on layer 0 while later slices are still moving.
-
-    The host object layout is untouched: a layer slice is ``kv_size`` contiguous
-    byte ranges inside the chunk (see :func:`build_layer_staging_copies`), and
-    the scatter kernel is told ``layer_offset``/``staged_layers`` so it addresses
-    the engine side absolutely and the staged side relatively.
-
-    Deliberately narrower than the chunk-major path, which stays the default:
-
-    * one kernel group per object group (the full-attention case). Hybrid models
-      put several kernel groups in one object, whose layer ranges would have to
-      be sliced independently.
-    * no GDS-backed objects, same as the chunk-major fast path.
-
-    Callers must check those before dispatching here.
-
-    Args:
-        cache_context: The GPU cache context containing the KV cache information.
-        block_ids_gpu: GPU block IDs, indexed by LMCache KV group index.
-        memory_objs: The MemoryObj instances to copy. None entries are only
-            valid for D2H (the batch is skipped); H2D raises.
-        object_group_id: Index of the object group being copied.
-        batch_size: Number of memory objects per batched copy.
-        skip_first_n_tokens: Tokens to skip writing at the start of the range.
-        direction: H2D (retrieve) or D2H (store).
-        layers_per_stage: Layers per slice. 1 is one slice per layer; larger
-            values trade pipeline granularity for fewer plans and events.
-        on_layer_batch: Called with ``(layer_start, layer_count)`` after each
-            slice's plan has been enqueued, in layer order. This is where a
-            caller records its per-slice event.
-
-    Raises:
-        ValueError: If a None entry is found in memory_objs when direction is
-            H2D, or if the object group does not hold exactly one kernel group.
-    """
-
-    lmcache_chunk_size = cache_context.lmcache_tokens_per_chunk
-    kv_groups_manager = cache_context.kv_layer_groups_manager
-    object_group = kv_groups_manager.object_groups[object_group_id]
-    kernel_group_ids = object_group.kernel_group_indices
-    if len(kernel_group_ids) != 1:
-        raise ValueError(
-            "layer-major transfer needs exactly one kernel group per object "
-            f"group, got {len(kernel_group_ids)} for object group "
-            f"{object_group_id}"
-        )
-    kernel_group_id = kernel_group_ids[0]
-    is_h2d = direction == lmcache_native.TransferDirection.H2D
-    max_batch_size = cache_context.max_batch_size
-
-    shape_desc = cache_context.get_shape_desc(kernel_group_id)
-    kv_size = shape_desc.kv_size
-    num_layers = shape_desc.nl
-
-    blocks_per_chunk = cache_context.calculate_num_blocks(
-        lmcache_chunk_size, kernel_group_id
-    )
-    tokens_per_window = min(
-        lmcache_chunk_size,
-        kv_groups_manager.get_subchunk_sw_size_tokens(kernel_group_id),
-    )
-    blocks_per_window = cache_context.calculate_num_blocks(
-        tokens_per_window, kernel_group_id
-    )
-
-    paged_ptrs = cache_context.get_kernel_group_kv_pointers(kernel_group_id)
-    block_ids_tensor = block_ids_gpu[kernel_group_id]
-    temp_buffers = [
-        cache_context.get_temp_kernel_group_buffer(slot, kernel_group_id)
-        for slot in range(max_batch_size)
-    ]
-    kernel_group_specs = [
-        device_ops.KernelGroupSpec(
-            paged_ptrs.data_ptr(),
-            [buffer.data_ptr() for buffer in temp_buffers],
-            shape_desc,
-            cache_context.get_slots_per_chunk_in_sw(kernel_group_id),
-            cache_context.get_engine_kv_format(kernel_group_id),
-            block_ids_tensor.data_ptr(),
-            block_ids_tensor.numel(),
-        )
-    ]
-
-    object_group_buffers = [
-        cache_context.get_temp_object_group_buffer(slot, object_group_id)
-        for slot in range(max_batch_size)
-    ]
-
-    attn_desc = kv_groups_manager.get_attn_desc()
-    num_objects_to_skip = 0
-    if not attn_desc.is_full_attention(object_group_id) and is_h2d:
-        sw_size_chunks = attn_desc.num_chunks_in_sw[object_group_id]
-        num_objects_to_skip = max(0, len(memory_objs) - sw_size_chunks)
-
-    execute_object_group_transfer = device_ops.execute_object_group_transfer
-
-    if layer_start < 0 or layer_count < 1 or layer_start + layer_count > num_layers:
-        raise ValueError(
-            f"layer slice [{layer_start}, {layer_start + layer_count}) is outside "
-            f"the object group's {num_layers} layers"
-        )
-
-    batch_steps: list[Any] = []
-    for start_object_idx, memory_object_batch in batched_iteration_with_skip(
-        memory_objs, batch_size, skip_count=num_objects_to_skip
-    ):
-        if any(mo is None for mo in memory_object_batch):
-            if is_h2d:
-                raise ValueError(
-                    "MemoryObj is None for some objects in the batch, "
-                    "cannot perform H2D copy. memory_object_batch: "
-                    f"{memory_object_batch}"
-                )
-            else:
-                continue
-
-        batch_len = len(memory_object_batch)
-        batch_start_token = start_object_idx * lmcache_chunk_size
-        batch_end_token = batch_start_token + batch_len * lmcache_chunk_size
-
-        effective_start = max(batch_start_token, skip_first_n_tokens)
-        if effective_start >= batch_end_token:
-            continue
-
-        skip_tokens_in_chunk = effective_start - batch_start_token
-
-        # The chunk-major buffer is sized for every layer, so a slice fits
-        # in its prefix. Sizing it down to the slice is a separate change.
-        slice_nbytes = memory_object_batch[0].get_size() // num_layers * layer_count
-        sliced_buffers = [
-            buffer[:slice_nbytes] for buffer in object_group_buffers[:batch_len]
-        ]
-        staging = build_layer_staging_copies(
-            memory_object_batch,
-            sliced_buffers,
-            is_h2d,
-            kv_size=kv_size,
-            num_layers=num_layers,
-            layer_start=layer_start,
-            layer_count=layer_count,
-        )
-
-        start_block_pos = start_object_idx * blocks_per_window
-        end_block_pos = (start_object_idx + batch_len) * blocks_per_window
-
-        orig_skip_blocks = cache_context.calculate_num_blocks(
-            skip_tokens_in_chunk, kernel_group_id
-        )
-        recalculated_skip_blocks = _recalculate_blocks_to_skip(
-            blocks_per_chunk,
-            blocks_per_window,
-            orig_skip_blocks,
-        )
-
-        launches = [
-            device_ops.LaunchVar(
-                0,
-                start_block_pos,
-                end_block_pos - start_block_pos,
-                batch_len,
-                recalculated_skip_blocks,
-                layer_start,
-                layer_count,
-            )
-        ]
-        batch_steps.append(device_ops.BatchStep(staging, launches))
-
-    if not batch_steps:
-        return
-
-    execute_object_group_transfer(
-        direction,
-        cache_context.device,
-        LazyMemoryAllocator.PIN_CHUNK_SIZE,
-        kernel_group_specs,
-        batch_steps,
-    )
-
-
-def _object_group_num_layers(
-    cache_context: BaseCacheContext, object_group_id: int
-) -> int:
-    """Layers the object group's single kernel group covers.
-
-    Args:
-        cache_context: The GPU cache context.
-        object_group_id: Index of the object group.
-
-    Returns:
-        The layer count.
-    """
-    kv_groups_manager = cache_context.kv_layer_groups_manager
-    object_group = kv_groups_manager.object_groups[object_group_id]
-    kernel_group_id = list(object_group.kernel_group_indices)[0]
-    return cache_context.get_shape_desc(kernel_group_id).nl
-
-
-def _slice_publisher_for(
-    publishers: "Sequence[Callable[[int, int], None]]",
-    request_indices: "Sequence[int]",
-) -> "Callable[[int, int, int], None]":
-    """Route a publish from a position in the batch to that request's board.
-
-    Args:
-        publishers: One publisher per request in the batch, indexed by the
-            request's position in the submitted batch.
-        request_indices: For each position in the transfer's ``per_request``,
-            that request's position in the submitted batch. The two differ when
-            a request's objects were not all found and it was dropped.
-
-    Returns:
-        A callback taking ``(position in per_request, layer_start,
-        layer_count)``.
-    """
-
-    def publish(position: int, layer_start: int, layer_count: int) -> None:
-        publishers[request_indices[position]](layer_start, layer_count)
-
-    return publish
-
-
-def transfer_kv_batch_layer_major(
-    cache_context: BaseCacheContext,
-    per_request: "Sequence[tuple[list[list[int]], Sequence[MemoryObj | None]]]",
-    object_group_id: int,
-    batch_size: int,
-    skip_first_n_tokens: int,
-    direction: "lmcache_native.TransferDirection",
-    layers_per_stage: int,
-    on_request_slice: "Callable[[int, int, int], None] | None" = None,
-) -> None:
-    """Move a whole batch of retrieves, a layer slice at a time.
-
-    The batch shares one FIFO stream with every other retrieve in flight, so
-    the order is request outer, slice inner: every layer of the first request,
-    then every layer of the next. A request is handed back to the engine once
-    its first slice has landed, and with this order its remaining slices are
-    the very next thing on the stream, so it computes while the requests
-    behind it are still copying. Interleaving the requests slice by slice
-    would instead hold every request's last slice until the whole batch had
-    moved, and every request would start computing at the same, late, time.
-
-    Each (request, slice) pair is its own native call. Within one call the plan
-    enqueues every staging copy before any kernel, so two requests sharing the
-    staging slots inside a single call would overwrite each other; across calls
-    stream order keeps the reuse safe.
-
-    Because each pair is its own call, arrival is published per pair: a request
-    hears about each of its slices as it is enqueued, and the worker decides
-    from the first one -- together with that slice's event -- when the request
-    can leave the wait for remote KV and rejoin the run queue.
-
-    Args:
-        cache_context: The GPU cache context.
-        per_request: One ``(block_ids, memory_objs)`` pair per request, in the
-            order the batch was submitted. The block ids are the host-side lists
-            indexed by LMCache KV group; they are cut and staged to the GPU
-            here, once per request, because the context stages them into one
-            shared buffer and returns views into it -- nothing else touches
-            that buffer between one request's slices.
-        object_group_id: Index of the object group to move.
-        batch_size: Chunks per staging batch.
-        skip_first_n_tokens: Initial tokens the transfer must not overwrite.
-        direction: H2D or D2H.
-        layers_per_stage: Layers per slice. Must be >= 1.
-        on_request_slice: Called with ``(position in per_request,
-            layer_start, layer_count)`` right after that one request's slice
-            has been enqueued.
-
-    Raises:
-        ValueError: If ``layers_per_stage`` is below 1.
-    """
-    if layers_per_stage < 1:
-        raise ValueError(f"layers_per_stage must be >= 1, got {layers_per_stage}")
-    if not per_request:
-        return
-    num_layers = _object_group_num_layers(cache_context, object_group_id)
-    for position, (block_ids, memory_objs) in enumerate(per_request):
-        # A fresh copy per request: the cut is done in place.
-        block_ids_gpu = downsample_and_stage_block_ids(
-            cache_context, [list(group) for group in block_ids]
-        )
-        for layer_start in range(0, num_layers, layers_per_stage):
-            layer_count = min(layers_per_stage, num_layers - layer_start)
-            _enqueue_object_group_layer_slice(
-                cache_context,
-                block_ids_gpu,
-                memory_objs,
-                object_group_id,
-                batch_size,
-                skip_first_n_tokens,
-                direction,
-                layer_start,
-                layer_count,
-            )
-            if on_request_slice is not None:
-                on_request_slice(position, layer_start, layer_count)
-
-
-_layer_major_fallback_logged = False
-
-
-def _layer_major_unusable_reason(
-    cache_context: BaseCacheContext,
-    memory_objs: Sequence[MemoryObj | None],
-    object_group_id: int,
-    direction: "lmcache_native.TransferDirection",
-) -> str | None:
-    """Return why layer-major staging cannot serve this transfer, or None if it can.
-
-    Args:
-        cache_context: The GPU cache context containing the KV cache information.
-        memory_objs: The MemoryObj instances about to be copied.
-        object_group_id: Index of the object group being copied.
-        direction: H2D (retrieve) or D2H (store).
-
-    Returns:
-        A short reason for the caller to log, or None when layer-major applies.
-    """
-    if direction != lmcache_native.TransferDirection.H2D:
-        return "stores stay chunk-major"
-    if not _HAS_NATIVE_OBJECT_GROUP_TRANSFER:
-        return "the native object-group transfer extension is unavailable"
-    if any(isinstance(mo, GDSMemoryObject) for mo in memory_objs):
-        return "the batch contains GDS-backed objects"
-    object_group = cache_context.kv_layer_groups_manager.object_groups[object_group_id]
-    if len(object_group.kernel_group_indices) != 1:
-        return (
-            "the object group holds "
-            f"{len(object_group.kernel_group_indices)} kernel groups "
-            "(hybrid model)"
-        )
-    return None
-
-
-def transfer_kv_per_object_group(
-    cache_context: BaseCacheContext,
-    block_ids_gpu: list[torch.Tensor],
-    memory_objs: Sequence[MemoryObj | None],
-    object_group_id: int,
-    batch_size: int,
-    skip_first_n_tokens: int,
-    direction: "lmcache_native.TransferDirection",
-    layers_per_stage: int = 0,
-    on_layer_batch: "Callable[[int, int], None] | None" = None,
-) -> None:
-    """Helper function to transfer memory objects of a single object group
-    to/from GPU, with batching support.
-
-    Args:
-        cache_context: The GPU cache context containing the KV cache information.
-        block_ids_gpu: GPU block IDs to retrieve into, indexed by LMCache KV group
-            index. It should satisfy `len(block_ids_gpu[i]) == len(memory_objs) *
-            blocks_per_chunk[i]` for each group `i`.
-            Note that the block IDs list are already on GPU.
-        memory_objs: The list of MemoryObj instances to copy from. It could be
-            None when allocation or retrieval fails. For store (D2H), it should
-            ignore the None entry and continue copying the rest. For retrieve
-            (H2D), it should raise the error and stop copying.
-        object_group_id: Index of the object group being copied.
-        batch_size: The number of memory objects to perform batched copy
-        skip_first_n_tokens: Number of tokens to skip writing at the start of
-            the retrieve range. This avoids overwriting APC-shared GPU blocks that
-            may be read concurrently by other requests.
-        direction: The transfer direction, H2D (retrieve) or D2H (store).
-        layers_per_stage: Stage the layer axis in slices of this many layers
-            instead of copying whole chunks. 0 (default) keeps the chunk-major
-            path. Only retrieves can use it, and only when the object group
-            holds a single kernel group and no GDS-backed objects; anything else
-            falls back to chunk-major and logs the reason once.
-        on_layer_batch: Called with ``(layer_start, layer_count)`` after each
-            slice is enqueued, when layer-major staging is in effect.
-
-    Raises:
-        ValueError: If it founds None entry in memory_objs when direction is H2D.
-    Note:
-        This function expects the caller to stage the block ids (list[list[int]])
-        into GPU tensors and pass them in as `block_ids_gpu`.
-    """
-    if layers_per_stage > 0:
-        reason = _layer_major_unusable_reason(
-            cache_context, memory_objs, object_group_id, direction
-        )
-        if reason is None:
-            num_layers = _object_group_num_layers(cache_context, object_group_id)
-            for layer_start in range(0, num_layers, layers_per_stage):
-                layer_count = min(layers_per_stage, num_layers - layer_start)
-                _enqueue_object_group_layer_slice(
-                    cache_context,
-                    block_ids_gpu,
-                    memory_objs,
-                    object_group_id,
-                    batch_size,
-                    skip_first_n_tokens,
-                    direction,
-                    layer_start,
-                    layer_count,
-                )
-                if on_layer_batch is not None:
-                    on_layer_batch(layer_start, layer_count)
-            return
-        global _layer_major_fallback_logged
-        if not _layer_major_fallback_logged:
-            _layer_major_fallback_logged = True
-            logger.info(
-                "Layer-major retrieve is configured (%d layers per stage) but "
-                "this transfer falls back to chunk-major: %s. Logged once.",
-                layers_per_stage,
-                reason,
-            )
-
-    if _HAS_NATIVE_OBJECT_GROUP_TRANSFER and not any(
-        isinstance(mo, GDSMemoryObject) for mo in memory_objs
-    ):
-        _run_object_group_transfer_plan(
-            cache_context,
-            block_ids_gpu,
-            memory_objs,
-            object_group_id,
-            batch_size,
-            skip_first_n_tokens,
-            direction,
-        )
-        return
-
-    lmcache_chunk_size = cache_context.lmcache_tokens_per_chunk
-    kv_groups_manager = cache_context.kv_layer_groups_manager
-    object_group = kv_groups_manager.object_groups[object_group_id]
-    kernel_group_ids = object_group.kernel_group_indices
-    is_h2d = direction == lmcache_native.TransferDirection.H2D
-
-    attn_desc = kv_groups_manager.get_attn_desc()
-    num_objects_to_skip = 0
-    if not attn_desc.is_full_attention(object_group_id) and is_h2d:
-        sw_size_chunks = attn_desc.num_chunks_in_sw[object_group_id]
-        num_objects_to_skip = max(0, len(memory_objs) - sw_size_chunks)
-        logger.debug(
-            "Detected sliding window for object group %d: "
-            "skipping the first %d objects in the batch",
-            object_group_id,
-            num_objects_to_skip,
-        )
-
-    for start_object_idx, memory_object_batch in batched_iteration_with_skip(
-        memory_objs, batch_size, skip_count=num_objects_to_skip
-    ):
-        if any(mo is None for mo in memory_object_batch):
-            if is_h2d:
-                raise ValueError(
-                    "MemoryObj is None for some objects in the batch, cannot "
-                    "perform H2D copy. memory_object_batch: "
-                    f"{memory_object_batch}"
-                )
-            else:
-                continue
-
-        batch_len = len(memory_object_batch)
-        batch_start_token = start_object_idx * lmcache_chunk_size
-        batch_end_token = batch_start_token + batch_len * lmcache_chunk_size
-
-        effective_start = max(batch_start_token, skip_first_n_tokens)
-        if effective_start >= batch_end_token:
-            continue
-
-        skip_tokens_in_chunk = effective_start - batch_start_token
-
-        # For H2D, copy from CPU to GPU tmp buffers before the kernel launch
-        if is_h2d:
-            for chunk_idx, memory_obj in enumerate(memory_object_batch):
-                lmcache_memcpy_async_h2d(
-                    memory_obj,
-                    cache_context.get_temp_object_group_buffer(
-                        chunk_idx, object_group_id
-                    ),
-                )
-
-        # Do paged KV copy
-        for kernel_group_id in kernel_group_ids:
-            blocks_per_chunk = cache_context.calculate_num_blocks(
-                lmcache_chunk_size, kernel_group_id
-            )
-            tokens_per_window = min(
-                lmcache_chunk_size,
-                kv_groups_manager.get_subchunk_sw_size_tokens(kernel_group_id),
-            )
-            blocks_per_window = cache_context.calculate_num_blocks(
-                tokens_per_window, kernel_group_id
-            )
-
-            # Get the block ids for this chunk
-            start_block_pos = start_object_idx * blocks_per_window
-            end_block_pos = (start_object_idx + batch_len) * blocks_per_window
-
-            block_ids_curr_batch = block_ids_gpu[kernel_group_id][
-                start_block_pos:end_block_pos
-            ]
-
-            # Re-calculate the skip blocks for this kernel group
-            orig_skip_blocks = cache_context.calculate_num_blocks(
-                skip_tokens_in_chunk, kernel_group_id
-            )
-            recalculated_skip_blocks = _recalculate_blocks_to_skip(
-                blocks_per_chunk,
-                blocks_per_window,
-                orig_skip_blocks,
-            )
-
-            # Launch kernel
-            group_kv_pointers = cache_context.get_kernel_group_kv_pointers(
-                kernel_group_id
-            )
-            group_lmcache_chunk_size = cache_context.get_slots_per_chunk_in_sw(
-                kernel_group_id
-            )
-            tmp_gpu_buffers_batched = [
-                cache_context.get_temp_kernel_group_buffer(
-                    i, kernel_group_id
-                ).data_ptr()
-                for i in range(batch_len)
-            ]
-            device_ops.multi_layer_block_kv_transfer(
-                group_kv_pointers,
-                tmp_gpu_buffers_batched,
-                block_ids_curr_batch,
-                cache_context.device,
-                direction,
-                cache_context.get_shape_desc(kernel_group_id),
-                group_lmcache_chunk_size,
-                cache_context.get_engine_kv_format(kernel_group_id),
-                recalculated_skip_blocks,
-            )
-
-        # For D2H, copy from GPU tmp buffers to CPU after the kernel launch
-        if not is_h2d:
-            for chunk_idx, memory_obj in enumerate(memory_object_batch):
-                lmcache_memcpy_async_d2h(
-                    cache_context.get_temp_object_group_buffer(
-                        chunk_idx, object_group_id
-                    ),
-                    memory_obj,
-                )
 
 
 @dataclass
@@ -1087,6 +202,12 @@ class LMCacheDrivenTransferModule(InstanceLivenessTarget):
         )
         self._device_host_func_dispatcher.start()
 
+    def register_host_func(self, kind: str, handler: Any, payload_type: Any) -> None:
+        """Register *handler* for *kind* on the per-process device host-func
+        dispatcher (stream-ordered callbacks without a driver-thread GIL
+        acquire); pair with ``submit_callback_to_stream``."""
+        self._device_host_func_dispatcher.register(kind, handler, payload_type)
+
     @property
     def context(self) -> MPCacheServerContext:
         """Return the shared engine context. Exposed for testing only."""
@@ -1111,6 +232,51 @@ class LMCacheDrivenTransferModule(InstanceLivenessTarget):
             if entry is not None:
                 entry.last_seen = now
             return entry
+
+    def _release_failed_retrieve_locks(
+        self,
+        key: IPCCacheServerKey,
+        instance_id: int,
+    ) -> None:
+        """Release only one failed instance's unconsumed lookup locks.
+
+        The lookup session is the ownership record.  If it is absent or does
+        not match the RETRIEVE range, no release is attempted: L1 locks are
+        anonymous refcounts, so guessing could consume a concurrent reader's
+        lock.  ``claim_failed_retrieve_release`` also makes duplicate failure
+        responses idempotent.
+        """
+        session = self._ctx.session_manager.get(key.request_id)
+        if session is None:
+            logger.warning(
+                "Cannot release RETRIEVE locks for unregistered instance %d: "
+                "request %s has no lookup session",
+                instance_id,
+                key.request_id,
+            )
+            return
+
+        lock_state = session.prepare_failed_retrieve_release(key)
+        if lock_state is None:
+            return
+        hit_chunks, locked_gids, group_windows, lookup_generation = lock_state
+        obj_keys = resolve_prefetched_obj_keys(
+            self._ctx,
+            key,
+            hit_chunks,
+            locked_gids,
+            group_windows=group_windows,
+        )
+        if not session.claim_failed_retrieve_release(
+            instance_id, key, lookup_generation
+        ):
+            return
+        if obj_keys:
+            # One failed RETRIEVE owns one read lock per key.  In
+            # particular, do not release the scheduler's whole MLA
+            # reservation here: the remaining TP workers and concurrent
+            # requests still own their independent read locks.
+            self._ctx.storage_manager.finish_read_prefetched(obj_keys, read_locks=1)
 
     def context_entries_snapshot(self) -> dict[int, ContextEntry]:
         """Return a shallow copy of the registry for iteration or status.
@@ -1213,41 +379,6 @@ class LMCacheDrivenTransferModule(InstanceLivenessTarget):
             # Backends without IPC collection omit this optional operation.
             ipc_collect()
 
-    def get_handlers(self) -> list[HandlerSpec]:
-        """Return handler specs for all request types this module serves.
-
-        Returns:
-            A list of HandlerSpec entries mapping request types to
-            their handler callables and thread pool assignments.
-        """
-        return [
-            HandlerSpec(
-                RequestType.REGISTER_KV_CACHE,
-                self.register_kv_cache,
-                ThreadPoolType.SYNC,
-            ),
-            HandlerSpec(
-                RequestType.UNREGISTER_KV_CACHE,
-                self.unregister_kv_cache,
-                ThreadPoolType.SYNC,
-            ),
-            HandlerSpec(
-                RequestType.STORE,
-                self.store,
-                ThreadPoolType.AFFINITY,
-            ),
-            HandlerSpec(
-                RequestType.RETRIEVE,
-                self.retrieve,
-                ThreadPoolType.AFFINITY,
-            ),
-            HandlerSpec(
-                RequestType.RETRIEVE_BATCH,
-                self.retrieve_batch,
-                ThreadPoolType.AFFINITY,
-            ),
-        ]
-
     def report_status(self) -> dict:
         """Return GPU transfer module status information.
 
@@ -1287,6 +418,7 @@ class LMCacheDrivenTransferModule(InstanceLivenessTarget):
                 board.close()
             self._arrival_boards.clear()
 
+    @request_handler()
     def register_kv_cache(
         self,
         instance_id: int,
@@ -1377,6 +509,7 @@ class LMCacheDrivenTransferModule(InstanceLivenessTarget):
             cache_context.num_layers,
         )
 
+    @request_handler()
     def unregister_kv_cache(self, instance_id: int) -> None:
         """Unregister the KV cache tensors for a given GPU instance ID.
 
@@ -1400,6 +533,10 @@ class LMCacheDrivenTransferModule(InstanceLivenessTarget):
         self._release_entries(popped)
         logger.info("Unregistered KV cache for GPU ID %d", instance_id)
 
+    @request_handler(
+        HandlerType.BLOCKING,
+        requires_client_affinity=True,
+    )
     @_lmcache_nvtx_annotate
     def store(
         self,
@@ -1423,10 +560,9 @@ class LMCacheDrivenTransferModule(InstanceLivenessTarget):
             that signals the completion of the store operation, and the second
             element indicates whether the store operation completed without a
             fatal error (not whether every requested chunk was stored; see
-            Notes).
+            Notes). The event handle is empty when no device work was submitted.
 
         Raises:
-            ValueError: If no GPU context is registered for the given instance ID.
             RuntimeError: If the backend does not support IPC event handles.
 
         Notes:
@@ -1441,7 +577,17 @@ class LMCacheDrivenTransferModule(InstanceLivenessTarget):
 
         entry = self.get_and_touch_context_entry(instance_id)
         if entry is None:
-            raise ValueError(f"No GPU context registered for instance ID {instance_id}")
+            # The worker can reconnect to a replacement server before its next
+            # registration probe. No device work was submitted in that window,
+            # so return an empty completion-event handle and a terminal False
+            # response instead of leaving the MQ future unanswered. Echoing the
+            # producer handle would make the originating process import its own
+            # IPC event, which is invalid on HIP.
+            logger.warning(
+                "Rejecting STORE for unregistered GPU instance ID %d",
+                instance_id,
+            )
+            return b"", False
         cache_context = entry.cache_context
         model_name = entry.model_name
         event_backend = entry.event_backend
@@ -1498,11 +644,13 @@ class LMCacheDrivenTransferModule(InstanceLivenessTarget):
             # Mamba chunks holding no real state) carry no valid KV and must not
             # be committed. Computed on the raw block ids before downsampling
             # mutates them.
+            null_block_id = self._ctx.null_block_id
             skipped_chunks = all_null_chunk_masks(
                 gpu_block_ids,
                 cache_context.kv_layer_groups_manager.object_groups,
                 blocks_per_chunk,
                 num_chunks,
+                null_block_id,
             )
 
             block_ids_per_group_gpu = downsample_and_stage_block_ids(
@@ -1534,6 +682,7 @@ class LMCacheDrivenTransferModule(InstanceLivenessTarget):
             ):
                 self._publish_token_bindings(key, obj_keys_per_obj_group[0])
 
+            transfer_key = next_transfer_key(key.request_id)
             self._ctx.event_bus.publish_on_stream(
                 cache_context.cupy_stream,
                 Event(
@@ -1543,6 +692,7 @@ class LMCacheDrivenTransferModule(InstanceLivenessTarget):
                         "device": str(cache_context.device),
                         "engine_id": instance_id,
                         "model_name": model_name,
+                        "transfer_key": transfer_key,
                     },
                 ),
             )
@@ -1564,7 +714,7 @@ class LMCacheDrivenTransferModule(InstanceLivenessTarget):
                         object_group_id=obj_group_id,
                     )
                     reserved_dict = self._ctx.storage_manager.reserve_write(
-                        keys_to_reserve, layout_desc, "new"
+                        keys_to_reserve, layout_desc
                     )
                     all_dict.update(reserved_dict)
                     if reserved_dict:
@@ -1588,6 +738,8 @@ class LMCacheDrivenTransferModule(InstanceLivenessTarget):
                         batch_size=1,
                         skip_first_n_tokens=0,
                         direction=lmcache_native.TransferDirection.D2H,
+                        transfer_key=transfer_key,
+                        block_ids_host=gpu_block_ids,
                     )
 
                 store_succeeded = True
@@ -1619,6 +771,7 @@ class LMCacheDrivenTransferModule(InstanceLivenessTarget):
                             "model_name": model_name,
                             "total_bytes": total_bytes,
                             "num_tokens": num_tokens,
+                            "transfer_key": transfer_key,
                         },
                     ),
                 )
@@ -1635,7 +788,6 @@ class LMCacheDrivenTransferModule(InstanceLivenessTarget):
             store_succeeded,
         )
 
-    @_lmcache_nvtx_annotate
     def _attach_arrival_board(self, name: str, num_slots: int) -> LayerArrivalBoard:
         """Return this process's mapping of a worker's arrival board.
 
@@ -1775,6 +927,11 @@ class LMCacheDrivenTransferModule(InstanceLivenessTarget):
             publishers.append(publisher)
         return publishers
 
+    @request_handler(
+        HandlerType.BLOCKING,
+        requires_client_affinity=True,
+    )
+    @_lmcache_nvtx_annotate
     def retrieve_batch(
         self,
         keys: list[IPCCacheServerKey],
@@ -1820,54 +977,109 @@ class LMCacheDrivenTransferModule(InstanceLivenessTarget):
                 chunk-major path.
 
         Returns:
-            ``(completion event handle, one hit flag per request)``.
+            ``(completion event handle, one hit flag per request)``. The handle
+            is empty when no device work was submitted.
 
         Raises:
-            ValueError: If no GPU context is registered for ``instance_id``.
             RuntimeError: If the backend does not support IPC event handles.
         """
+        st = time.perf_counter()
+
         entry = self.get_and_touch_context_entry(instance_id)
         if entry is None:
-            raise ValueError(f"No GPU context registered for instance ID {instance_id}")
+            # See retrieve(): no device work, so no completion event; the
+            # False results let the caller recover or recompute.
+            logger.warning(
+                "Rejecting RETRIEVE_BATCH for unregistered GPU instance ID %d",
+                instance_id,
+            )
+            for key in keys:
+                try:
+                    self._release_failed_retrieve_locks(key, instance_id)
+                except Exception:
+                    logger.exception(
+                        "Failed to release RETRIEVE_BATCH locks for unregistered "
+                        "GPU instance ID %d",
+                        instance_id,
+                    )
+            return b"", [False] * len(keys)
         cache_context = entry.cache_context
+        model_name = entry.model_name
         event_backend = entry.event_backend
         if event_backend is None:
             raise RuntimeError("Registered cache context has no event backend")
-        event = event_backend.create_event(cache_context.device)
 
-        num_object_groups = cache_context.kv_layer_groups_manager.num_object_groups
-        attn_desc = cache_context.kv_layer_groups_manager.get_attn_desc()
+        kv_groups_manager = cache_context.kv_layer_groups_manager
+        num_object_groups = kv_groups_manager.num_object_groups
+        attn_desc = kv_groups_manager.get_attn_desc()
+        # Aux (connector-private) groups are never served by the std retrieve;
+        # see retrieve() for why.
+        skipped_groups = {
+            g for g, kind in enumerate(attn_desc.group_kinds) if kind == "aux"
+        }
+        group_skips = [
+            0 if window < 0 else window for window in attn_desc.num_chunks_in_sw
+        ]
+        blocks_per_chunk = [
+            cache_context.calculate_num_blocks(self._ctx.chunk_size, group_idx)
+            for group_idx in range(kv_groups_manager.num_kernel_groups)
+        ]
 
-        producer_event = event_backend.import_event(
-            event_ipc_handle, cache_context.device
-        )
-        event_backend.wait_event(producer_event, cache_context.stream)
-        publishers = self._build_batch_arrival_publishers(
-            cache_context,
-            event_backend,
-            arrival_boards,
-            layer_event_handles,
-            len(keys),
-            num_object_groups,
-        )
-        use_layer_major = publishers is not None and layers_per_stage > 0
+        for key in keys:
+            self._ctx.event_bus.publish(
+                Event(
+                    event_type=EventType.MP_RETRIEVE_SUBMITTED,
+                    session_id=key.request_id,
+                    metadata={"device": str(cache_context.device)},
+                )
+            )
+        transfer_keys = [next_transfer_key(key.request_id) for key in keys]
 
         hits = [False] * len(keys)
-        prefetched_keys: list[ObjectKey] = []
-        # Staging copies and native scatters use the ambient device/stream.
-        # They must precede the arrival and completion events recorded on the
-        # registered stream, just as in the single-request retrieve path.
         with (
             torch_dev.device(cache_context.device),
             torch_dev.stream(cache_context.stream),
             contextlib.ExitStack() as stack,
         ):
+            event = event_backend.create_event(cache_context.device)
+            for key, transfer_key in zip(keys, transfer_keys, strict=True):
+                self._ctx.event_bus.publish_on_stream(
+                    cache_context.cupy_stream,
+                    Event(
+                        event_type=EventType.MP_RETRIEVE_START,
+                        session_id=key.request_id,
+                        metadata={
+                            "device": str(cache_context.device),
+                            "engine_id": instance_id,
+                            "model_name": model_name,
+                            "transfer_key": transfer_key,
+                        },
+                    ),
+                )
+
+            producer_event = event_backend.import_event(
+                event_ipc_handle, cache_context.device
+            )
+            event_backend.wait_event(producer_event, cache_context.stream)
+            publishers = self._build_batch_arrival_publishers(
+                cache_context,
+                event_backend,
+                arrival_boards,
+                layer_event_handles,
+                len(keys),
+                num_object_groups - len(skipped_groups),
+            )
+            use_layer_major = publishers is not None and layers_per_stage > 0
+
+            prefetched_keys: list[ObjectKey] = []
             # Per object group, gather every request's in-window objects before
             # enqueuing anything, so the slice loop can walk the batch.
             per_group: list[
                 list[tuple[int, list[list[int]], list[MemoryObj | None]]]
             ] = [[] for _ in range(num_object_groups)]
             ready = [True] * len(keys)
+            num_chunks_per_request = [0] * len(keys)
+            bytes_per_request = [0] * len(keys)
             for req_idx, (key, block_ids) in enumerate(
                 zip(keys, gpu_block_ids, strict=True)
             ):
@@ -1875,9 +1087,31 @@ class LMCacheDrivenTransferModule(InstanceLivenessTarget):
                     key, list(range(num_object_groups))
                 )
                 num_chunks = len(obj_keys_per_obj_group[0])
+                num_chunks_per_request[req_idx] = num_chunks
+                # Fail closed on a short block-id list, as retrieve() does.
+                if any(
+                    len(group_block_ids) < num_chunks * bpc
+                    for group_block_ids, bpc in zip(
+                        block_ids, blocks_per_chunk, strict=True
+                    )
+                ):
+                    logger.error(
+                        "RETRIEVE_BATCH block ID underflow for request_id=%s: "
+                        "each group needs num_chunks * blocks_per_chunk block "
+                        "IDs for %d chunks (per-group blocks_per_chunk=%s); "
+                        "skipping this request.",
+                        key.request_id,
+                        num_chunks,
+                        blocks_per_chunk,
+                    )
+                    ready[req_idx] = False
+                    continue
                 for obj_group_id in range(num_object_groups):
-                    window = attn_desc.num_chunks_in_sw[obj_group_id]
-                    skip = 0 if window < 0 else max(0, num_chunks - window)
+                    if obj_group_id in skipped_groups:
+                        continue
+                    skip = max(0, num_chunks - group_skips[obj_group_id])
+                    if attn_desc.num_chunks_in_sw[obj_group_id] < 0:
+                        skip = 0
                     in_window_keys = obj_keys_per_obj_group[obj_group_id][skip:]
                     window_objs = stack.enter_context(
                         self._ctx.storage_manager.read_prefetched_results(
@@ -1892,6 +1126,9 @@ class LMCacheDrivenTransferModule(InstanceLivenessTarget):
                         ready[req_idx] = False
                         continue
                     prefetched_keys.extend(in_window_keys)
+                    bytes_per_request[req_idx] += sum(
+                        mo.get_size() for mo in window_objs
+                    )
                     memory_objs: list[MemoryObj | None] = [None] * skip + list(
                         window_objs
                     )
@@ -1899,38 +1136,43 @@ class LMCacheDrivenTransferModule(InstanceLivenessTarget):
 
             try:
                 for obj_group_id in range(num_object_groups):
+                    if obj_group_id in skipped_groups:
+                        continue
                     entries = [
                         entry for entry in per_group[obj_group_id] if ready[entry[0]]
                     ]
                     if not entries:
                         continue
-                    per_request = [(blocks, objs) for _, blocks, objs in entries]
                     if use_layer_major and publishers is not None:
                         transfer_kv_batch_layer_major(
                             cache_context,
-                            per_request,
+                            [(blocks, objs) for _, blocks, objs in entries],
                             object_group_id=obj_group_id,
                             batch_size=cache_context.max_batch_size,
                             skip_first_n_tokens=skip_first_n_tokens,
                             direction=lmcache_native.TransferDirection.H2D,
                             layers_per_stage=layers_per_stage,
-                            on_request_slice=_slice_publisher_for(
+                            on_request_slice=slice_publisher_for(
                                 publishers, [idx for idx, _, _ in entries]
                             ),
                         )
                     else:
-                        for block_ids, memory_objs in per_request:
+                        for req_idx, block_ids, memory_objs in entries:
+                            # The cut is done in place; the same lists then
+                            # serve as the host block ids of the direct path.
+                            block_ids_host = [list(group) for group in block_ids]
                             transfer_kv_per_object_group(
                                 cache_context,
                                 downsample_and_stage_block_ids(
-                                    cache_context,
-                                    [list(group) for group in block_ids],
+                                    cache_context, block_ids_host
                                 ),
                                 memory_objs,
                                 object_group_id=obj_group_id,
                                 batch_size=cache_context.max_batch_size,
                                 skip_first_n_tokens=skip_first_n_tokens,
                                 direction=lmcache_native.TransferDirection.H2D,
+                                transfer_key=transfer_keys[req_idx],
+                                block_ids_host=block_ids_host,
                             )
                 hits = list(ready)
             except Exception:
@@ -1944,9 +1186,46 @@ class LMCacheDrivenTransferModule(InstanceLivenessTarget):
                         "finish_read_prefetched",
                         prefetched_keys,
                     )
+                for req_idx, (key, transfer_key) in enumerate(
+                    zip(keys, transfer_keys, strict=True)
+                ):
+                    num_chunks = num_chunks_per_request[req_idx]
+                    self._ctx.event_bus.publish_on_stream(
+                        cache_context.cupy_stream,
+                        Event(
+                            event_type=EventType.MP_RETRIEVE_END,
+                            session_id=key.request_id,
+                            metadata={
+                                "retrieved_count": num_chunks if hits[req_idx] else 0,
+                                "device": str(cache_context.device),
+                                "engine_id": instance_id,
+                                "model_name": model_name,
+                                "cache_salt": key.cache_salt,
+                                "total_bytes": bytes_per_request[req_idx],
+                                "num_tokens": (
+                                    num_chunks * self._ctx.chunk_size
+                                    if hits[req_idx]
+                                    else 0
+                                ),
+                                "transfer_key": transfer_key,
+                            },
+                        ),
+                    )
 
+        if all(hits):
+            logger.info(
+                "Retrieved a batch of %d requests (%d tokens) in %.3f seconds",
+                len(keys),
+                sum(num_chunks_per_request) * self._ctx.chunk_size,
+                time.perf_counter() - st,
+            )
         return event_backend.export_event(event, cache_context.device), hits
 
+    @request_handler(
+        HandlerType.BLOCKING,
+        requires_client_affinity=True,
+    )
+    @_lmcache_nvtx_annotate
     def retrieve(
         self,
         key: IPCCacheServerKey,
@@ -1976,16 +1255,34 @@ class LMCacheDrivenTransferModule(InstanceLivenessTarget):
             A tuple where the first element is the IPC handle of the event
             that signals the completion of the retrieve operation, and the
             second element indicates whether the key was successfully retrieved.
+            The event handle is empty when no device work was submitted.
 
         Raises:
-            ValueError: If no GPU context is registered for the given instance ID.
             RuntimeError: If the backend does not support IPC event handles.
         """
         st = time.perf_counter()
 
         entry = self.get_and_touch_context_entry(instance_id)
         if entry is None:
-            raise ValueError(f"No GPU context registered for instance ID {instance_id}")
+            # See store(): there is no completion event because no device work
+            # was submitted. The False result lets the caller recover or
+            # recompute without importing its own producer event.
+            logger.warning(
+                "Rejecting RETRIEVE for unregistered GPU instance ID %d",
+                instance_id,
+            )
+            try:
+                self._release_failed_retrieve_locks(key, instance_id)
+            except Exception:
+                # A cleanup failure must never suppress the terminal response:
+                # the client otherwise waits forever because blocking-handler
+                # exceptions are only logged by the MQ server.
+                logger.exception(
+                    "Failed to release RETRIEVE locks for unregistered "
+                    "GPU instance ID %d",
+                    instance_id,
+                )
+            return b"", False
         cache_context = entry.cache_context
         model_name = entry.model_name
         event_backend = entry.event_backend
@@ -2009,6 +1306,7 @@ class LMCacheDrivenTransferModule(InstanceLivenessTarget):
             )
         )
 
+        transfer_key = next_transfer_key(key.request_id)
         self._ctx.event_bus.publish_on_stream(
             cache_context.cupy_stream,
             Event(
@@ -2018,6 +1316,7 @@ class LMCacheDrivenTransferModule(InstanceLivenessTarget):
                     "device": str(cache_context.device),
                     "engine_id": instance_id,
                     "model_name": model_name,
+                    "transfer_key": transfer_key,
                 },
             ),
         )
@@ -2075,22 +1374,40 @@ class LMCacheDrivenTransferModule(InstanceLivenessTarget):
             on_layer_batch = self._build_layer_arrival_publisher(
                 cache_context, event_backend, arrival_board, layer_event_handles
             )
+            layer_major_kwargs: dict[str, Any] = (
+                {"layers_per_stage": layers_per_stage, "on_layer_batch": on_layer_batch}
+                if on_layer_batch is not None
+                else {}
+            )
 
             # Per object group, the prefetch only locked the in-window suffix
             # (the last ``num_chunks_in_sw`` chunks; the whole prefix for full
             # attention, where the value is < 0). Read and transfer only those.
+            # Aux (connector-private) groups are never served by the
+            # std retrieve: the lookup does not lock their keys and their
+            # block-id entry is a placeholder -- reading them would be an
+            # unlocked read of a plane nobody consumes here.
             attn_desc = cache_context.kv_layer_groups_manager.get_attn_desc()
+            skipped_groups = {
+                g for g, kind in enumerate(attn_desc.group_kinds) if kind == "aux"
+            }
             group_skips = [
                 0 if window < 0 else max(0, num_chunks - window)
                 for window in attn_desc.num_chunks_in_sw
             ]
-            expected_retained = sum(num_chunks - skip for skip in group_skips)
+            expected_retained = sum(
+                num_chunks - skip
+                for g, skip in enumerate(group_skips)
+                if g not in skipped_groups
+            )
 
             prefetched_keys: list[ObjectKey] = []
             total_bytes = 0
             retrieve_succeeded = True
             try:
                 for obj_group_id in range(num_object_groups):
+                    if obj_group_id in skipped_groups:
+                        continue
                     skip = group_skips[obj_group_id]
                     in_window_keys = obj_keys_per_obj_group[obj_group_id][skip:]
                     with self._ctx.storage_manager.read_prefetched_results(
@@ -2118,8 +1435,9 @@ class LMCacheDrivenTransferModule(InstanceLivenessTarget):
                             batch_size=cache_context.max_batch_size,
                             skip_first_n_tokens=skip_first_n_tokens,
                             direction=lmcache_native.TransferDirection.H2D,
-                            layers_per_stage=layers_per_stage,
-                            on_layer_batch=on_layer_batch,
+                            transfer_key=transfer_key,
+                            block_ids_host=gpu_block_ids,
+                            **layer_major_kwargs,
                         )
                         # Extend only after the copy is enqueued: on exception,
                         # read_prefetched_results releases this group's locks
@@ -2154,6 +1472,7 @@ class LMCacheDrivenTransferModule(InstanceLivenessTarget):
                             "cache_salt": key.cache_salt,
                             "total_bytes": total_bytes,
                             "num_tokens": num_tokens,
+                            "transfer_key": transfer_key,
                         },
                     ),
                 )

@@ -34,7 +34,7 @@ def test_batch_copies_and_completion_share_the_registered_stream(
 
     @contextmanager
     def read_objects(keys: list[Any]) -> Iterator[list[object]]:
-        yield [object() for _ in keys]
+        yield [SimpleNamespace(get_size=lambda: 16) for _ in keys]
 
     def enqueue(*args: Any, **kwargs: Any) -> None:
         copy_contexts.append((ambient["device"], ambient["stream"]))
@@ -47,15 +47,24 @@ def test_batch_copies_and_completion_share_the_registered_stream(
     context = SimpleNamespace(
         storage_manager=storage,
         resolve_obj_keys=lambda key, groups: [[key.request_id]],
+        chunk_size=256,
+        event_bus=SimpleNamespace(
+            publish=lambda event: None,
+            publish_on_stream=lambda stream, event: None,
+        ),
     )
     cache = SimpleNamespace(
         device="registered-device",
         stream="registered-stream",
         cupy_stream="registered-stream",
         max_batch_size=1,
+        calculate_num_blocks=lambda tokens, group: 1,
         kv_layer_groups_manager=SimpleNamespace(
             num_object_groups=1,
-            get_attn_desc=lambda: SimpleNamespace(num_chunks_in_sw=[-1]),
+            num_kernel_groups=1,
+            get_attn_desc=lambda: SimpleNamespace(
+                num_chunks_in_sw=[-1], group_kinds=["full"]
+            ),
         ),
     )
     events = SimpleNamespace(
@@ -80,11 +89,16 @@ def test_batch_copies_and_completion_share_the_registered_stream(
     )
     monkeypatch.setattr(transfer, "submit_callback_to_stream", lambda *args: None)
     module = transfer.LMCacheDrivenTransferModule(context)
-    entry = SimpleNamespace(cache_context=cache, event_backend=events)
+    entry = SimpleNamespace(
+        cache_context=cache, event_backend=events, model_name="model"
+    )
     monkeypatch.setattr(module, "get_and_touch_context_entry", lambda instance: entry)
     try:
         _, hits = module.retrieve_batch(
-            [SimpleNamespace(request_id="a"), SimpleNamespace(request_id="b")],
+            [
+                SimpleNamespace(request_id="a", cache_salt=""),
+                SimpleNamespace(request_id="b", cache_salt=""),
+            ],
             instance_id=1,
             gpu_block_ids=[[[1]], [[2]]],
             event_ipc_handle=b"producer",

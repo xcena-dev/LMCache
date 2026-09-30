@@ -36,9 +36,9 @@ from lmcache.v1.mp_observability.config import DEFAULT_OBSERVABILITY_CONFIG
 from lmcache.v1.multiprocess.config import MPServerConfig
 from lmcache.v1.multiprocess.custom_types import IPCCacheServerKey, KVCache
 from lmcache.v1.multiprocess.layer_arrival_board import LayerArrivalBoard
-from lmcache.v1.multiprocess.mq import MessageQueueClient
-from lmcache.v1.multiprocess.protocol import RequestType, get_response_class
 from lmcache.v1.multiprocess.server import run_cache_server
+from lmcache.v1.multiprocess.transport.base import RequestClient
+from lmcache.v1.multiprocess.transport.factory import RequestClientFactory
 
 SERVER_HOST = "localhost"
 SERVER_PORT = 5607
@@ -73,7 +73,7 @@ if not (torch_dev.is_available() and torch_device_type == "cuda"):
     pytest.skip("requires available CUDA runtime", allow_module_level=True)
 
 # First Party
-from lmcache.v1.platform.cuda.ipc_wrapper import CudaIPCWrapper  # noqa: E402
+from lmcache.v1.platform.devices.cuda.ipc_wrapper import CudaIPCWrapper  # noqa: E402
 
 if not _has_working_new_shared_cuda():
     pytest.skip("new_shared_cuda is not usable here", allow_module_level=True)
@@ -121,21 +121,15 @@ def create_cache_key(
     )
 
 
-def lookup_all(client: MessageQueueClient, keys: list[IPCCacheServerKey]) -> int:
+def lookup_all(client: RequestClient, keys: list[IPCCacheServerKey]) -> int:
     total = 0
     for key in keys:
         lookup_key = key.no_worker_id_version()
-        client.submit_request(
-            RequestType.LOOKUP,
-            [lookup_key, 1],
-            get_response_class(RequestType.LOOKUP),
-        ).result(timeout=DEFAULT_TIMEOUT)
+        client.lookup(lookup_key, 1).result(timeout=DEFAULT_TIMEOUT)
         while True:
-            result = client.submit_request(
-                RequestType.QUERY_PREFETCH_STATUS,
-                [lookup_key.request_id],
-                get_response_class(RequestType.QUERY_PREFETCH_STATUS),
-            ).result(timeout=DEFAULT_TIMEOUT)
+            result = client.query_prefetch_status(lookup_key.request_id).result(
+                timeout=DEFAULT_TIMEOUT
+            )
             if result is not None:
                 total += result
                 break
@@ -143,7 +137,7 @@ def lookup_all(client: MessageQueueClient, keys: list[IPCCacheServerKey]) -> int
 
 
 def wait_until_all_stored(
-    client: MessageQueueClient, keys: list[IPCCacheServerKey], timeout: float = 30.0
+    client: RequestClient, keys: list[IPCCacheServerKey], timeout: float = 30.0
 ) -> int:
     """Poll the lookup until every key is visible, or the timeout runs out.
 
@@ -162,7 +156,7 @@ def wait_until_all_stored(
 
 
 def store_keys(
-    client: MessageQueueClient,
+    client: RequestClient,
     keys: list[IPCCacheServerKey],
     instance_id: int,
     gpu_block_ids: list[int],
@@ -171,11 +165,7 @@ def store_keys(
     for i, key in enumerate(keys):
         block_ids = gpu_block_ids[i * BLOCKS_PER_KEY : (i + 1) * BLOCKS_PER_KEY]
         result = (
-            client.submit_request(
-                RequestType.STORE,
-                [key, instance_id, [block_ids], event.ipc_handle()],
-                get_response_class(RequestType.STORE),
-            )
+            client.store(key, instance_id, [block_ids], event.ipc_handle())
             .to_device_future()
             .result(timeout=DEFAULT_TIMEOUT)
         )
@@ -183,7 +173,7 @@ def store_keys(
 
 
 def retrieve_keys(
-    client: MessageQueueClient,
+    client: RequestClient,
     keys: list[IPCCacheServerKey],
     instance_id: int,
     gpu_block_ids: list[int],
@@ -203,22 +193,23 @@ def retrieve_keys(
     published: list[int] = []
     for i, key in enumerate(keys):
         block_ids = gpu_block_ids[i * BLOCKS_PER_KEY : (i + 1) * BLOCKS_PER_KEY]
-        payload: list[Any] = [key, instance_id, [block_ids], event.ipc_handle(), 0]
+        arrival_board: tuple[str, int, int] | None = None
+        layer_event_handles: list[bytes] | None = None
         if layers_per_stage > 0:
             assert board is not None and layer_events is not None
             board.reset(slot)
-            payload += [
-                (board.name, slot, board.num_slots),
-                [e.ipc_handle() for e in layer_events],
-                layers_per_stage,
-            ]
-        else:
-            payload += [None, None, 0]
+            arrival_board = (board.name, slot, board.num_slots)
+            layer_event_handles = [e.ipc_handle() for e in layer_events]
         result = (
-            client.submit_request(
-                RequestType.RETRIEVE,
-                payload,
-                get_response_class(RequestType.RETRIEVE),
+            client.retrieve(
+                key,
+                instance_id,
+                [block_ids],
+                event.ipc_handle(),
+                0,
+                arrival_board,
+                layer_event_handles,
+                layers_per_stage if arrival_board is not None else 0,
             )
             .to_device_future()
             .result(timeout=DEFAULT_TIMEOUT)
@@ -269,10 +260,10 @@ def zmq_context() -> Generator[zmq.Context, None, None]:
 @pytest.fixture(scope="module")
 def client(
     server_process: mp.Process, zmq_context: zmq.Context
-) -> Generator[MessageQueueClient, None, None]:
-    mq_client = MessageQueueClient(server_url=SERVER_URL, context=zmq_context)
-    yield mq_client
-    mq_client.close()
+) -> Generator[RequestClient, None, None]:
+    request_client = RequestClientFactory.create(SERVER_URL, context=zmq_context)
+    yield request_client
+    request_client.close()
 
 
 @pytest.fixture(scope="module")
@@ -285,38 +276,28 @@ def client_context() -> Generator[ClientContext, None, None]:
 
 @pytest.fixture(scope="module")
 def registered_instance(
-    client: MessageQueueClient, client_context: ClientContext
+    client: RequestClient, client_context: ClientContext
 ) -> Generator[int, None, None]:
     instance_id = os.getpid()
-    client.submit_request(
-        RequestType.REGISTER_KV_CACHE,
-        [
-            instance_id,
-            client_context.get_kv_cache(),
-            "testmodel",
-            1,
-            EngineType.VLLM,
-            {},
-            [],
-        ],
-        get_response_class(RequestType.REGISTER_KV_CACHE),
+    client.register_kv_cache(
+        instance_id,
+        client_context.get_kv_cache(),
+        "testmodel",
+        1,
+        EngineType.VLLM,
+        {},
+        [],
     ).result(timeout=DEFAULT_TIMEOUT)
     yield instance_id
     try:
-        client.submit_request(
-            RequestType.CLEAR, [], get_response_class(RequestType.CLEAR)
-        ).result(timeout=DEFAULT_TIMEOUT)
-        client.submit_request(
-            RequestType.UNREGISTER_KV_CACHE,
-            [instance_id],
-            get_response_class(RequestType.UNREGISTER_KV_CACHE),
-        ).result(timeout=DEFAULT_TIMEOUT)
+        client.clear().result(timeout=DEFAULT_TIMEOUT)
+        client.unregister_kv_cache(instance_id).result(timeout=DEFAULT_TIMEOUT)
     except Exception as exc:  # pragma: no cover - teardown best effort
         print(f"unregister failed: {exc}")
 
 
 def test_layer_major_retrieve_matches_the_source_blocks(
-    client: MessageQueueClient,
+    client: RequestClient,
     client_context: ClientContext,
     registered_instance: int,
 ):
@@ -393,7 +374,7 @@ def test_layer_major_retrieve_matches_the_source_blocks(
 
 
 def test_layer_major_and_chunk_major_agree_bit_for_bit(
-    client: MessageQueueClient,
+    client: RequestClient,
     client_context: ClientContext,
     registered_instance: int,
 ):
@@ -467,7 +448,7 @@ def test_layer_major_and_chunk_major_agree_bit_for_bit(
 
 
 def test_batch_retrieve_moves_every_request_correctly(
-    client: MessageQueueClient,
+    client: RequestClient,
     client_context: ClientContext,
     registered_instance: int,
 ):
@@ -526,22 +507,18 @@ def test_batch_retrieve_moves_every_request_correctly(
         # to_device_future() consumes the event handle and hands back the second
         # element of the response, so this is the per-request hit list.
         hits = (
-            client.submit_request(
-                RequestType.RETRIEVE_BATCH,
+            client.retrieve_batch(
+                round_keys,
+                registered_instance,
+                block_ids,
+                event.ipc_handle(),
+                0,
+                [(board.name, s, board.num_slots) for s in range(NUM_KEYS)],
                 [
-                    round_keys,
-                    registered_instance,
-                    block_ids,
-                    event.ipc_handle(),
-                    0,
-                    [(board.name, s, board.num_slots) for s in range(NUM_KEYS)],
-                    [
-                        [e.ipc_handle() for e in request_events]
-                        for request_events in layer_events
-                    ],
-                    8,
+                    [e.ipc_handle() for e in request_events]
+                    for request_events in layer_events
                 ],
-                get_response_class(RequestType.RETRIEVE_BATCH),
+                8,
             )
             .to_device_future()
             .result(timeout=DEFAULT_TIMEOUT)

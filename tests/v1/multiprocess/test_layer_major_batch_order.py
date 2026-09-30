@@ -24,7 +24,7 @@ buffer between one request's slices.
 import pytest
 
 # First Party
-from lmcache.v1.multiprocess.modules import lmcache_driven_transfer as transfer
+from lmcache.v1.multiprocess import object_group_transfer as transfer
 
 NUM_LAYERS = 8
 LAYERS_PER_STAGE = 2

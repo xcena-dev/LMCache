@@ -4,6 +4,7 @@ Tests for the DAX MP L2 adapter.
 """
 
 # Standard
+from types import SimpleNamespace
 from typing import cast
 import select
 import threading
@@ -18,7 +19,6 @@ from lmcache.lmcache_native import Bitmap
 from lmcache.v1.distributed.api import (
     MemoryLayoutDesc,
     ObjectKey,
-    PrefetchRequestSpec,
 )
 from lmcache.v1.distributed.config import (
     EvictionConfig,
@@ -28,7 +28,7 @@ from lmcache.v1.distributed.config import (
 )
 from lmcache.v1.distributed.error import L1Error
 from lmcache.v1.distributed.internal_api import L2AdapterListener
-from lmcache.v1.distributed.l2_adapters.base import L2AdapterInterface
+from lmcache.v1.distributed.l2_adapters.base import AdapterUsage, L2AdapterInterface
 from lmcache.v1.distributed.l2_adapters.config import (
     L2AdaptersConfig,
     get_registered_l2_adapter_types,
@@ -42,13 +42,18 @@ from lmcache.v1.distributed.l2_adapters.reconfiguration import (
     L2ReconfigurableAdapter,
     L2ReconfigureError,
 )
+from lmcache.v1.distributed.storage_controllers.utils import L2AdapterDescriptor
 from lmcache.v1.distributed.storage_manager import StorageManager
 from lmcache.v1.memory_allocators.ad_hoc_memory_allocator import AdHocMemoryAllocator
 from lmcache.v1.memory_management import (
     MemoryFormat,
     MemoryObj,
 )
+from lmcache.v1.mp_observability.event_bus import EventBus
 from lmcache.v1.platform import consume_fd
+
+# Test helpers
+from tests.v1.distributed.utils import single_row_spec
 
 _EMPTY_LAYOUT = MemoryLayoutDesc(shapes=[], dtypes=[])
 
@@ -433,6 +438,10 @@ class _FakeReconfigurableAdapter:
         self.calls.append((operation, payload))
         return {"status": "ok", "operation": operation, "payload": payload}
 
+    def get_usage(self) -> AdapterUsage:
+        """Declare no capacity; reconfiguring still reports the compartment."""
+        return AdapterUsage(total_bytes_used=0, total_capacity_bytes=0)
+
 
 class _SerdeLikeWrapper:
     def __init__(self, inner_adapter: _FakeReconfigurableAdapter) -> None:
@@ -440,8 +449,43 @@ class _SerdeLikeWrapper:
 
 
 class _FakeAdapterDescriptor:
-    def __init__(self, type_name: str) -> None:
+    def __init__(self, type_name: str, shared: bool = False) -> None:
         self.type_name = type_name
+        # The real L2AdapterDescriptor always carries its config; capacity
+        # reporting reads ``shared`` off it.
+        self.config = SimpleNamespace(shared=shared)
+
+
+class _RecordingBus:
+    """Captures capacity-change events instead of publishing them."""
+
+    def __init__(self) -> None:
+        self.events: list[object] = []
+
+    def publish(self, event: object) -> None:
+        self.events.append(event)
+
+
+def _wire_capacity_publishing(sm: StorageManager) -> None:
+    """Give a bare StorageManager the state its capacity publish needs.
+
+    Reconfiguring an adapter also announces the new topology, which reads
+    the L1 config, the adapter descriptors, and the event bus.
+
+    Args:
+        sm: The partially-constructed storage manager to wire up.
+    """
+    sm._lifecycle_lock = threading.Lock()
+    sm._event_bus = cast(EventBus, _RecordingBus())
+    # Declares no L1, keeping these tests about the L2 path.
+    sm._l1_config = L1ManagerConfig(
+        memory_config=L1MemoryManagerConfig(size_in_bytes=0, use_lazy=True)
+    )
+    if not hasattr(sm, "_adapter_descriptors"):
+        sm._adapter_descriptors = {
+            adapter_id: cast(L2AdapterDescriptor, _FakeAdapterDescriptor("fake"))
+            for adapter_id in sm._l2_adapters
+        }
 
 
 def test_storage_manager_routes_generic_l2_reconfigure_to_adapter():
@@ -449,6 +493,9 @@ def test_storage_manager_routes_generic_l2_reconfigure_to_adapter():
     adapter = _FakeReconfigurableAdapter()
     sm._adapters_lock = threading.Lock()
     sm._l2_adapters = {0: cast(L2AdapterInterface, adapter)}
+    # Reconfiguring changes capacity, so the call also announces the new
+    # topology; that needs enough state to build a capacity snapshot.
+    _wire_capacity_publishing(sm)
 
     result = sm.reconfigure_l2_adapter(0, "flip", {"enabled": True})
 
@@ -792,7 +839,7 @@ def test_storage_manager_dax_adapter_roundtrip(tmp_path):
         adapter = sm._l2_adapters[0]
         assert isinstance(adapter, DaxL2Adapter)
 
-        reserved = sm.reserve_write([key], layout, mode="new")
+        reserved = sm.reserve_write([key], layout)
         assert key in reserved
         assert reserved[key].tensor is not None
         reserved[key].tensor.fill_(11)
@@ -806,26 +853,14 @@ def test_storage_manager_dax_adapter_roundtrip(tmp_path):
             timeout=5.0,
         )
 
-        handle = sm.submit_prefetch_task(PrefetchRequestSpec([key], {0: layout}))
-        assert wait_for_condition(
-            lambda: sm.query_prefetch_lookup_hits(handle) is not None,
-            timeout=5.0,
-        )
-        lookup_hits = sm.query_prefetch_lookup_hits(handle)
-        assert lookup_hits == 1
-
-        final_result: dict[str, int | None] = {"value": None}
-
-        def _capture_prefetch_result() -> bool:
-            result = sm.query_prefetch_status(handle)
-            if result is None:
-                return False
-            final_result["value"] = result.count_leading_ones()
-            return True
-
-        assert wait_for_condition(_capture_prefetch_result, timeout=5.0)
-        final_hits = final_result["value"]
+        handle = sm.submit_prefetch_task(single_row_spec([key], layout))
+        assert sm.wait_prefetch_status(handle, timeout=5.0)
+        result = sm.query_prefetch_status(handle)
+        assert result is not None
+        final_hits = result.hit_cells[0].count_leading_ones()
         assert final_hits == 1
+        # The key came back from the DAX adapter, not from L1.
+        assert result.l2_hit_cells[0].count_leading_ones() == 1
 
         with sm.read_prefetched_results([key]) as results:
             assert results is not None
@@ -897,7 +932,7 @@ def test_storage_manager_dax_adapter_uses_global_l2_eviction(tmp_path):
         key2 = create_object_key(72)
 
         def _write_key(key: ObjectKey, fill_value: int, usage_fraction: float) -> None:
-            reserved = sm.reserve_write([key], layout, mode="new")
+            reserved = sm.reserve_write([key], layout)
             assert key in reserved
             assert reserved[key].tensor is not None
             reserved[key].tensor.fill_(fill_value)

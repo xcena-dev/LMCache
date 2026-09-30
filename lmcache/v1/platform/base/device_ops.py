@@ -20,10 +20,7 @@ if TYPE_CHECKING:
 # First Party
 from lmcache.logging import init_logger
 from lmcache.v1.platform import ops_types, torch_ops
-from lmcache.v1.platform.ops_types import (
-    PageBufferShapeDesc,
-    set_shape_desc_dtype,
-)
+from lmcache.v1.platform.ops_types import PageBufferShapeDesc
 import lmcache.lmcache_native as lmcache_native
 
 logger = init_logger(__name__)
@@ -52,7 +49,6 @@ class DeviceOps:
     LaunchVar = ops_types.LaunchVar
     BatchStep = ops_types.BatchStep
     KernelGroupSpec = ops_types.KernelGroupSpec
-    set_shape_desc_dtype = staticmethod(set_shape_desc_dtype)
 
     # Bound from the native module by bind_native (declared for static analysis).
     TransferDirection: type[lmcache_native.TransferDirection]
@@ -175,6 +171,8 @@ class DeviceOps:
         lmcache_chunk_size: int,
         engine_kv_format: lmcache_native.EngineKVFormat,
         skip_prefix_n_blocks: int,
+        layer_offset: int = 0,
+        staged_layers: int = 0,
     ) -> None:
         return torch_ops.multi_layer_block_kv_transfer(
             paged_buffer_ptrs_tensor,
@@ -186,6 +184,8 @@ class DeviceOps:
             lmcache_chunk_size,
             engine_kv_format,
             skip_prefix_n_blocks,
+            layer_offset,
+            staged_layers,
         )
 
     def multi_layer_kv_transfer(self, *args, **kwargs):
