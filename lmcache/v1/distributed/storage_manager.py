@@ -668,11 +668,24 @@ class StorageManager:
             prefetch_request_id,
             skip_l2,
         )
+        submit_time = time.monotonic()
+        # Measurement instrumentation: joins the engine request id to the
+        # prefetch id that P2P-READ-QOS / l2_load_start lines carry. The L1/L2
+        # split is decided inside the prefetch controller, so only the total
+        # key count is known here.
+        logger.info(
+            "REQ-TRACE prefetch_submit req=%s pf=%s keys=%d skip_l2=%s mono=%.3f",
+            external_request_id,
+            prefetch_request_id,
+            len(spec.key_groups) * spec.group_size,
+            skip_l2,
+            submit_time * 1e3,
+        )
         return PrefetchHandle(
             prefetch_request_id=prefetch_request_id,
             external_request_id=external_request_id,
             total_requested_keys=len(spec.key_groups) * spec.group_size,
-            submit_time=time.monotonic(),
+            submit_time=submit_time,
             sliding_windows=tuple(row.sliding_window_size for row in spec.key_groups),
         )
 

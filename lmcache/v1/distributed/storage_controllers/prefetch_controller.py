@@ -23,6 +23,7 @@ import enum
 import itertools
 import select
 import threading
+import time as _trace_time
 
 # First Party
 from lmcache.lmcache_native import Bitmap
@@ -56,6 +57,7 @@ from lmcache.v1.distributed.storage_controllers.utils import (
     L2AdapterDescriptor,
     MapState,
 )
+from lmcache.v1.distributed.trace_ctx import current_prefetch_id
 from lmcache.v1.mp_observability.event import Event, EventType
 from lmcache.v1.mp_observability.event_bus import get_event_bus
 from lmcache.v1.mp_observability.otel_init import register_gauge
@@ -1302,7 +1304,13 @@ class PrefetchController(StorageControllerInterface):
             if not keys:
                 continue
             objects = [reserved_objs[key] for key in keys]
-            task_id = self._l2_adapters[l2_idx].submit_load_task(keys, objects)
+            # Measurement instrumentation: tag the transfer channel's per-read
+            # QoS line with this prefetch id.
+            _tok = current_prefetch_id.set(request.request_id)
+            try:
+                task_id = self._l2_adapters[l2_idx].submit_load_task(keys, objects)
+            finally:
+                current_prefetch_id.reset(_tok)
             request.inflight_load_tasks[l2_idx] = task_id
             plan_keys.extend(keys)
 
@@ -1325,6 +1333,15 @@ class PrefetchController(StorageControllerInterface):
 
         if not plan_keys:
             return
+        # Measurement instrumentation: R1 start mark (host monotonic ms).
+        logger.info(
+            "REQ-TRACE l2_load_start pf=%s tasks=%d keys=%d bytes=%d mono=%.3f",
+            request.request_id,
+            len(request.inflight_load_tasks),
+            len(plan_keys),
+            sum(request.load_bytes_by_adapter.values()),
+            _trace_time.monotonic() * 1e3,
+        )
         self._event_bus.publish(
             Event(
                 event_type=EventType.L2_PREFETCH_LOAD_SUBMITTED,
