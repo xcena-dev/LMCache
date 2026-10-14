@@ -16,15 +16,9 @@ the stock manager (keep in sync with ``l1_manager.py``); ``MARU:`` marks
 maru-specific logic.
 
 A background sweeper reclaims staging whose TTL elapses (an abandoned client's
-orphan write pages / read pins). Known gaps: (1) a pin whose RPC reply is lost
+orphan write pages / read pins). Known gap: a pin whose RPC reply is lost
 leaks server-side; reconciliation (per-instance pin ledger) is a maru-side
-design item. (2) for retained (non-temporary) prefetch buffers, the prefetch
-controller's load-failure cleanup calls ``finish_write`` then ``delete`` on the
-failed keys -- ``finish_write`` publishes the page to the shared directory, so a
-peer that pins it in the window before ``delete`` makes ``delete`` refuse
-(KEY_IS_LOCKED, which the caller ignores) and the key lingers. Rare (L2-load
-failure + concurrent same-key lookup); a caller-side batch-abort is the clean
-future fix.
+design item.
 """
 
 # Standard
@@ -34,7 +28,6 @@ from typing import (
     Any,
     Callable,
     Concatenate,
-    Literal,
     ParamSpec,
     TypeVar,
 )
@@ -48,17 +41,29 @@ import torch
 # First Party
 from lmcache.lmcache_native import is_mla
 from lmcache.logging import init_logger
-from lmcache.v1.distributed.api import MemoryLayoutDesc, ObjectKey
-from lmcache.v1.distributed.config import L1ManagerConfig, MaruL1Config
-from lmcache.v1.distributed.error import L1Error
-from lmcache.v1.distributed.internal_api import L1ManagerListener, L1MemoryDesc
+from lmcache.v1.distributed.api import L1BackendType, MemoryLayoutDesc, ObjectKey
+from lmcache.v1.distributed.config import (
+    L1ManagerConfig,
+    MaruL1Config,
+    get_configured_capacity_bytes,
+)
+from lmcache.v1.distributed.error import L1Error, L1ReconfigureError
+from lmcache.v1.distributed.internal_api import (
+    L1ManagerListener,
+    L1MemoryDesc,
+    L1OperationResult,
+)
 from lmcache.v1.distributed.l1_manager import (
     MAX_READ_LOCK_COUNT,
     L1ObjectState,
-    L1OperationResult,
+    next_l1_manager_id,
 )
 from lmcache.v1.distributed.memory_manager.maru_memory_allocator import (
     MaruMemoryAllocator,
+)
+from lmcache.v1.memory_allocators.devdax_memory_allocator import (
+    DevDaxArenaStatus,
+    DevDaxRemoveMode,
 )
 from lmcache.v1.memory_management import MemoryFormat, MemoryObj
 from lmcache.v1.mp_observability.event import Event, EventType
@@ -180,6 +185,8 @@ class _PendingWrite:
     mem_obj: MemoryObj
     is_temporary: bool
     deadline: float = float("inf")
+    # The writer's tag from reserve_write; the finishing call must match it.
+    tag: str = ""
 
 
 class MaruL1Manager:
@@ -205,6 +212,10 @@ class MaruL1Manager:
         if maru_config is None:
             raise ValueError("MaruL1Manager requires memory_config.maru_config")
         self._config: MaruL1Config = maru_config
+        # PARITY(L1Manager): the full L1 config and a process-local identity,
+        # which is also the owner tag stamped on reserved pages.
+        self._l1_config = config
+        self._l1_manager_id = next_l1_manager_id()
         self._write_ttl_seconds = config.write_ttl_seconds
         self._read_ttl_seconds = config.read_ttl_seconds
         self._lock = threading.Lock()
@@ -275,6 +286,35 @@ class MaruL1Manager:
             keys: The affected object keys (event metadata).
         """
         self._event_bus.publish(Event(event_type=event_type, metadata={"keys": keys}))
+
+    def _take_pending_write(self, key: ObjectKey, tag: str) -> _PendingWrite | None:
+        """Pop ``key``'s write staging if ``tag`` reserved it, else None.
+
+        PARITY(L1Manager._take_staging): only the reserving tag finishes or
+        discards a reservation; another tag's call leaves it staged.
+        """
+        entry = self._pending_write.get(key)
+        if entry is None or entry.tag != tag:
+            return None
+        return self._pending_write.pop(key)
+
+    def _report_staging_gone(self, keys: list[ObjectKey]) -> None:
+        """Tell listeners that ``keys`` left L1 without ever becoming resident.
+
+        PARITY(L1Manager._report_staging_gone): the eviction policy tracks a
+        key from ``reserve_write`` on, so every dropped reservation must be
+        reported or the key stays in the policy forever. Keys still staged
+        locally are skipped. No event is published: nothing readable left.
+        """
+        gone = [
+            k
+            for k in keys
+            if k not in self._pending_read and k not in self._pending_write
+        ]
+        if not gone:
+            return
+        for listener in self._registered_listeners:
+            listener.on_l1_keys_deleted_by_manager(gone)
 
     def _safe_unpin(self, handler: "MaruHandler", key_strs: list[str]) -> None:
         """Release server pins, logging (not raising) on RPC failure."""
@@ -481,10 +521,13 @@ class MaruL1Manager:
         many holds exist, not whether they will ever be released. Mirrors the
         stock write_lock/read_lock TTL: an expired write page is returned to
         the owner (abort_alloc) and an expired read releases its pins (a
-        temporary read reclaims its private page instead). No listener fires --
-        a late finish_read/unsafe_read then sees KEY_NOT_EXIST and recomputes
-        (the same failure path as a stock TTL expiry), and firing across the
-        daemon thread would be a novel hazard for the stock listeners.
+        temporary read reclaims its private page instead). A late
+        finish_read/unsafe_read then sees KEY_NOT_EXIST and recomputes (the
+        same failure path as a stock TTL expiry). Keys whose page is gone
+        (expired writes, expired temporary reads) are reported through
+        ``on_l1_keys_deleted_by_manager`` under the lock, as every other
+        listener call; an expired directory read stays tracked, since the key
+        is still resident in the shared pool.
         """
         now = time.monotonic()
         with self._lock:
@@ -505,6 +548,7 @@ class MaruL1Manager:
                         "MaruL1Manager: sweep failed to reclaim write page %s", k
                     )
             to_unpin: list[str] = []
+            gone_reads: list[ObjectKey] = []
             for k in expired_reads:
                 read_entry = self._pending_read.pop(k)
                 # MARU: release real server pins (pinned); a temporary stage
@@ -512,6 +556,7 @@ class MaruL1Manager:
                 if read_entry.pinned:
                     to_unpin.extend([object_key_to_string(k)] * read_entry.pinned)
                 if read_entry.is_temporary:
+                    gone_reads.append(k)
                     try:
                         self._allocator.abort_alloc(read_entry.mem_obj)
                     except Exception:
@@ -520,6 +565,7 @@ class MaruL1Manager:
                         )
             if to_unpin:
                 self._safe_unpin(self._allocator.handler, to_unpin)
+            self._report_staging_gone(expired_writes + gone_reads)
             logger.warning(
                 "MaruL1Manager: swept %d orphan write(s) / %d orphan read(s)",
                 len(expired_writes),
@@ -544,27 +590,24 @@ class MaruL1Manager:
             A dictionary mapping each key to (L1Error, MemoryObj | None).
 
         Errors:
-            KEY_NOT_EXIST: Absent from the directory, unresolvable, or the
-                pin RPC failed.
-            KEY_NOT_READABLE: The key is mid-write on this instance.
+            KEY_NOT_EXIST: Absent from the directory, unresolvable, the pin
+                RPC failed, or the key is mid-write on this instance.
         """
         total = _validate_read_locks(read_locks)
         ret: dict[ObjectKey, L1OperationResult] = {
             k: (L1Error.KEY_NOT_EXIST, None) for k in keys
         }
-        # PARITY(L1Manager.reserve_read): a key mid-write on this instance is
-        # not readable (distinct from a plain miss), mirroring stock's per-key
-        # write/read lock exclusion. A peer may have already registered the same
-        # key in the shared directory, so mid-write keys are excluded from the
-        # pin/stage below -- otherwise the pin would succeed and stage a
-        # _pending_read entry for a key still in _pending_write (double staging),
-        # stranding the in-flight write (its promote then returns
-        # KEY_IN_WRONG_STATE and never pops _pending_write).
+        # PARITY(L1Manager.reserve_read): a staged write is invisible to
+        # readers, so a key mid-write on this instance reads as a miss. A peer
+        # may have already registered the same key in the shared directory, so
+        # mid-write keys are excluded from the pin/stage below -- otherwise the
+        # pin would succeed and stage a _pending_read entry for a key still in
+        # _pending_write (double staging), stranding the in-flight write (its
+        # promote then returns KEY_IN_WRONG_STATE and never pops _pending_write).
         readable: list[ObjectKey] = []
         successful_keys: list[ObjectKey] = []
         for k in keys:
             if k in self._pending_write:
-                ret[k] = (L1Error.KEY_NOT_READABLE, None)
                 continue
             entry = self._pending_read.get(k)
             if entry is not None and entry.is_temporary:
@@ -600,8 +643,9 @@ class MaruL1Manager:
             A dictionary mapping each key to (L1Error, MemoryObj | None).
 
         Errors:
-            KEY_NOT_EXIST: The key has no staged read.
-            KEY_NOT_READABLE: The key is mid-write or has no active read hold.
+            KEY_NOT_EXIST: The key has no staged read (a staged write is
+                invisible to readers).
+            KEY_NOT_READABLE: The key has no active read hold.
         """
         ret: dict[ObjectKey, L1OperationResult] = {}
         for k in keys:
@@ -612,8 +656,6 @@ class MaruL1Manager:
                     if entry.refcount > 0
                     else (L1Error.KEY_NOT_READABLE, None)
                 )
-            elif k in self._pending_write:
-                ret[k] = (L1Error.KEY_NOT_READABLE, None)
             else:
                 ret[k] = (L1Error.KEY_NOT_EXIST, None)
         return ret
@@ -700,37 +742,36 @@ class MaruL1Manager:
         keys: list[ObjectKey],
         is_temporary: list[bool],
         layout_desc: MemoryLayoutDesc,
-        mode: Literal["new", "update", "all"] = "all",
+        tag: str = "",
     ) -> dict[ObjectKey, L1OperationResult]:
         """Allocate CXL pages and stage them for writing.
 
-        PARITY(L1Manager.reserve_write): in "new" mode existing keys return
-        KEY_NOT_WRITABLE; allocation is all-or-nothing. MARU: "existing"
-        covers locally staged keys and directory-registered keys (the latter
-        check is the cross-instance dedup -- another instance stored it, so
-        the D2H copy is skipped). In-place update of a registered shared page
-        is not possible, so only ``mode="new"`` (the only mode MP callers
-        use) is supported.
+        PARITY(L1Manager.reserve_write): existing keys return
+        KEY_NOT_WRITABLE; allocation is all-or-nothing; each page is stamped
+        with this manager's owner tag. MARU: "existing" covers locally staged
+        keys and directory-registered keys (the latter check is the
+        cross-instance dedup -- another instance stored it, so the D2H copy is
+        skipped). A key holds one write reservation at a time whatever its
+        tag; ``L1Manager`` lets different tags stage the same key at once.
+        The cost: of two concurrent L2 prefetches of one key (each prefetch
+        has its own tag), the second gets KEY_NOT_WRITABLE and its prefix hit
+        stops at that key.
 
         Args:
             keys: The list of object keys to reserve write access for.
             is_temporary: Per-key flag; temporary objects are dropped after
                 their read completes.
             layout_desc: The memory layout for the allocation.
-            mode: Reservation mode; must be ``"new"``.
+            tag: The writer's identity; the same tag must be passed to the
+                ``finish_write`` variant that completes the write.
 
         Returns:
             A dictionary mapping each key to (L1Error, MemoryObj | None).
-
-        Raises:
-            ValueError: If ``mode`` is not ``"new"``.
 
         Errors:
             KEY_NOT_WRITABLE: The key is staged locally or already registered.
             OUT_OF_MEMORY: The CXL pool could not fit the batch.
         """
-        if mode != "new":
-            raise ValueError(f"MaruL1Manager supports mode='new' only, got {mode!r}")
         ret: dict[ObjectKey, L1OperationResult] = {}
         candidates: list[tuple[ObjectKey, bool]] = []
         for k, is_temp in zip(keys, is_temporary, strict=False):
@@ -775,8 +816,9 @@ class MaruL1Manager:
         successful_keys: list[ObjectKey] = []
         deadline = time.monotonic() + self._write_ttl_seconds
         for (k, is_temp), obj in zip(need_allocate, objs, strict=False):
+            obj.set_l1_manager(self._l1_manager_id)
             self._pending_write[k] = _PendingWrite(
-                mem_obj=obj, is_temporary=is_temp, deadline=deadline
+                mem_obj=obj, is_temporary=is_temp, deadline=deadline, tag=tag
             )
             ret[k] = (L1Error.SUCCESS, obj)
             successful_keys.append(k)
@@ -788,7 +830,9 @@ class MaruL1Manager:
         return ret
 
     @_maru_l1_synchronized
-    def finish_write(self, keys: list[ObjectKey]) -> dict[ObjectKey, L1Error]:
+    def finish_write(
+        self, keys: list[ObjectKey], tag: str = ""
+    ) -> dict[ObjectKey, L1Error]:
         """Finish writes, publishing only non-temporary pages to MaruServer.
 
         Temporary pages become locally readable without taking read holds or
@@ -799,18 +843,20 @@ class MaruL1Manager:
 
         Args:
             keys: The list of object keys to finish write access for.
+            tag: The writer's tag passed to ``reserve_write``.
 
         Returns:
             A dictionary mapping each key to an L1Error.
 
         Errors:
-            KEY_NOT_EXIST: The key was never reserved (or already finished).
+            KEY_NOT_EXIST: ``tag`` stages nothing for the key (never reserved,
+                already finished, or reserved under another tag).
             KEY_IN_WRONG_STATE: Registration failed.
         """
         ret: dict[ObjectKey, L1Error] = {}
         staged: list[tuple[ObjectKey, _PendingWrite]] = []
         for k in keys:
-            entry = self._pending_write.pop(k, None)
+            entry = self._take_pending_write(k, tag)
             if entry is None:
                 logger.warning("MaruL1Manager: finish write on unstaged key %s", k)
                 ret[k] = L1Error.KEY_NOT_EXIST
@@ -826,6 +872,8 @@ class MaruL1Manager:
                 staged.append((k, entry))
         registered, errors = self._store_staged(staged)
         ret.update(errors)
+        # A failed store never became resident; the policy must forget it.
+        self._report_staging_gone(list(errors))
         for k in registered:
             ret[k] = L1Error.SUCCESS
         # PARITY(L1Manager.finish_write): notify listeners of registered pages
@@ -839,7 +887,7 @@ class MaruL1Manager:
 
     @_maru_l1_synchronized
     def finish_write_and_reserve_read(
-        self, keys: list[ObjectKey], read_locks: int = 1
+        self, keys: list[ObjectKey], read_locks: int = 1, tag: str = ""
     ) -> dict[ObjectKey, L1OperationResult]:
         """Finish a write and take read holds in one step (L2->L1 promote).
 
@@ -863,12 +911,14 @@ class MaruL1Manager:
             keys: Keys to transition from write-staged to read-staged.
             read_locks: Total read holds per key, clamped to [1, 128].
                 Defaults to one; callers may reserve for multiple readers.
+            tag: The writer's tag passed to ``reserve_write``.
 
         Returns:
             A dictionary mapping each key to (L1Error, MemoryObj | None).
 
         Errors:
-            KEY_NOT_EXIST: The key is not write-staged on this instance.
+            KEY_NOT_EXIST: ``tag`` does not write-stage the key on this
+                instance.
             KEY_IN_WRONG_STATE: The key is already read-staged, or registration
                 or re-resolve failed.
         """
@@ -880,7 +930,7 @@ class MaruL1Manager:
         retain_staged: list[tuple[ObjectKey, _PendingWrite]] = []
         for k in keys:
             entry = self._pending_write.get(k)
-            if entry is None:
+            if entry is None or entry.tag != tag:
                 # PARITY(L1Manager): a key not write-held cannot be promoted.
                 logger.warning("MaruL1Manager: promote on non-write-staged key %s", k)
                 continue
@@ -941,6 +991,7 @@ class MaruL1Manager:
         registered, errors = self._store_staged(retain_staged)
         for k, err in errors.items():
             ret[k] = (err, None)
+        self._report_staging_gone(list(errors))
         if not registered:
             return
         # A store that cannot be re-resolved to a read view is a wrong-state
@@ -982,6 +1033,7 @@ class MaruL1Manager:
         """
         ret: dict[ObjectKey, L1Error] = {}
         successful_keys: list[ObjectKey] = []
+        missing_keys: list[ObjectKey] = []
         handler = self._allocator.handler
         for k in keys:
             entry = self._pending_read.get(k)
@@ -1006,11 +1058,11 @@ class MaruL1Manager:
                 # MARU: handler.delete conflates pinned and missing; one
                 # exists() round-trip disambiguates so pinned keys retry.
                 # TODO(maru): a tri-state delete RPC would remove this.
-                ret[k] = (
-                    L1Error.KEY_IS_LOCKED
-                    if handler.exists(ks)
-                    else L1Error.KEY_NOT_EXIST
-                )
+                if handler.exists(ks):
+                    ret[k] = L1Error.KEY_IS_LOCKED
+                else:
+                    ret[k] = L1Error.KEY_NOT_EXIST
+                    missing_keys.append(k)
             except Exception:
                 logger.exception("MaruL1Manager: delete failed for key %s", ks)
                 ret[k] = L1Error.KEY_IS_LOCKED
@@ -1019,6 +1071,10 @@ class MaruL1Manager:
         for listener in self._registered_listeners:
             listener.on_l1_keys_deleted_by_manager(successful_keys)
         self._publish(EventType.L1_KEYS_EVICTED, successful_keys)
+        # MARU: a key can leave the shared directory without this instance
+        # (a peer deleted it); the policy must forget it too, or it is picked
+        # again every cycle.
+        self._report_staging_gone(missing_keys)
         return ret
 
     def touch_keys(self, keys: list[ObjectKey]) -> None:
@@ -1179,6 +1235,132 @@ class MaruL1Manager:
         """Return None: the shared pool has no single registerable region."""
         return None
 
+    @property
+    def l1_manager_id(self) -> int:
+        """Return this manager's process-local memory-object owner tag."""
+        return self._l1_manager_id
+
+    @property
+    def config(self) -> L1ManagerConfig:
+        """Return the L1 configuration this manager was built from."""
+        return self._l1_config
+
+    @_maru_l1_synchronized
+    def finish_write_and_delete(
+        self, keys: list[ObjectKey], tag: str = ""
+    ) -> dict[ObjectKey, L1Error]:
+        """Discard ``tag``'s write reservations without committing them.
+
+        PARITY(L1Manager.finish_write_and_delete): the staged pages never
+        become readable and no write-finished notification fires; keys that
+        leave L1 this way are reported through ``on_l1_keys_deleted_by_manager``.
+        MARU: the pages were never registered, so they go straight back to the
+        owner (``abort_alloc``) without a MaruServer RPC.
+
+        Args:
+            keys: The list of object keys whose staged pages to discard.
+            tag: The writer's tag passed to ``reserve_write``.
+
+        Returns:
+            A dictionary mapping each object key to an L1Error.
+
+        Errors:
+            KEY_NOT_EXIST: ``tag`` stages nothing for the key.
+        """
+        ret: dict[ObjectKey, L1Error] = {}
+        discarded: list[ObjectKey] = []
+        for k in keys:
+            entry = self._take_pending_write(k, tag)
+            if entry is None:
+                ret[k] = L1Error.KEY_NOT_EXIST
+                continue
+            try:
+                self._allocator.abort_alloc(entry.mem_obj)
+            except Exception:
+                logger.exception("MaruL1Manager: failed to reclaim write page %s", k)
+            ret[k] = L1Error.SUCCESS
+            discarded.append(k)
+        self._report_staging_gone(discarded)
+        return ret
+
+    @_maru_l1_synchronized
+    def get_staging_memory_usage(self) -> int:
+        """Return bytes held by uncommitted write reservations.
+
+        Returns:
+            The total size of the pages staged between ``reserve_write`` and
+            its finishing call; part of :meth:`get_memory_usage`'s used bytes.
+        """
+        return sum(e.mem_obj.get_size() for e in self._pending_write.values())
+
+    def get_capacity_bytes_by_backend(self) -> dict[L1BackendType, int]:
+        """Return the configured CXL pool request as the ``MARU`` capacity.
+
+        Returns:
+            The initial pool owned by this process, not the shared device.
+        """
+        return get_configured_capacity_bytes(self._l1_config)
+
+    def memory_region_count(self) -> int:
+        """Return the number of CXL regions this instance owns.
+
+        MARU: the owned pool gains a region on each expansion; peer regions
+        mapped for reads are not counted. Zero before the pool is created.
+
+        Returns:
+            The owned region count.
+        """
+        if not self._allocator.is_initialized:
+            return 0
+        return len(self._allocator.handler.get_owned_region_ids())
+
+    def owns_device(self, device_path: str) -> bool:
+        """Return False: maru maps its pool through MaruServer, not a DAX L1."""
+        return False
+
+    def get_devdax_arena_statuses(self) -> list[DevDaxArenaStatus]:
+        """Reject: maru L1 has no Device-DAX arenas.
+
+        Raises:
+            L1ReconfigureError: Always (409).
+        """
+        raise self._not_devdax()
+
+    def get_devdax_arena_status(self, device_path: str) -> DevDaxArenaStatus:
+        """Reject: maru L1 has no Device-DAX arenas.
+
+        Raises:
+            L1ReconfigureError: Always (409).
+        """
+        raise self._not_devdax()
+
+    def add_devdax_device(
+        self, device_path: str, size_in_bytes: int
+    ) -> DevDaxArenaStatus:
+        """Reject: maru L1 has no Device-DAX arenas.
+
+        Raises:
+            L1ReconfigureError: Always (409).
+        """
+        raise self._not_devdax()
+
+    def remove_devdax_device(
+        self,
+        device_path: str,
+        mode: DevDaxRemoveMode = DevDaxRemoveMode.DRAIN,
+    ) -> DevDaxArenaStatus:
+        """Reject: maru L1 has no Device-DAX arenas.
+
+        Raises:
+            L1ReconfigureError: Always (409).
+        """
+        raise self._not_devdax()
+
+    @staticmethod
+    def _not_devdax() -> L1ReconfigureError:
+        """PARITY(L1Manager._require_devdax_memory_manager): the 409 error."""
+        return L1ReconfigureError(409, "L1 is not Device-DAX backed (maru L1)")
+
     def close(self) -> None:
         """Stop the sweeper, release staged state, and tear down the allocator."""
         self._stop_event.set()
@@ -1196,11 +1378,22 @@ class MaruL1Manager:
             A dict with the stock L1 status keys plus ``backend``.
         """
         used, total = self.get_memory_usage()
+        capacities = self.get_capacity_bytes_by_backend()
         return {
             "is_healthy": self._allocator.memcheck(),
             "backend": "maru",
             "total_object_count": len(self._pending_read) + len(self._pending_write),
             "write_locked_count": len(self._pending_write),
+            # PARITY(L1Manager.report_status): StorageManager sums
+            # capacity_bytes_by_backend across L1s. Inline, not
+            # get_staging_memory_usage(): the lock is already held.
+            "staging_object_count": len(self._pending_write),
+            "staging_bytes": sum(
+                e.mem_obj.get_size() for e in self._pending_write.values()
+            ),
+            "capacity_bytes_by_backend": {
+                backend.value: size for backend, size in capacities.items()
+            },
             "read_locked_count": sum(
                 1 for e in self._pending_read.values() if e.refcount > 0
             ),

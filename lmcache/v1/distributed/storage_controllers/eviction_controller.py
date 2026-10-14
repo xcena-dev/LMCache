@@ -19,8 +19,8 @@ from lmcache.v1.distributed.eviction_policy import CreateEvictionPolicy
 from lmcache.v1.distributed.internal_api import (
     EvictionAction,
     EvictionDestination,
+    L1ManagerInterface,
 )
-from lmcache.v1.distributed.l1_protocol import L1ManagerInterface
 from lmcache.v1.distributed.l2_adapters.base import L2AdapterInterface
 from lmcache.v1.distributed.storage_controller import StorageControllerInterface
 from lmcache.v1.mp_observability.event import Event, EventType

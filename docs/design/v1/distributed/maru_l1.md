@@ -101,22 +101,26 @@ MaruServer RPCs and owns:
 Membership and pins live remotely (MaruServer); these local dicts hold only
 in-flight/staged state. A single non-reentrant lock serializes every public method.
 
-### `L1ManagerInterface` (`l1_protocol.py`)
+### `L1ManagerInterface` (`internal_api.py`)
 
-A structural `typing.Protocol` (`@runtime_checkable`). Both `L1Manager` and
-`MaruL1Manager` satisfy it without inheritance; each method's docstring is the
-behavioral contract (listener firing, PINNED retry, `read_locks` total-count balance).
-`StorageManager` selects the implementation in one line:
+The stock structural `typing.Protocol` (`@runtime_checkable`). `MaruL1Manager`
+satisfies it without inheritance; each method's docstring is the behavioral contract
+(listener firing, writer tags, PINNED retry, `read_locks` total-count balance).
+Maru is one entry of the multi-L1 list: `--l1-manager '{"type": "MARU", ...}'` (or
+the legacy `--maru-*` flags) yields a `MaruL1ManagerConfig`, and `StorageManager`
+builds a `MaruL1Manager` for the entry whose `memory_config.maru_config` is set:
 
 ```python
-self._l1_manager: L1ManagerInterface = (
-    MaruL1Manager(cfg) if maru_config else L1Manager(cfg)
+manager: L1ManagerInterface = (
+    MaruL1Manager(manager_config)
+    if manager_config.memory_config.maru_config is not None
+    else L1Manager(manager_config)
 )
 ```
 
-The stock controllers call only this surface (no private access), so widening their
-`l1_manager` parameter type from concrete `L1Manager` to `L1ManagerInterface`
-(runtime-identical) lets the whole stack run over either implementation.
+Validation keeps the MARU entry the only L1 of the process. The stock controllers
+call only this surface (no private access), so the whole stack runs over either
+implementation.
 
 ### `MaruMemoryAllocator` (`memory_manager/maru_memory_allocator.py`)
 
@@ -305,8 +309,8 @@ remain reflected separately in runtime usage.
 ## References
 
 - Implementation: `lmcache/v1/distributed/maru_l1_manager.py`
-- Protocol: `lmcache/v1/distributed/l1_protocol.py`
+- Interface: `lmcache/v1/distributed/internal_api.py` (`L1ManagerInterface`)
 - Allocator: `lmcache/v1/distributed/memory_manager/maru_memory_allocator.py`
-- Config: `lmcache/v1/distributed/config.py` (`MaruL1Config`)
+- Config: `lmcache/v1/distributed/config.py` (`MaruL1Config`, `MaruL1ManagerConfig`)
 - User docs: `docs/source/mp/configuration.rst` (Maru CXL Shared L1 section)
 - External runtime: [maru](https://github.com/xcena-dev/maru)

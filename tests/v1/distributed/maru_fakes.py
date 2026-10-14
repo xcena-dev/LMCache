@@ -162,6 +162,9 @@ class FakeMaruHandler:
     def get_chunk_size(self) -> int:
         return self.chunk_size
 
+    def get_owned_region_ids(self) -> list[int]:
+        return [0]  # FakeCxlAdapter allocates every page from region 0
+
     def get_stats(self) -> dict:
         return {
             "store_regions": {
@@ -191,6 +194,11 @@ class FakeCxlAdapter:
         obj = MagicMock(name=f"cxl-page-{rid}-{pid}")
         obj.metadata.address = (rid << 32) | pid
         obj.metadata.phy_size = self.chunk_size
+        obj.get_size.return_value = self.chunk_size
+        # Mirror MemoryObj's L1 owner tag so owner-routed write completion works.
+        owner: list[int | None] = [None]
+        obj.set_l1_manager.side_effect = lambda tag: owner.__setitem__(0, tag)
+        obj.get_l1_manager.side_effect = lambda: owner[0]
         return obj
 
     def batched_allocate(self, shapes, dtypes, batch_size, fmt=None, at=None):

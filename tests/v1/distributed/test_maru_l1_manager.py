@@ -13,6 +13,7 @@ the shared contract are intentionally absent -- see the conformance suite.
 
 # Standard
 from unittest.mock import MagicMock
+import json
 import sys
 import time
 
@@ -23,21 +24,23 @@ import torch
 try:
     # First Party
     from lmcache.v1.distributed.api import (
+        GroupedObjectKeys,
         L1BackendType,
         MemoryLayoutDesc,
         ObjectKey,
-        PrefetchRequestSpec,
+        PrefetchTaskSpec,
     )
     from lmcache.v1.distributed.config import (
         EvictionConfig,
         L1ManagerConfig,
         L1MemoryManagerConfig,
         MaruL1Config,
+        MaruL1ManagerConfig,
         StorageManagerConfig,
         get_configured_capacity_bytes,
         parse_args,
     )
-    from lmcache.v1.distributed.error import L1Error
+    from lmcache.v1.distributed.error import L1Error, L1ReconfigureError
     from lmcache.v1.distributed.l2_adapters.config import L2AdaptersConfig
     from lmcache.v1.distributed.l2_adapters.mock_l2_adapter import MockL2AdapterConfig
     from lmcache.v1.distributed.maru_l1_manager import (
@@ -258,6 +261,95 @@ def test_maru_without_pool_size_raises():
         parse_args(_args("--maru-server-url", "maru://localhost:9000"))
 
 
+def _maru_l1_json(**overrides) -> str:
+    values = {
+        "type": "MARU",
+        "tag": "maru",
+        "size_gb": 8,
+        "server_url": "maru://localhost:9000",
+        **overrides,
+    }
+    return json.dumps(values)
+
+
+def test_maru_flags_build_maru_l1_manager_config():
+    """The legacy --maru-* flags are one MARU L1 entry."""
+    cfg = parse_args(
+        _args("--maru-server-url", "maru://localhost:9000", "--maru-pool-size-gb", "8")
+    )
+    assert [type(c) for c in cfg.l1_manager_configs] == [MaruL1ManagerConfig]
+
+
+def test_l1_manager_maru_entry_builds_maru_config():
+    cfg = parse_args(
+        [
+            "--eviction-policy",
+            "LRU",
+            "--l1-manager",
+            _maru_l1_json(instance_id="node-a", auto_expand=False),
+        ]
+    )
+    (l1,) = cfg.l1_manager_configs
+    assert isinstance(l1, MaruL1ManagerConfig)
+    assert l1.tag == "maru"
+    maru = l1.memory_config.maru_config
+    assert maru == MaruL1Config(
+        server_url="maru://localhost:9000",
+        pool_size_bytes=8 * (1 << 30),
+        instance_id="node-a",
+        auto_expand=False,
+    )
+    assert get_configured_capacity_bytes(l1) == {L1BackendType.MARU: 8 * (1 << 30)}
+
+
+@pytest.mark.parametrize(
+    "overrides, match",
+    [
+        ({"server_url": ""}, "server_url"),
+        ({"instance_id": 3}, "instance_id"),
+        ({"auto_expand": "yes"}, "auto_expand"),
+        ({"path": "/dev/dax0.0"}, "Unknown L1 fields"),
+        ({"tag": "_default"}, "_default"),
+    ],
+)
+def test_l1_manager_maru_entry_rejects_bad_fields(overrides, match):
+    with pytest.raises(ValueError, match=match):
+        parse_args(
+            ["--eviction-policy", "LRU", "--l1-manager", _maru_l1_json(**overrides)]
+        )
+
+
+def test_l1_manager_maru_entry_must_be_the_only_l1():
+    dram = json.dumps({"type": "DRAM", "tag": "dram", "size_gb": 1})
+    with pytest.raises(ValueError, match="other L1 managers"):
+        parse_args(
+            [
+                "--eviction-policy",
+                "LRU",
+                "--l1-manager",
+                _maru_l1_json(),
+                "--l1-manager",
+                dram,
+            ]
+        )
+
+
+@pytest.mark.parametrize(
+    "flags",
+    [
+        ["--maru-server-url", "maru://localhost:9000"],
+        ["--maru-pool-size-gb", "8"],
+        ["--maru-instance-id", "node-a"],
+        ["--no-maru-auto-expand"],
+    ],
+)
+def test_l1_manager_entry_rejects_legacy_maru_flags(flags):
+    with pytest.raises(ValueError, match="either --l1-manager or legacy"):
+        parse_args(
+            ["--eviction-policy", "LRU", "--l1-manager", _maru_l1_json(), *flags]
+        )
+
+
 def test_maru_rejects_devdax_l1():
     with pytest.raises(ValueError, match="devdax"):
         _maru_sm_config(memory=_maru_memory(devdax_path="/dev/dax0.0", shm_name=""))
@@ -266,7 +358,7 @@ def test_maru_rejects_devdax_l1():
 def test_maru_rejects_registered_l2(monkeypatch):
     # Simulate a registered/RDMA adapter via the shared region classifier.
     monkeypatch.setattr(
-        "lmcache.v1.distributed.config._requires_single_l1_memory_region",
+        "lmcache.v1.distributed.config.requires_single_l1_memory_region",
         lambda adapter_config: "nixl_store",
     )
     with pytest.raises(ValueError, match="registerable"):
@@ -330,7 +422,7 @@ def test_reserve_read_pool_miss_rolls_back_pins():
 
 
 def test_reserve_read_excludes_mid_write_key_no_double_staging():
-    """A key mid-write on this instance stays KEY_NOT_READABLE even if a peer
+    """A key mid-write on this instance reads as a miss even if a peer
     registered it -- it must not be pinned or read-staged.
 
     A local write reserves ``k`` (staged in _pending_write); before it finishes,
@@ -345,13 +437,13 @@ def test_reserve_read_excludes_mid_write_key_no_double_staging():
     ks = object_key_to_string(k)
 
     # Local write in flight: k staged for write, not yet registered by us.
-    manager.reserve_write([k], [True], _LAYOUT, mode="new")
+    manager.reserve_write([k], [True], _LAYOUT)
     # A peer registers the same key in the shared directory mid-write.
     _seed(handler, k)
 
     # A read racing the in-flight write is refused, not served from the peer.
     res = manager.reserve_read([k])
-    assert res[k] == (L1Error.KEY_NOT_READABLE, None)
+    assert res[k] == (L1Error.KEY_NOT_EXIST, None)
     assert handler.pins.get(ks, 0) == 0  # no pin taken on the peer copy
     assert k not in manager._pending_read  # no double staging
     assert k in manager._pending_write  # write still in flight
@@ -371,21 +463,118 @@ def test_reserve_read_excludes_mid_write_key_no_double_staging():
 def test_reserve_write_oom_marks_whole_batch():
     manager, _, adapter = make_maru_manager()
     adapter.oom = True
-    res = manager.reserve_write([_key(1), _key(2)], [False] * 2, _LAYOUT, mode="new")
+    res = manager.reserve_write([_key(1), _key(2)], [False] * 2, _LAYOUT)
     assert all(v == (L1Error.OUT_OF_MEMORY, None) for v in res.values())
 
 
-def test_reserve_write_rejects_non_new_mode():
+def test_reserve_write_stamps_owner_tag():
     manager, _, _ = make_maru_manager()
-    with pytest.raises(ValueError):
-        manager.reserve_write([_key(1)], [False], _LAYOUT, mode="update")
+    k = _key(1)
+    obj = manager.reserve_write([k], [False], _LAYOUT)[k][1]
+    assert obj.get_l1_manager() == manager.l1_manager_id
+
+
+def test_write_reservation_is_finished_by_its_tag_only():
+    manager, handler, _ = make_maru_manager()
+    k = _key(1)
+    assert manager.reserve_write([k], [False], _LAYOUT, tag="a")[k][0] == (
+        L1Error.SUCCESS
+    )
+    # One reservation per key, whatever the tag.
+    assert manager.reserve_write([k], [False], _LAYOUT, tag="b")[k] == (
+        L1Error.KEY_NOT_WRITABLE,
+        None,
+    )
+    assert manager.finish_write([k], tag="b")[k] == L1Error.KEY_NOT_EXIST
+    assert manager.finish_write_and_delete([k], tag="b")[k] == L1Error.KEY_NOT_EXIST
+    assert k in manager._pending_write
+    assert manager.finish_write([k], tag="a")[k] == L1Error.SUCCESS
+    assert object_key_to_string(k) in handler.store_map
+
+
+def test_finish_write_and_delete_reclaims_unregistered_page():
+    manager, handler, adapter = make_maru_manager()
+    rec = RecordingListener()
+    manager.register_listener(rec)
+    k = _key(1)
+    obj = manager.reserve_write([k], [False], _LAYOUT, tag="t")[k][1]
+    assert manager.get_staging_memory_usage() == adapter.chunk_size
+
+    assert manager.finish_write_and_delete([k], tag="t")[k] == L1Error.SUCCESS
+    assert adapter.freed == [obj.metadata.address]
+    assert object_key_to_string(k) not in handler.store_map
+    assert manager.get_staging_memory_usage() == 0
+    assert rec.kinds("deleted_by_manager") == [[k]]
+    assert rec.kinds("write_finished") == []
+    assert manager.finish_write_and_delete([k], tag="t")[k] == L1Error.KEY_NOT_EXIST
+
+
+def test_expired_write_is_reported_gone_by_sweeper():
+    """The eviction policy tracks reserved keys, so a swept one is reported."""
+    manager, _, adapter = make_maru_manager()
+    rec = RecordingListener()
+    manager.register_listener(rec)
+    k = _key(1)
+    obj = manager.reserve_write([k], [False], _LAYOUT)[k][1]
+    manager._pending_write[k].deadline = 0.0
+    manager._sweep_once()
+    assert adapter.freed == [obj.metadata.address]
+    assert rec.kinds("deleted_by_manager") == [[k]]
+
+
+def test_failed_store_is_reported_gone():
+    manager, handler, _ = make_maru_manager()
+    rec = RecordingListener()
+    manager.register_listener(rec)
+    k = _key(1)
+    handler.fail_store_keys = {object_key_to_string(k)}
+    manager.reserve_write([k], [False], _LAYOUT)
+    assert manager.finish_write([k])[k] == L1Error.KEY_IN_WRONG_STATE
+    assert rec.kinds("deleted_by_manager") == [[k]]
+    assert rec.kinds("write_finished") == []
+
+
+def test_delete_of_key_gone_from_directory_is_reported():
+    """A key a peer already deleted must leave this instance's policy too."""
+    manager, _, _ = make_maru_manager()
+    rec = RecordingListener()
+    manager.register_listener(rec)
+    k = _key(1)
+    assert manager.delete([k])[k] == L1Error.KEY_NOT_EXIST
+    assert [k] in rec.kinds("deleted_by_manager")
+
+
+def test_storage_manager_status_reports_maru_capacity():
+    sm, _, _ = _maru_sm_with_fakes()
+    try:
+        status = sm.report_status()
+        assert status["l1_capacity_bytes_by_backend"] == {
+            L1BackendType.MARU.value: 1 << 20
+        }
+    finally:
+        sm.close()
+
+
+def test_maru_reports_no_devdax_arenas():
+    manager, _, _ = make_maru_manager()
+    assert manager.owns_device("/dev/dax0.0") is False
+    assert manager.memory_region_count() == 1
+    assert manager.config.memory_config.maru_config is not None
+    for call in (
+        manager.get_devdax_arena_statuses,
+        lambda: manager.get_devdax_arena_status("/dev/dax0.0"),
+        lambda: manager.add_devdax_device("/dev/dax0.0", 1 << 30),
+        lambda: manager.remove_devdax_device("/dev/dax0.0"),
+    ):
+        with pytest.raises(L1ReconfigureError):
+            call()
 
 
 def test_finish_write_handle_failure_reclaims_all_pages():
     manager, _, adapter = make_maru_manager()
     keys = [_key(1), _key(2)]
     adapter.fail_handle = True
-    manager.reserve_write(keys, [False] * 2, _LAYOUT, mode="new")
+    manager.reserve_write(keys, [False] * 2, _LAYOUT)
     res = manager.finish_write(keys)
     assert all(err == L1Error.KEY_IN_WRONG_STATE for err in res.values())
     assert len(adapter.freed) == 2  # never reached the server: reclaimed
@@ -396,7 +585,7 @@ def test_finish_write_store_rpc_failure_never_recycles():
     manager, handler, adapter = make_maru_manager()
     k = _key(1)
     handler.fail_store = True
-    manager.reserve_write([k], [False], _LAYOUT, mode="new")
+    manager.reserve_write([k], [False], _LAYOUT)
     assert manager.finish_write([k])[k] == L1Error.KEY_IN_WRONG_STATE
     assert not adapter.freed
 
@@ -404,7 +593,7 @@ def test_finish_write_store_rpc_failure_never_recycles():
 def test_finish_write_dup_skip_is_success_without_abort():
     manager, handler, adapter = make_maru_manager()
     k = _key(1)
-    manager.reserve_write([k], [False], _LAYOUT, mode="new")
+    manager.reserve_write([k], [False], _LAYOUT)
     _seed(handler, k)  # another instance registered it meanwhile
     assert manager.finish_write([k])[k] == L1Error.SUCCESS  # dup-skip
     assert not adapter.freed  # no local double-free
@@ -438,7 +627,7 @@ def test_delete_force_is_ignored_for_locked_keys():
     handler.pins[object_key_to_string(pinned)] = 1  # pinned by another instance
 
     staged = _key(2)
-    manager.reserve_write([staged], [True], _LAYOUT, mode="new")  # in-flight write
+    manager.reserve_write([staged], [True], _LAYOUT)  # in-flight write
 
     results = manager.delete([pinned, staged], force=True)
     assert results[pinned] == L1Error.KEY_IS_LOCKED
@@ -536,7 +725,7 @@ def test_is_key_evictable_tracks_local_staging():
 def test_temporary_promote_page_reclaimed_after_read():
     manager, handler, adapter = make_maru_manager()
     k = _key(1)
-    page = manager.reserve_write([k], [True], _LAYOUT, mode="new")[k][1]
+    page = manager.reserve_write([k], [True], _LAYOUT)[k][1]
     manager.finish_write_and_reserve_read([k])
 
     assert manager.finish_read([k])[k] == L1Error.SUCCESS
@@ -548,7 +737,7 @@ def test_temporary_promote_page_reclaimed_after_read():
 def test_retained_promote_read_locks_pins_n():
     manager, handler, _ = make_maru_manager()
     k = _key(1)
-    manager.reserve_write([k], [False], _LAYOUT, mode="new")
+    manager.reserve_write([k], [False], _LAYOUT)
 
     manager.finish_write_and_reserve_read([k], read_locks=3)
     assert handler.pins[object_key_to_string(k)] == 3  # total read locks
@@ -558,7 +747,7 @@ def test_retained_promote_dup_skip_resolves_winner():
     """A peer registered the key first: re-resolve pins the winning page."""
     manager, handler, _ = make_maru_manager()
     k = _key(1)
-    manager.reserve_write([k], [False], _LAYOUT, mode="new")
+    manager.reserve_write([k], [False], _LAYOUT)
     _seed(handler, k, rid=9, pid=5)  # peer registered it meanwhile
 
     assert manager.finish_write_and_reserve_read([k])[k][0] == L1Error.SUCCESS
@@ -569,7 +758,7 @@ def test_retained_promote_store_failure_is_wrong_state():
     manager, handler, _ = make_maru_manager()
     k = _key(1)
     handler.fail_store_keys.add(object_key_to_string(k))
-    manager.reserve_write([k], [False], _LAYOUT, mode="new")
+    manager.reserve_write([k], [False], _LAYOUT)
 
     assert manager.finish_write_and_reserve_read([k])[k] == (
         L1Error.KEY_IN_WRONG_STATE,
@@ -586,7 +775,7 @@ def test_retained_promote_store_failure_is_wrong_state():
 def test_sweep_reclaims_expired_write():
     manager, _, adapter = make_maru_manager()
     k = _key(1)
-    page = manager.reserve_write([k], [False], _LAYOUT, mode="new")[k][1]
+    page = manager.reserve_write([k], [False], _LAYOUT)[k][1]
     manager._pending_write[k].deadline = time.monotonic() - 1  # force expiry
 
     manager._sweep_once()
@@ -611,7 +800,7 @@ def test_sweep_reclaims_expired_read_unpins():
 def test_sweep_reclaims_expired_temporary_read():
     manager, handler, adapter = make_maru_manager()
     k = _key(1)
-    page = manager.reserve_write([k], [True], _LAYOUT, mode="new")[k][1]
+    page = manager.reserve_write([k], [True], _LAYOUT)[k][1]
     manager.finish_write_and_reserve_read([k])  # temporary read staged
     manager._pending_read[k].deadline = time.monotonic() - 1
 
@@ -653,7 +842,7 @@ def test_event_bus_write_read_delete_lifecycle():
     manager._event_bus = MagicMock()
     k = _key(1)
 
-    manager.reserve_write([k], [False], _LAYOUT, mode="new")
+    manager.reserve_write([k], [False], _LAYOUT)
     manager.finish_write([k])
     manager.reserve_read([k])
     manager.finish_read([k])
@@ -674,7 +863,7 @@ def test_finish_write_store_failure_is_not_fired():
     rec = RecordingListener()
     manager.register_listener(rec)
 
-    manager.reserve_write([k], [False], _LAYOUT, mode="new")
+    manager.reserve_write([k], [False], _LAYOUT)
     manager.finish_write([k])
     assert rec.kinds("write_finished") == []
 
@@ -701,8 +890,8 @@ def test_finish_read_temporary_frees_page_and_fires_delete():
     assert k not in manager._pending_read
 
 
-def test_delete_fires_only_for_removed_keys():
-    """Locked / absent keys are not reported as manager deletes."""
+def test_delete_fires_for_removed_and_absent_keys():
+    """Removed and absent keys leave the eviction policy; locked keys stay."""
     manager, handler, _ = make_maru_manager()
     removed, absent, locked = _key(1), _key(2), _key(3)
     _seed(handler, removed)
@@ -712,7 +901,7 @@ def test_delete_fires_only_for_removed_keys():
     manager.register_listener(rec)
 
     manager.delete([removed, absent, locked])
-    assert rec.kinds("deleted_by_manager") == [[removed]]
+    assert rec.kinds("deleted_by_manager") == [[removed], [absent]]
 
 
 # =========================================================================
@@ -775,7 +964,7 @@ def test_store_registers_in_maru_directory():
     sm, handler, _ = _maru_sm_with_fakes()
     try:
         k = _key(1)
-        res = sm.reserve_write([k], _LAYOUT, mode="new")
+        res = sm.reserve_write([k], _LAYOUT)
         assert res[k] is not None
         sm.finish_write([k])
         assert object_key_to_string(k) in handler.store_map
@@ -788,12 +977,28 @@ def test_prefetch_hits_l1_resident_keys():
     sm, _, _ = _maru_sm_with_fakes()
     try:
         keys = [_key(i) for i in range(3)]
-        sm.reserve_write(keys, _LAYOUT, mode="new")
+        sm.reserve_write(keys, _LAYOUT)
         sm.finish_write(keys)
 
-        handle = sm.submit_prefetch_task(PrefetchRequestSpec(keys, {0: _LAYOUT}))
-        assert _wait(lambda: sm.query_prefetch_status(handle) is not None)
-        assert sm.query_prefetch_status(handle).count_leading_ones() == len(keys)
+        handle = sm.submit_prefetch_task(
+            PrefetchTaskSpec(
+                key_groups=[
+                    GroupedObjectKeys(keys=keys, object_group_id=0, layout_desc=_LAYOUT)
+                ]
+            )
+        )
+        # Each result is returned once, so keep the first non-None one.
+        found = []
+
+        def _poll() -> bool:
+            result = sm.query_prefetch_status(handle)
+            if result is not None:
+                found.append(result)
+            return bool(found)
+
+        assert _wait(_poll)
+        assert found[0].hit_cells[0].get_indices_list() == list(range(len(keys)))
+        sm.finish_read_prefetched(keys)
     finally:
         sm.close()
 
@@ -805,7 +1010,7 @@ def test_eviction_deletes_from_maru_directory():
     sm, handler, _ = _maru_sm_with_fakes(trigger_watermark=0.1)
     try:
         keys = [_key(i) for i in range(6)]
-        sm.reserve_write(keys, _LAYOUT, mode="new")
+        sm.reserve_write(keys, _LAYOUT)
         sm.finish_write(keys)
         assert len(handler.store_map) == 6
 

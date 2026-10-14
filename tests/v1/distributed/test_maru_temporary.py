@@ -50,7 +50,7 @@ def test_temporary_finish_write_never_publishes(
     manager, handler, adapter = make_maru_manager()
     key = _key(1)
     try:
-        _, obj = manager.reserve_write([key], [True], _LAYOUT, mode="new")[key]
+        _, obj = manager.reserve_write([key], [True], _LAYOUT)[key]
         assert obj is not None
         assert manager.finish_write([key])[key] == L1Error.SUCCESS
         assert handler.batch_exists([object_key_to_string(key)]) == [False]
@@ -75,7 +75,7 @@ def test_private_read_and_cleanup_do_not_touch_peer_copy(
     manager, handler, adapter = local_manager
     key = _key(2)
     encoded = object_key_to_string(key)
-    _, obj = manager.reserve_write([key], [True], _LAYOUT, mode="new")[key]
+    _, obj = manager.reserve_write([key], [True], _LAYOUT)[key]
     assert obj is not None
     if promote:
         assert manager.finish_write_and_reserve_read([key])[key] == (
@@ -106,7 +106,7 @@ def test_deleting_completed_temporary_preserves_peer_copy(
     manager, handler, adapter = local_manager
     key = _key(3)
     encoded = object_key_to_string(key)
-    _, obj = manager.reserve_write([key], [True], _LAYOUT, mode="new")[key]
+    _, obj = manager.reserve_write([key], [True], _LAYOUT)[key]
     assert obj is not None
     assert manager.finish_write([key])[key] == L1Error.SUCCESS
     handler.store_map[encoded] = (7, 3, 64)
@@ -123,9 +123,7 @@ def test_mixed_finish_write_keeps_temporary_private_on_store_failure(
     """Directory store failure does not discard or publish a private buffer."""
     manager, handler, adapter = local_manager
     temporary, retained = _key(4), _key(5)
-    reserved = manager.reserve_write(
-        [temporary, retained], [True, False], _LAYOUT, mode="new"
-    )
+    reserved = manager.reserve_write([temporary, retained], [True, False], _LAYOUT)
     temporary_obj = reserved[temporary][1]
     assert temporary_obj is not None
     handler.fail_store = True
@@ -144,7 +142,7 @@ def test_non_force_clear_keeps_active_temporary_read(
     """Clear reclaims completed idle pages but preserves a reader's buffer."""
     manager, _, adapter = local_manager
     idle, active = _key(6), _key(7)
-    reserved = manager.reserve_write([idle, active], [True, True], _LAYOUT, "new")
+    reserved = manager.reserve_write([idle, active], [True, True], _LAYOUT)
     idle_obj = reserved[idle][1]
     assert idle_obj is not None
     assert all(
@@ -162,7 +160,7 @@ def test_close_reclaims_completed_temporary_once() -> None:
     """Shutdown must not leak or double-free a finished, unread temporary."""
     manager, _, adapter = make_maru_manager()
     key = _key(8)
-    _, obj = manager.reserve_write([key], [True], _LAYOUT, mode="new")[key]
+    _, obj = manager.reserve_write([key], [True], _LAYOUT)[key]
     assert obj is not None
     assert manager.finish_write([key])[key] == L1Error.SUCCESS
     manager.close()
@@ -175,7 +173,7 @@ def test_completed_temporary_without_reader_is_not_released_by_finish_read(
     """An unmatched finish_read must not free an unlocked temporary page."""
     manager, _, adapter = local_manager
     key = _key(9)
-    manager.reserve_write([key], [True], _LAYOUT, mode="new")
+    manager.reserve_write([key], [True], _LAYOUT)
     assert manager.finish_write([key])[key] == L1Error.SUCCESS
     assert manager.finish_read([key])[key] == L1Error.KEY_IN_WRONG_STATE
     assert adapter.freed == []
@@ -187,7 +185,7 @@ def test_completed_temporary_is_reclaimed_after_read_ttl() -> None:
     manager, handler, adapter = make_maru_manager(read_ttl_seconds=1)
     key = _key(10)
     try:
-        _, obj = manager.reserve_write([key], [True], _LAYOUT, mode="new")[key]
+        _, obj = manager.reserve_write([key], [True], _LAYOUT)[key]
         assert obj is not None
         assert manager.finish_write([key])[key] == L1Error.SUCCESS
         deadline = time.monotonic() + 5

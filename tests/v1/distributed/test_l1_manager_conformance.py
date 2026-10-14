@@ -24,8 +24,8 @@ try:
     from lmcache.v1.distributed.api import MemoryLayoutDesc, ObjectKey
     from lmcache.v1.distributed.config import L1ManagerConfig, L1MemoryManagerConfig
     from lmcache.v1.distributed.error import L1Error
+    from lmcache.v1.distributed.internal_api import L1ManagerInterface
     from lmcache.v1.distributed.l1_manager import L1Manager
-    from lmcache.v1.distributed.l1_protocol import L1ManagerInterface
     from lmcache.v1.distributed.maru_l1_manager import MaruL1Manager
 
     # Local
@@ -94,7 +94,7 @@ def manager(request):
 
 
 def _write(mgr, keys):
-    res = mgr.reserve_write(keys, [False] * len(keys), _LAYOUT, mode="new")
+    res = mgr.reserve_write(keys, [False] * len(keys), _LAYOUT)
     assert all(err == L1Error.SUCCESS for err, _ in res.values())
     fin = mgr.finish_write(keys)
     assert all(err == L1Error.SUCCESS for err in fin.values())
@@ -118,9 +118,9 @@ def test_write_read_roundtrip(manager):
 
 def test_reserve_write_new_rejects_in_flight_key(manager):
     k = _key(3)
-    first = manager.reserve_write([k], [False], _LAYOUT, mode="new")
+    first = manager.reserve_write([k], [False], _LAYOUT)
     assert first[k][0] == L1Error.SUCCESS
-    second = manager.reserve_write([k], [False], _LAYOUT, mode="new")
+    second = manager.reserve_write([k], [False], _LAYOUT)
     assert second[k] == (L1Error.KEY_NOT_WRITABLE, None)
 
 
@@ -176,9 +176,7 @@ def test_is_key_evictable_gates_on_read_hold(manager):
 def test_retained_promote_transitions_write_to_read(manager):
     """Both backends: reserve_write -> promote -> read-held -> release."""
     k = _key(10)
-    assert manager.reserve_write([k], [False], _LAYOUT, mode="new")[k][0] == (
-        L1Error.SUCCESS
-    )
+    assert manager.reserve_write([k], [False], _LAYOUT)[k][0] == (L1Error.SUCCESS)
     assert manager.finish_write_and_reserve_read([k])[k][0] == L1Error.SUCCESS
     assert manager.unsafe_read([k])[k][0] == L1Error.SUCCESS
     assert manager.delete([k])[k] == L1Error.KEY_IS_LOCKED  # read-held
@@ -189,9 +187,7 @@ def test_retained_promote_transitions_write_to_read(manager):
 def test_temporary_promote_dropped_after_read(manager):
     """Both backends: a temporary promote is gone after its read finishes."""
     k = _key(11)
-    assert manager.reserve_write([k], [True], _LAYOUT, mode="new")[k][0] == (
-        L1Error.SUCCESS
-    )
+    assert manager.reserve_write([k], [True], _LAYOUT)[k][0] == (L1Error.SUCCESS)
     assert manager.finish_write_and_reserve_read([k])[k][0] == L1Error.SUCCESS
     assert manager.unsafe_read([k])[k][0] == L1Error.SUCCESS
     assert manager.finish_read([k])[k] == L1Error.SUCCESS
@@ -205,7 +201,7 @@ def test_temporary_finish_write_is_local_readable_staging(
     key = _key(100)
     listener = RecordingListener()
     manager.register_listener(listener)
-    err, obj = manager.reserve_write([key], [True], _LAYOUT, mode="new")[key]
+    err, obj = manager.reserve_write([key], [True], _LAYOUT)[key]
     assert err == L1Error.SUCCESS
     assert manager.finish_write([key])[key] == L1Error.SUCCESS
     assert listener.kinds("write_finished") == []
@@ -227,9 +223,7 @@ def test_temporary_finish_write_can_be_discarded_without_reading(
 ) -> None:
     """An unlocked temporary is reclaimable by delete or non-force clear."""
     key = _key(101)
-    assert manager.reserve_write([key], [True], _LAYOUT, mode="new")[key][0] == (
-        L1Error.SUCCESS
-    )
+    assert manager.reserve_write([key], [True], _LAYOUT)[key][0] == (L1Error.SUCCESS)
     assert manager.finish_write([key])[key] == L1Error.SUCCESS
     if clear:
         manager.clear()
@@ -241,7 +235,7 @@ def test_temporary_finish_write_can_be_discarded_without_reading(
 def test_promote_fires_promote_event(manager):
     """Both backends fire finish_write_and_reserve_read, never write_finished."""
     k = _key(12)
-    manager.reserve_write([k], [False], _LAYOUT, mode="new")
+    manager.reserve_write([k], [False], _LAYOUT)
     rec = RecordingListener()
     manager.register_listener(rec)
 
@@ -251,11 +245,11 @@ def test_promote_fires_promote_event(manager):
     manager.finish_read([k])
 
 
-def test_reserve_read_mid_write_is_not_readable(manager):
-    """A key reserved-but-not-finished for write is not readable (not a miss)."""
+def test_reserve_read_mid_write_is_a_miss(manager):
+    """A key reserved-but-not-finished for write is invisible to readers."""
     k = _key(13)
-    manager.reserve_write([k], [False], _LAYOUT, mode="new")
-    assert manager.reserve_read([k])[k] == (L1Error.KEY_NOT_READABLE, None)
+    manager.reserve_write([k], [False], _LAYOUT)
+    assert manager.reserve_read([k])[k] == (L1Error.KEY_NOT_EXIST, None)
 
 
 def test_finish_on_unstaged_key_is_not_exist(manager):
@@ -280,7 +274,7 @@ def test_listener_fires_across_lifecycle(manager):
     manager.register_listener(rec)
     k = _key(9)
 
-    manager.reserve_write([k], [False], _LAYOUT, mode="new")
+    manager.reserve_write([k], [False], _LAYOUT)
     assert [k] in rec.kinds("reserved_write")
 
     manager.finish_write([k])
@@ -300,52 +294,28 @@ def test_listener_fires_across_lifecycle(manager):
 
 
 # =========================================================================
-# structural conformance: Protocol method-set / signature drift guards
+# structural conformance: MaruL1Manager against the stock Protocol
 #
-# A ``runtime_checkable`` ``issubclass`` only checks method *names*; these bind
-# the Protocol's method set and call shapes to both concrete backends so
-# signature drift fails CI. (Absorbed from the former protocol structural
-# tests and the maru unit file's two interface tests.)
+# A ``Protocol`` with properties rejects ``issubclass``, and its defaults are
+# written as ``...``; these bind the Protocol's member set and call shapes to
+# the maru backend so signature drift fails CI. The stock ``L1Manager`` side of
+# the contract is covered by ``test_l1_interface.py``.
 # =========================================================================
 
 
-def _interface_methods() -> set[str]:
-    """Public method names declared on the Protocol."""
+def _interface_members() -> set[str]:
+    """Public methods and properties declared on the Protocol."""
     return {
         name
         for name, val in vars(L1ManagerInterface).items()
-        if callable(val) and not name.startswith("_")
+        if not name.startswith("_") and (callable(val) or isinstance(val, property))
     }
-
-
-def _l1_manager_methods() -> set[str]:
-    """Public method names on the concrete L1Manager."""
-    return {
-        name
-        for name in dir(L1Manager)
-        if not name.startswith("_") and callable(getattr(L1Manager, name))
-    }
-
-
-def _unwrap(fn):
-    """Recover the wrapped function from ``l1_mgr_synchronized``.
-
-    That decorator is a plain closure without ``functools.wraps``, so
-    ``inspect.signature`` would otherwise see ``(self, *args, **kwargs)``. The
-    original function is the ``func`` free variable of the wrapper closure.
-    """
-    code = getattr(fn, "__code__", None)
-    while code is not None and fn.__closure__ and "func" in code.co_freevars:
-        fn = fn.__closure__[code.co_freevars.index("func")].cell_contents
-        code = getattr(fn, "__code__", None)
-    return fn
 
 
 def _params(fn) -> list[tuple[str, object, object]]:
     """Parameter (name, kind, default) list excluding ``self``.
 
-    Annotations are excluded on purpose: L1Manager leaves some param/return
-    annotations off, so only the call shape (names/kinds/defaults) is compared.
+    Annotations are excluded on purpose: only the call shape is compared.
     """
     return [
         (p.name, p.kind, p.default)
@@ -354,24 +324,13 @@ def _params(fn) -> list[tuple[str, object, object]]:
     ]
 
 
-def test_interface_matches_l1_manager_surface():
-    """The Protocol declares exactly L1Manager's public method set."""
-    methods = _interface_methods()
-    assert methods == _l1_manager_methods()
-    assert len(methods) == 17  # tripwire against wholesale drift
-
-
-def test_signatures_match_l1_manager():
-    """Each Protocol method's call shape matches L1Manager's."""
-    for name in _interface_methods():
-        proto = _params(getattr(L1ManagerInterface, name))
-        impl = _params(_unwrap(getattr(L1Manager, name)))
-        assert proto == impl, name
-
-
-def test_l1_manager_conforms_to_interface():
-    """The stock L1Manager satisfies the interface (structural, no instance)."""
-    assert issubclass(L1Manager, L1ManagerInterface)
+def test_maru_conforms_to_l1_manager_interface():
+    """MaruL1Manager defines every Protocol member, properties as properties."""
+    for name in _interface_members():
+        declared = vars(L1ManagerInterface)[name]
+        impl = getattr(MaruL1Manager, name, None)
+        assert impl is not None, name
+        assert isinstance(declared, property) == isinstance(impl, property), name
 
 
 def test_incomplete_class_does_not_conform():
@@ -380,20 +339,24 @@ def test_incomplete_class_does_not_conform():
     class Partial:
         def close(self) -> None: ...
 
-    assert not issubclass(Partial, L1ManagerInterface)
-
-
-def test_maru_conforms_to_l1_manager_interface():
-    """MaruL1Manager satisfies the interface (structural, binds the sibling)."""
-    assert issubclass(MaruL1Manager, L1ManagerInterface)
+    assert not isinstance(Partial(), L1ManagerInterface)
 
 
 def test_maru_signatures_match_interface():
     """Each Protocol method's call shape matches MaruL1Manager's."""
-    for name in _interface_methods():
-        proto = _params(getattr(L1ManagerInterface, name))
-        impl = _params(_unwrap(getattr(MaruL1Manager, name)))
-        assert proto == impl, name
+    for name in _interface_members():
+        declared = vars(L1ManagerInterface)[name]
+        if isinstance(declared, property):
+            continue
+        proto = _params(declared)
+        impl = _params(getattr(MaruL1Manager, name))
+        assert [(n, k) for n, k, _ in proto] == [(n, k) for n, k, _ in impl], name
+        for (_, _, want), (param, _, got) in zip(proto, impl, strict=True):
+            # The Protocol spells some defaults ``...``: any default matches.
+            if want is Ellipsis:
+                assert got is not inspect.Parameter.empty, (name, param)
+            else:
+                assert want == got, (name, param)
 
 
 @pytest.mark.parametrize(
